@@ -18624,3 +18624,188 @@ fn test_select_visible_subthreads_orders_by_recency_and_limits() {
     let exact = subthreads::select_visible_subthreads(subthreads, 4, false);
     assert_eq!(exact.hidden, 0);
 }
+
+fn active_panel_session_id(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> acp::SessionId {
+    panel.read_with(cx, |panel, cx| {
+        panel
+            .active_conversation_view()
+            .and_then(|view| view.read(cx).active_thread().cloned())
+            .map(|thread_view| thread_view.read(cx).thread.read(cx).session_id().clone())
+            .expect("panel should show a thread")
+    })
+}
+
+fn find_subthread_entry(
+    sidebar: &Entity<Sidebar>,
+    cx: &VisualTestContext,
+) -> subthreads::SubthreadEntry {
+    sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subthread(subthread) => Some(subthread.clone()),
+                _ => None,
+            })
+            .expect("expected a subagent row")
+    })
+}
+
+#[gpui::test]
+async fn test_clicking_parent_row_opens_parent_without_toggling_children(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, parent_thread, _) =
+        setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    let parent_session_id = parent_thread.read_with(cx, |t, _| t.session_id().clone());
+    let parent_metadata = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(parent_thread_id)
+            .cloned()
+            .unwrap()
+    });
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    // Only the chevron expands: opening the parent leaves the group collapsed.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_thread(parent_metadata.clone(), &workspace, false, window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.expanded_subthread_groups.is_empty());
+    });
+
+    // View the child, then click the parent: the parent's own thread comes back.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    let child = find_subthread_entry(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_subthread(&child, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_panel_session_id(&panel, cx),
+        acp::SessionId::new("child-1")
+    );
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_thread(parent_metadata.clone(), &workspace, false, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(active_panel_session_id(&panel, cx), parent_session_id);
+    // Expansion survives all of this.
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(
+            sidebar
+                .expanded_subthread_groups
+                .contains(&parent_thread_id)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_rapid_switching_between_threads_and_subthreads(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let (parent_thread_id, parent_thread, _) =
+        setup_parent_with_subagents(&project, &panel, 2, cx).await;
+    let parent_session_id = parent_thread.read_with(cx, |t, _| t.session_id().clone());
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    // A second, unrelated thread takes over the panel.
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    let other_session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&other_session_id, &project, cx).await;
+    cx.run_until_parked();
+
+    let parent_metadata = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(parent_thread_id)
+            .cloned()
+            .unwrap()
+    });
+    let other_metadata = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&other_session_id)
+            .cloned()
+            .unwrap()
+    });
+
+    // parent -> child -> other -> parent -> child -> other, with no settling in between.
+    for _ in 0..2 {
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_thread(parent_metadata.clone(), &workspace, false, window, cx);
+        });
+        cx.run_until_parked();
+        let child = find_subthread_entry(&sidebar, cx);
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.open_subthread(&child, window, cx);
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_thread(other_metadata.clone(), &workspace, false, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(active_panel_session_id(&panel, cx), other_session_id);
+    }
+
+    // Opening the parent shows the parent itself, not the child it showed last.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_thread(parent_metadata.clone(), &workspace, false, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(active_panel_session_id(&panel, cx), parent_session_id);
+
+    sidebar.read_with(cx, |sidebar, cx| {
+        // The highlight is on the parent row only, and expansion is intact.
+        assert!(sidebar.viewed_subthread(cx).is_none());
+        assert!(
+            sidebar
+                .expanded_subthread_groups
+                .contains(&parent_thread_id)
+        );
+        assert_eq!(sidebar.pending_thread_activation, None);
+    });
+}
+
+#[gpui::test]
+async fn test_viewed_subthread_row_is_the_active_one(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    let child = find_subthread_entry(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_subthread(&child, window, cx);
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, cx| {
+        assert_eq!(
+            sidebar.viewed_subthread(cx),
+            Some((parent_thread_id, acp::SessionId::new("child-1")))
+        );
+    });
+}

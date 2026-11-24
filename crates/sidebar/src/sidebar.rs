@@ -2476,10 +2476,27 @@ impl Sidebar {
         let is_group_header_after_first =
             ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
 
-        let is_active = self
-            .active_entry
-            .as_ref()
-            .is_some_and(|active| active.matches_entry(entry));
+        // While a subagent thread is shown, its row is the active one, not its parent's.
+        let viewed_subthread = self.viewed_subthread(cx);
+        let is_active = match entry {
+            ListEntry::Subthread(subthread) => {
+                viewed_subthread.as_ref().is_some_and(|(parent, session)| {
+                    *parent == subthread.parent.metadata.thread_id
+                        && *session == subthread.info.session_id
+                })
+            }
+            ListEntry::Thread(thread)
+                if viewed_subthread
+                    .as_ref()
+                    .is_some_and(|(parent, _)| *parent == thread.metadata.thread_id) =>
+            {
+                false
+            }
+            _ => self
+                .active_entry
+                .as_ref()
+                .is_some_and(|active| active.matches_entry(entry)),
+        };
 
         let rendered = match entry {
             ListEntry::ProjectHeader {
@@ -2515,7 +2532,7 @@ impl Sidebar {
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Subthread(subthread) => {
-                self.render_subthread(ix, subthread, is_selected, cx)
+                self.render_subthread(ix, subthread, is_active, is_selected, cx)
             }
             ListEntry::LoadMoreSubthreads {
                 parent_thread_id, ..
@@ -4253,6 +4270,7 @@ impl Sidebar {
         };
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
+            Self::show_root_thread(&metadata, workspace, window, cx);
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
             });
@@ -4278,8 +4296,27 @@ impl Sidebar {
         });
 
         Self::load_agent_thread_in_workspace(workspace, metadata, true, window, cx);
+        Self::show_root_thread(metadata, workspace, window, cx);
 
         self.update_entries(cx);
+    }
+
+    /// A conversation remembers which of its subagent threads was shown last.
+    /// Opening the thread itself must show the thread, not that subagent.
+    fn show_root_thread(
+        metadata: &ThreadMetadata,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(session_id) = metadata.session_id.clone() else {
+            return;
+        };
+        if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            agent_panel.update(cx, |agent_panel, cx| {
+                agent_panel.navigate_to_subthread(&metadata.thread_id, session_id, window, cx);
+            });
+        }
     }
 
     fn activate_thread_in_other_window(
@@ -6570,6 +6607,32 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// The parent thread and session of the subagent thread the active panel is
+    /// showing, if it is showing one.
+    fn viewed_subthread(&self, cx: &App) -> Option<(ThreadId, acp::SessionId)> {
+        let panel = self
+            .active_workspace(cx)?
+            .read(cx)
+            .panel::<AgentPanel>(cx)?;
+        let panel = panel.read(cx);
+        let conversation = panel.active_conversation_view()?.read(cx);
+        let root_session_id = conversation
+            .root_thread_view()?
+            .read(cx)
+            .thread
+            .read(cx)
+            .session_id()
+            .clone();
+        let session_id = conversation
+            .active_thread()?
+            .read(cx)
+            .thread
+            .read(cx)
+            .session_id()
+            .clone();
+        (session_id != root_session_id).then(|| (conversation.parent_id(), session_id))
+    }
+
     fn toggle_subthreads(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         if !self.expanded_subthread_groups.remove(&thread_id) {
             self.expanded_subthread_groups.insert(thread_id);
@@ -6616,6 +6679,7 @@ impl Sidebar {
         &self,
         ix: usize,
         subthread: &SubthreadEntry,
+        is_active: bool,
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -6639,6 +6703,7 @@ impl Sidebar {
         .status(info.status)
         .timestamp(timestamp)
         .indented(true)
+        .selected(is_active)
         .focused(is_focused)
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_subthread(&subthread, window, cx);

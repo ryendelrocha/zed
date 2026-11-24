@@ -33,8 +33,8 @@ pub struct ThreadItemWorktreeInfo {
     pub kind: WorktreeKind,
 }
 
-/// A disclosure arrow shown before a thread's icon, for threads that have
-/// nested threads of their own.
+/// A disclosure chevron button at the right end of the row, for threads that
+/// have nested threads of their own.
 struct ThreadItemDisclosure {
     is_open: bool,
     on_toggle: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
@@ -220,7 +220,8 @@ impl ThreadItem {
         self
     }
 
-    /// Shows a disclosure arrow before the icon. Clicking it calls `on_toggle`
+    /// Shows a disclosure chevron button at the right end of the row. Clicking it
+    /// calls `on_toggle`
     /// instead of the row's `on_click`.
     pub fn disclosure(
         mut self,
@@ -378,26 +379,24 @@ impl RenderOnce for ThreadItem {
             icon_container().child(agent_icon).into_any_element()
         };
 
-        let has_disclosure = self.disclosure.is_some();
         let disclosure = self.disclosure.map(|disclosure| {
-            h_flex()
-                .id(format!("disclosure-{}", self.id))
-                .size_4()
-                .flex_none()
-                .justify_center()
-                .rounded_sm()
-                .hover(|style| style.bg(color.ghost_element_hover))
-                .child(
-                    Icon::new(if disclosure.is_open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-                )
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(disclosure.on_toggle)
+            let on_toggle = disclosure.on_toggle;
+            IconButton::new(
+                format!("disclosure-{}", self.id),
+                if disclosure.is_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+            )
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .hover_background(color.element_background)
+            .active_background(color.element_active)
+            .on_click(move |event, window, cx| {
+                cx.stop_propagation();
+                on_toggle(event, window, cx);
+            })
         });
 
         let title = self.title;
@@ -506,7 +505,6 @@ impl RenderOnce for ThreadItem {
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
-                            .when_some(disclosure, |this, disclosure| this.child(disclosure))
                             .child(icon)
                             .child(title_label),
                     )
@@ -537,13 +535,20 @@ impl RenderOnce for ThreadItem {
                                     ),
                             )
                         })
+                    })
+                    .when_some(disclosure, |this, disclosure| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .child(disclosure)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                        )
                     }),
             )
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
                         .gap_1p5()
-                        .when(has_disclosure, |this| this.child(icon_container())) // Disclosure Spacing
                         .child(icon_container()) // Icon Spacing
                         .when(self.archived, |this| {
                             this.child(
