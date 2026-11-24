@@ -227,7 +227,7 @@ Open the Settings Editor and search for “Threads Sidebar Auto Open”. Or add 
 
 `true` or `false`.
 
-A thread that has subagent threads shows a disclosure arrow. The subagent threads stay hidden until you expand it, and only one level is shown: a subagent's own subagents are not listed. With `false`, subagent threads stay out of the sidebar.
+A thread that has subagent threads lists them below it, and shows a chevron on its right to collapse or expand the list. Only one level is shown: a subagent's own subagents are not listed. With `false`, subagent threads stay out of the sidebar.
 
 Open the Settings Editor and search for “Show Subagent Threads In Sidebar”. Or add this to your `settings.json`:
 

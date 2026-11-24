@@ -1572,6 +1572,11 @@ impl Thread {
         self.model = ThreadModel::Ready(model);
     }
 
+    /// When a message was last added to the thread.
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
     pub fn id(&self) -> &acp_v2::SessionId {
         &self.id
     }

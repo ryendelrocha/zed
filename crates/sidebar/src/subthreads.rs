@@ -70,7 +70,7 @@ pub(crate) fn select_visible_subthreads(
 /// are laid out with.
 pub(crate) struct SubthreadLayout<'a> {
     pub groups: &'a HashMap<ThreadId, Vec<SubthreadInfo>>,
-    pub expanded: &'a HashSet<ThreadId>,
+    pub collapsed: &'a HashSet<ThreadId>,
     pub fully_loaded: &'a HashSet<ThreadId>,
     pub visible: usize,
 }
@@ -105,7 +105,7 @@ pub(crate) fn insert_subthread_entries(
             continue;
         };
         counts.insert(thread_id, subthreads.len());
-        if !layout.expanded.contains(&thread_id) {
+        if layout.collapsed.contains(&thread_id) {
             continue;
         }
         let VisibleSubthreads { shown, hidden } = select_visible_subthreads(

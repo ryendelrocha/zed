@@ -1861,16 +1861,25 @@ impl NativeAgent {
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
-                    cx.update(|cx| {
-                        NativeAgentConnection::handle_thread_events(
-                            events,
-                            acp_thread.downgrade(),
-                            None,
-                            cx,
-                        )
-                    })
-                    .await
-                    .map_err(Arc::new)?;
+                    // Replayed history is not new activity: it keeps the time of the
+                    // thread's last message rather than the time it was opened.
+                    acp_thread.update(cx, |acp_thread, _| acp_thread.set_replaying_history(true));
+                    let replayed = cx
+                        .update(|cx| {
+                            NativeAgentConnection::handle_thread_events(
+                                events,
+                                acp_thread.downgrade(),
+                                None,
+                                cx,
+                            )
+                        })
+                        .await;
+                    let updated_at = thread.read_with(cx, |thread, _| thread.updated_at());
+                    acp_thread.update(cx, |acp_thread, _| {
+                        acp_thread.set_replaying_history(false);
+                        acp_thread.restore_last_message_at(updated_at);
+                    });
+                    replayed.map_err(Arc::new)?;
                     let outcomes = thread.read_with(cx, |thread, _| {
                         thread
                             .subagent_outcomes()

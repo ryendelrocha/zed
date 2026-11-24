@@ -132,7 +132,7 @@ Children run concurrently. `start_child` returns right away, and `await_children
 
 When `agent.orchestration.show_as_subthreads` is on:
 - each child appears in the sidebar under its orchestrator thread, with a disclosure arrow;
-- the group is **collapsed by default**;
+- the group is **expanded by default**, and the user can collapse it with the chevron;
 - an expanded group shows the **N most recent children** (N = `agent.orchestration.subthreads_visible`, default 5), followed by a **"Load more"** row;
 - children are **sorted by the time of their last message, most recent first**;
 - each child row reuses the thread row's status icons (running, waiting for confirmation, error, done).
@@ -214,7 +214,7 @@ When a child asks for permission (`session/request_permission`), the request app
 - **AC4.** `<child-id>.jsonl` contains one line per orchestrator-child exchange, with nothing from the child's internal tool calls.
 - **AC5.** A child started with `subagent_quota: 1` gets an error on its second spawn through Zed's tools.
 - **AC6.** With `subthreads_visible: 5` and 7 children, the expanded group shows the 5 with the most recent messages, newest first, plus "Load more". "Load more" reveals the other 2.
-- **AC7.** The group is collapsed when the orchestrator thread is first shown.
+- **AC7.** The group is expanded when the orchestrator thread is first shown, and a group the user collapsed with the chevron stays collapsed across rebuilds and thread switches.
 - **AC8.** With `show_as_subthreads: false`, the children appear as top-level threads.
 - **AC9.** Two children with `worktree: new` run at the same time in separate worktrees, and one with `worktree: shared` runs in the orchestrator's worktree.
 - **AC10.** Cancelling the orchestrator stops every running child.

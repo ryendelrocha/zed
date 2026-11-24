@@ -3852,6 +3852,8 @@ pub struct AcpThread {
     subagent_association: Option<subagents::SubagentAssociation>,
     /// When a message was last added to or extended in this thread.
     last_message_at: Option<DateTime<Utc>>,
+    /// Set while the agent replays the conversation history of a loaded session.
+    replaying_history: bool,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
     // Notices stay with the live session, but never enter conversation history or exports.
@@ -4209,6 +4211,7 @@ impl AcpThread {
             subagents: IndexMap::default(),
             subagent_association: None,
             last_message_at: None,
+            replaying_history: false,
             plans: HashMap::default(),
             visible_plan: None,
             plan_change_count: 0,
@@ -4303,6 +4306,24 @@ impl AcpThread {
     /// agent reported for the session. `None` for a thread that has neither.
     pub fn last_message_at(&self) -> Option<DateTime<Utc>> {
         self.last_message_at.or(self.session_info.updated_at)
+    }
+
+    /// Marks the entries that follow as history being replayed rather than new
+    /// messages, so they do not count as activity at the time of the load.
+    pub fn set_replaying_history(&mut self, replaying: bool) {
+        self.replaying_history = replaying;
+    }
+
+    /// Sets the time of the last message after its history was replayed, when the
+    /// agent knows it.
+    pub fn restore_last_message_at(&mut self, at: DateTime<Utc>) {
+        self.last_message_at = Some(at);
+    }
+
+    fn stamp_last_message(&mut self) {
+        if !self.replaying_history {
+            self.last_message_at = Some(Utc::now());
+        }
     }
 
     pub fn parent_session_id(&self) -> Option<&acp_v2::SessionId> {
@@ -5858,7 +5879,7 @@ impl AcpThread {
                 *existing_protocol_id = protocol_id;
             }
             content.append_prompt(chunk, &language_registry, path_style, cx);
-            self.last_message_at = Some(Utc::now());
+            self.stamp_last_message();
             let idx = entries_len - 1;
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
         } else {
@@ -5916,7 +5937,7 @@ impl AcpThread {
                 {
                     let text_len = text.text.len();
                     let source_index = content.append_deferred_text(text);
-                    self.last_message_at = Some(Utc::now());
+                    self.stamp_last_message();
                     cx.emit(AcpThreadEvent::EntryUpdated(target.entry_index));
                     self.buffer_streaming_text(target, source_index, text_len, cx);
                     return;
@@ -5938,7 +5959,9 @@ impl AcpThread {
             && *existing_indented == indented
         {
             let idx = entries_len - 1;
-            self.last_message_at = Some(Utc::now());
+            if !self.replaying_history {
+                self.last_message_at = Some(Utc::now());
+            }
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
             match (chunks.last_mut(), is_thought) {
                 (
@@ -6150,7 +6173,7 @@ impl AcpThread {
 
     fn push_entry(&mut self, entry: AgentThreadEntry, cx: &mut Context<Self>) {
         self.flush_streaming_text(cx);
-        self.last_message_at = Some(Utc::now());
+        self.stamp_last_message();
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
     }

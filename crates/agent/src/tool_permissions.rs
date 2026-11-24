@@ -635,6 +635,10 @@ mod tests {
                 default_width: px(300.),
                 position: settings::SidebarDockPosition::Left,
             },
+            orchestration: agent_settings::OrchestrationSettings {
+                show_as_subthreads: true,
+                subthreads_visible: 5,
+            },
             thinking_display: Default::default(),
         }
     }

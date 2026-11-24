@@ -1044,7 +1044,12 @@ fn apply_v2_session_notification(
         *config_options.config_options.borrow_mut() = update.config_options.clone();
         config_options.tx.borrow_mut().send(()).log_err();
     }
-    thread.update(cx, |thread, cx| notification.apply(thread, cx))?
+    thread.update(cx, |thread, cx| {
+        thread.set_replaying_history(replaying);
+        let result = notification.apply(thread, cx);
+        thread.set_replaying_history(false);
+        result
+    })?
 }
 
 fn handle_v2_session_notification(

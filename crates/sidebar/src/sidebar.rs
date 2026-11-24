@@ -982,8 +982,8 @@ pub struct Sidebar {
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
-    /// Threads whose subagent threads are listed below them. Collapsed by default.
-    expanded_subthread_groups: HashSet<ThreadId>,
+    /// Threads whose subagent threads the user collapsed. Groups are expanded by default.
+    collapsed_subthread_groups: HashSet<ThreadId>,
     /// Threads whose "Load more" was used, so all their subagent threads are listed.
     fully_loaded_subthread_groups: HashSet<ThreadId>,
     /// Remembers whether each draft last rendered as empty or with content so
@@ -1139,7 +1139,7 @@ impl Sidebar {
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
-            expanded_subthread_groups: HashSet::new(),
+            collapsed_subthread_groups: HashSet::new(),
             fully_loaded_subthread_groups: HashSet::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
@@ -1653,11 +1653,11 @@ impl Sidebar {
         } else {
             HashMap::new()
         };
-        let expanded_subthread_groups = self.expanded_subthread_groups.clone();
+        let collapsed_subthread_groups = self.collapsed_subthread_groups.clone();
         let fully_loaded_subthread_groups = self.fully_loaded_subthread_groups.clone();
         let subthread_layout = SubthreadLayout {
             groups: &subthread_groups,
-            expanded: &expanded_subthread_groups,
+            collapsed: &collapsed_subthread_groups,
             fully_loaded: &fully_loaded_subthread_groups,
             visible: orchestration.subthreads_visible.max(1),
         };
@@ -6634,8 +6634,8 @@ impl Sidebar {
     }
 
     fn toggle_subthreads(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        if !self.expanded_subthread_groups.remove(&thread_id) {
-            self.expanded_subthread_groups.insert(thread_id);
+        if !self.collapsed_subthread_groups.remove(&thread_id) {
+            self.collapsed_subthread_groups.insert(thread_id);
         }
         self.update_entries(cx);
     }
@@ -6813,7 +6813,8 @@ impl Sidebar {
             .subthread_counts
             .contains_key(&thread.metadata.thread_id)
             .then(|| {
-                self.expanded_subthread_groups
+                !self
+                    .collapsed_subthread_groups
                     .contains(&thread.metadata.thread_id)
             });
 

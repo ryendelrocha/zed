@@ -1342,9 +1342,15 @@ impl ThreadMetadataStore {
             .and_then(|t| t.created_at)
             .unwrap_or_else(|| updated_at);
 
-        let interacted_at = existing_thread
-            .map(|t| t.interacted_at)
-            .unwrap_or(Some(updated_at));
+        // `interacted_at` is the time of the last message the user sent, and it is what
+        // orders threads in the sidebar. Saving metadata because a thread was loaded or
+        // received output must not change that order, so a thread without one keeps
+        // the time it was last saved with instead of falling back to `updated_at`,
+        // which this save is about to set to now.
+        let interacted_at = match existing_thread {
+            Some(existing) => existing.interacted_at.or(Some(existing.updated_at)),
+            None => Some(thread_ref.last_message_at().unwrap_or(updated_at)),
+        };
 
         let agent_id = thread_ref.connection().agent_id();
 

@@ -9502,6 +9502,12 @@ exit 7
             vec!["user", "assistant", "compaction"],
             "replayed notifications should be applied to the thread"
         );
+
+        // Replaying history is not activity: loading a thread must not stamp it with
+        // the load time, or reopening it would look like a new message.
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.last_message_at(), None);
+        });
     }
 
     #[gpui::test(iterations = 10)]
@@ -10569,7 +10575,7 @@ fn handle_session_notification(
 ) {
     let session_id = acp_v2::SessionId::new(notification.session_id.0);
     // Extract everything we need from the session while briefly borrowing.
-    let (thread, session_modes, config_opts_data) = {
+    let (thread, session_modes, config_opts_data, replaying) = {
         let sessions = ctx.sessions.borrow();
         let Some(session) = sessions.get(&session_id) else {
             log::warn!(
@@ -10594,6 +10600,7 @@ fn handle_session_notification(
                 .config_options
                 .as_ref()
                 .map(|opts| (opts.config_options.clone(), opts.tx.clone())),
+            session.is_replaying(&session_id),
         )
     };
     // Borrow is dropped here.
@@ -10697,7 +10704,11 @@ fn handle_session_notification(
     // Forward the update to the acp_thread as usual.
     if let Err(err) = thread
         .update(cx, |thread, cx| {
-            thread.handle_session_update(notification.update.clone(), cx)
+            // Replayed history is not new activity in the thread.
+            thread.set_replaying_history(replaying);
+            let result = thread.handle_session_update(notification.update.clone(), cx);
+            thread.set_replaying_history(false);
+            result
         })
         .flatten_acp()
     {
