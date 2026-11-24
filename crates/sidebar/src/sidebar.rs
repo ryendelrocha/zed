@@ -1,3 +1,4 @@
+mod subthreads;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;
@@ -44,6 +45,7 @@ use project::project_settings::ProjectSettings;
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::RemoteConnectionOptions;
+use subthreads::{SubthreadEntry, SubthreadLayout, insert_subthread_entries};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
@@ -396,6 +398,12 @@ enum ListEntry {
         has_threads: bool,
     },
     Thread(Arc<ThreadEntry>),
+    /// A subagent thread, listed under its parent thread.
+    Subthread(SubthreadEntry),
+    /// Reveals the subagent threads of `parent_thread_id` that are not listed yet.
+    LoadMoreSubthreads {
+        parent_thread_id: ThreadId,
+    },
     Terminal(TerminalEntry),
 }
 
@@ -416,7 +424,9 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. }
+            | ListEntry::Subthread(_)
+            | ListEntry::LoadMoreSubthreads { .. } => None,
         }
     }
 }
@@ -442,7 +452,9 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. }
+            | ListEntry::Subthread(_)
+            | ListEntry::LoadMoreSubthreads { .. } => None,
         }
     }
 }
@@ -452,7 +464,10 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::Subthread(_)
+            | ListEntry::LoadMoreSubthreads { .. } => None,
         }
     }
 
@@ -470,6 +485,11 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::Subthread(subthread) => match &subthread.parent.workspace {
+                ThreadEntryWorkspace::Open(ws) => vec![ws.clone()],
+                ThreadEntryWorkspace::Closed { .. } => Vec::new(),
+            },
+            ListEntry::LoadMoreSubthreads { .. } => Vec::new(),
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
                 .cloned()
@@ -497,6 +517,8 @@ struct SidebarContents {
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
+    /// How many subagent threads each listed parent thread has.
+    subthread_counts: HashMap<ThreadId, usize>,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -513,6 +535,8 @@ enum EntryShape {
         is_collapsed: bool,
     },
     Thread(ThreadId),
+    Subthread(ThreadId, acp::SessionId),
+    LoadMoreSubthreads(ThreadId),
     Terminal(TerminalId),
 }
 
@@ -958,6 +982,10 @@ pub struct Sidebar {
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
+    /// Threads whose subagent threads are listed below them. Collapsed by default.
+    expanded_subthread_groups: HashSet<ThreadId>,
+    /// Threads whose "Load more" was used, so all their subagent threads are listed.
+    fully_loaded_subthread_groups: HashSet<ThreadId>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -1111,6 +1139,8 @@ impl Sidebar {
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
+            expanded_subthread_groups: HashSet::new(),
+            fully_loaded_subthread_groups: HashSet::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
@@ -1617,6 +1647,21 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
+        let orchestration = AgentSettings::get_global(cx).orchestration;
+        let subthread_groups = if orchestration.show_as_subthreads {
+            subthreads::live_subthreads_by_parent(&workspaces, cx)
+        } else {
+            HashMap::new()
+        };
+        let expanded_subthread_groups = self.expanded_subthread_groups.clone();
+        let fully_loaded_subthread_groups = self.fully_loaded_subthread_groups.clone();
+        let subthread_layout = SubthreadLayout {
+            groups: &subthread_groups,
+            expanded: &expanded_subthread_groups,
+            fully_loaded: &fully_loaded_subthread_groups,
+            visible: orchestration.subthreads_visible.max(1),
+        };
+        let mut subthread_counts: HashMap<ThreadId, usize> = HashMap::new();
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -2122,12 +2167,19 @@ impl Sidebar {
                     has_threads,
                 });
 
+                let group_start = entries.len();
                 Self::push_entries_by_display_time(
                     &mut entries,
                     matched_terminals,
                     matched_threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                );
+                insert_subthread_entries(
+                    &mut entries,
+                    group_start,
+                    &subthread_layout,
+                    &mut subthread_counts,
                 );
             } else {
                 let has_terminal_notifications = terminals
@@ -2172,12 +2224,19 @@ impl Sidebar {
                     continue;
                 }
 
+                let group_start = entries.len();
                 Self::push_entries_by_display_time(
                     &mut entries,
                     terminals,
                     threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                );
+                insert_subthread_entries(
+                    &mut entries,
+                    group_start,
+                    &subthread_layout,
+                    &mut subthread_counts,
                 );
             }
         }
@@ -2197,6 +2256,7 @@ impl Sidebar {
             notified_terminals,
             project_header_indices,
             has_open_projects,
+            subthread_counts,
         };
     }
 
@@ -2298,6 +2358,13 @@ impl Sidebar {
                     .unwrap_or(false),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
+            ListEntry::Subthread(subthread) => EntryShape::Subthread(
+                subthread.parent.metadata.thread_id,
+                subthread.info.session_id.clone(),
+            ),
+            ListEntry::LoadMoreSubthreads {
+                parent_thread_id, ..
+            } => EntryShape::LoadMoreSubthreads(*parent_thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
         })
     }
@@ -2447,6 +2514,12 @@ impl Sidebar {
                 )
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
+            ListEntry::Subthread(subthread) => {
+                self.render_subthread(ix, subthread, is_selected, cx)
+            }
+            ListEntry::LoadMoreSubthreads {
+                parent_thread_id, ..
+            } => self.render_load_more_subthreads(ix, *parent_thread_id, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
@@ -3902,6 +3975,16 @@ impl Sidebar {
                     }
                 }
             }
+            ListEntry::Subthread(subthread) => {
+                let subthread = subthread.clone();
+                self.open_subthread(&subthread, window, cx);
+            }
+            ListEntry::LoadMoreSubthreads {
+                parent_thread_id, ..
+            } => {
+                let parent_thread_id = *parent_thread_id;
+                self.load_more_subthreads(parent_thread_id, cx);
+            }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
@@ -4588,7 +4671,12 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(
+                ListEntry::Thread(_)
+                | ListEntry::Subthread(_)
+                | ListEntry::LoadMoreSubthreads { .. }
+                | ListEntry::Terminal(_),
+            ) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4615,7 +4703,12 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
+            Some(
+                ListEntry::Thread(_)
+                | ListEntry::Subthread(_)
+                | ListEntry::LoadMoreSubthreads { .. }
+                | ListEntry::Terminal(_),
+            ) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
                     Some(ListEntry::ProjectHeader { .. })
@@ -6055,7 +6148,9 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Subthread(_)
+                | ListEntry::LoadMoreSubthreads { .. } => unreachable!(),
             }
         }
 
@@ -6154,6 +6249,7 @@ impl Sidebar {
                         timestamp,
                     }))
                 }
+                ListEntry::Subthread(_) | ListEntry::LoadMoreSubthreads { .. } => None,
                 ListEntry::Terminal(terminal) => {
                     let timestamp: SharedString =
                         format_history_entry_timestamp(terminal.metadata.created_at).into();
@@ -6474,6 +6570,117 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn toggle_subthreads(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if !self.expanded_subthread_groups.remove(&thread_id) {
+            self.expanded_subthread_groups.insert(thread_id);
+        }
+        self.update_entries(cx);
+    }
+
+    fn load_more_subthreads(&mut self, parent_thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.fully_loaded_subthread_groups.insert(parent_thread_id);
+        self.update_entries(cx);
+    }
+
+    /// Opens the parent thread and shows the subagent thread in it.
+    fn open_subthread(
+        &mut self,
+        subthread: &SubthreadEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ThreadEntryWorkspace::Open(workspace) = &subthread.parent.workspace else {
+            return;
+        };
+        self.selection = None;
+        self.activate_thread(
+            subthread.parent.metadata.clone(),
+            workspace,
+            false,
+            window,
+            cx,
+        );
+        if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            agent_panel.update(cx, |agent_panel, cx| {
+                agent_panel.navigate_to_subthread(
+                    &subthread.parent.metadata.thread_id,
+                    subthread.info.session_id.clone(),
+                    window,
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn render_subthread(
+        &self,
+        ix: usize,
+        subthread: &SubthreadEntry,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let info = &subthread.info;
+        let timestamp: SharedString = info
+            .last_message_at
+            .map(format_history_entry_timestamp)
+            .unwrap_or_default()
+            .into();
+        let subthread = subthread.clone();
+
+        ThreadItem::new(
+            SharedString::from(format!("subthread-entry-{}", ix)),
+            info.title.clone(),
+        )
+        .base_bg(cx.theme().colors().panel_background)
+        .icon(info.icon)
+        .when_some(info.icon_from_external_svg.clone(), |this, svg| {
+            this.custom_icon_from_external_svg(svg)
+        })
+        .status(info.status)
+        .timestamp(timestamp)
+        .indented(true)
+        .focused(is_focused)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_subthread(&subthread, window, cx);
+        }))
+        .into_any_element()
+    }
+
+    fn render_load_more_subthreads(
+        &self,
+        ix: usize,
+        parent_thread_id: ThreadId,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .id(SharedString::from(format!("load-more-subthreads-{}", ix)))
+            .w_full()
+            .py_1()
+            .pl_9()
+            .pr_1p5()
+            .border_1()
+            .border_r_2()
+            .border_color(gpui::transparent_black())
+            .when(is_focused, |this| {
+                this.border_color(colors.panel_focused_border)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.ghost_element_hover))
+            .active(|style| style.bg(colors.ghost_element_active))
+            .child(
+                Label::new("Load more")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.selection = None;
+                this.load_more_subthreads(parent_thread_id, cx);
+            }))
+            .into_any_element()
+    }
+
     fn render_thread(
         &self,
         ix: usize,
@@ -6535,6 +6742,16 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        // `Some(is_expanded)` when the thread has subagent threads to disclose.
+        let subthread_disclosure = self
+            .contents
+            .subthread_counts
+            .contains_key(&thread.metadata.thread_id)
+            .then(|| {
+                self.expanded_subthread_groups
+                    .contains(&thread.metadata.thread_id)
+            });
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
@@ -6542,6 +6759,15 @@ impl Sidebar {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
+            .when_some(subthread_disclosure, |this, is_expanded| {
+                let thread_id = thread.metadata.thread_id;
+                this.disclosure(
+                    is_expanded,
+                    cx.listener(move |this, _, _window, cx| {
+                        this.toggle_subthreads(thread_id, cx);
+                    }),
+                )
+            })
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
             })
@@ -7343,14 +7569,17 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                (0..ix)
-                    .rev()
-                    .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-                        _ => None,
-                    })
-            }
+            Some(
+                ListEntry::Thread(_)
+                | ListEntry::Subthread(_)
+                | ListEntry::LoadMoreSubthreads { .. }
+                | ListEntry::Terminal(_),
+            ) => (0..ix)
+                .rev()
+                .find_map(|i| match self.contents.entries.get(i) {
+                    Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -7535,7 +7764,9 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. }
+            | ListEntry::Subthread(_)
+            | ListEntry::LoadMoreSubthreads { .. } => {}
         }
     }
 

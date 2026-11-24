@@ -33,6 +33,13 @@ pub struct ThreadItemWorktreeInfo {
     pub kind: WorktreeKind,
 }
 
+/// A disclosure arrow shown before a thread's icon, for threads that have
+/// nested threads of their own.
+struct ThreadItemDisclosure {
+    is_open: bool,
+    on_toggle: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+}
+
 #[derive(IntoElement, RegisterComponent)]
 pub struct ThreadItem {
     id: ElementId,
@@ -60,6 +67,8 @@ pub struct ThreadItem {
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     archived: bool,
+    indented: bool,
+    disclosure: Option<ThreadItemDisclosure>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
@@ -94,6 +103,8 @@ impl ThreadItem {
             project_name: None,
             worktrees: Vec::new(),
             archived: false,
+            indented: false,
+            disclosure: None,
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
@@ -200,6 +211,26 @@ impl ThreadItem {
 
     pub fn archived(mut self, archived: bool) -> Self {
         self.archived = archived;
+        self
+    }
+
+    /// Indents the row one level, for threads nested under another thread.
+    pub fn indented(mut self, indented: bool) -> Self {
+        self.indented = indented;
+        self
+    }
+
+    /// Shows a disclosure arrow before the icon. Clicking it calls `on_toggle`
+    /// instead of the row's `on_click`.
+    pub fn disclosure(
+        mut self,
+        is_open: bool,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.disclosure = Some(ThreadItemDisclosure {
+            is_open,
+            on_toggle: Box::new(on_toggle),
+        });
         self
     }
 
@@ -347,6 +378,28 @@ impl RenderOnce for ThreadItem {
             icon_container().child(agent_icon).into_any_element()
         };
 
+        let has_disclosure = self.disclosure.is_some();
+        let disclosure = self.disclosure.map(|disclosure| {
+            h_flex()
+                .id(format!("disclosure-{}", self.id))
+                .size_4()
+                .flex_none()
+                .justify_center()
+                .rounded_sm()
+                .hover(|style| style.bg(color.ghost_element_hover))
+                .child(
+                    Icon::new(if disclosure.is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(disclosure.on_toggle)
+        });
+
         let title = self.title;
         let highlight_positions = self.highlight_positions;
 
@@ -430,6 +483,7 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
+            .when(self.indented, |s| s.pl_5())
             .when(self.selected, |s| s.bg(color.ghost_element_selected))
             .border_1()
             .border_r_2()
@@ -452,6 +506,7 @@ impl RenderOnce for ThreadItem {
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
+                            .when_some(disclosure, |this, disclosure| this.child(disclosure))
                             .child(icon)
                             .child(title_label),
                     )
@@ -488,6 +543,7 @@ impl RenderOnce for ThreadItem {
                 this.child(
                     h_flex()
                         .gap_1p5()
+                        .when(has_disclosure, |this| this.child(icon_container())) // Disclosure Spacing
                         .child(icon_container()) // Icon Spacing
                         .when(self.archived, |this| {
                             this.child(

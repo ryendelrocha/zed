@@ -191,6 +191,23 @@ impl JsonSchema for AutoCompactThreshold {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct OrchestrationSettingsContent {
+    /// Whether subagent threads are shown nested under their parent thread in
+    /// the threads sidebar. When disabled, subagent threads stay out of the
+    /// sidebar.
+    ///
+    /// Default: true
+    pub show_as_subthreads: Option<bool>,
+    /// How many subagent threads are listed under a parent thread in the
+    /// threads sidebar before a "Load more" row. The most recently active
+    /// ones are shown first.
+    ///
+    /// Default: 5
+    pub subthreads_visible: Option<usize>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AutoCompactSettingsContent {
     /// Whether to automatically compact the agent's context when it grows too
     /// large, summarizing earlier messages to free up room in the model's
@@ -260,6 +277,8 @@ pub struct AgentSettingsContent {
     pub max_idle_retained_threads: Option<usize>,
     /// Settings for the threads sidebar.
     pub threads_sidebar: Option<ThreadsSidebarSettingsContent>,
+    /// Settings for how subagent threads are presented.
+    pub orchestration: Option<OrchestrationSettingsContent>,
     /// Default fixed width in pixels when the agent panel is docked to the left or right and
     /// `flexible` is false.
     ///

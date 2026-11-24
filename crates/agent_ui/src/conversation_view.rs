@@ -59,10 +59,10 @@ use terminal_view::terminal_panel::TerminalPanel;
 use text::Anchor;
 use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
 use ui::{
-    Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton,
-    DecoratedIcon, DiffStat, Disclosure, Divider, DividerColor, IconDecoration, IconDecorationKind,
-    KeyBinding, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip, WithScrollbar, prelude::*,
-    right_click_menu,
+    AgentThreadStatus, Callout, CircularProgress, CommonAnimationExt, ContextMenu,
+    ContextMenuEntry, CopyButton, DecoratedIcon, DiffStat, Disclosure, Divider, DividerColor,
+    IconDecoration, IconDecorationKind, KeyBinding, PopoverMenu, PopoverMenuHandle, TintColor,
+    Tooltip, WithScrollbar, prelude::*, right_click_menu,
 };
 use util::{
     ResultExt, debug_panic, defer,
@@ -299,6 +299,17 @@ impl ProfileProvider for Entity<agent::Thread> {
     fn profile_downgraded(&self, cx: &App) -> bool {
         self.read(cx).profile_was_downgraded()
     }
+}
+
+/// A subagent thread of a conversation's root thread, as shown in the threads sidebar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubthreadInfo {
+    pub session_id: acp_v2::SessionId,
+    pub title: SharedString,
+    pub status: AgentThreadStatus,
+    pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub icon: IconName,
+    pub icon_from_external_svg: Option<SharedString>,
 }
 
 #[derive(Default)]
@@ -901,6 +912,56 @@ impl ConversationView {
                 .is_some()
                 || !conversation.elicitation_requests.is_empty()
         })
+    }
+
+    /// The subagent threads the root thread spawned, as the threads sidebar lists them.
+    /// Only direct children: a subagent's own subagents are not included.
+    pub fn subthreads(&self, cx: &App) -> Vec<SubthreadInfo> {
+        let Some(root_view) = self.root_thread_view() else {
+            return Vec::new();
+        };
+        let Some(connected) = self.as_connected() else {
+            return Vec::new();
+        };
+        let root_view = root_view.read(cx);
+        let conversation = connected.conversation.read(cx);
+
+        root_view
+            .thread
+            .read(cx)
+            .subagents()
+            .map(|subagent| {
+                let subagent = subagent.read(cx);
+                let session_id = subagent.session_id().clone();
+                let title = subagent
+                    .subagent_association()
+                    .and_then(|association| association.title.clone())
+                    .or_else(|| subagent.title())
+                    .unwrap_or_else(|| crate::DEFAULT_THREAD_TITLE.into());
+                let status = if conversation
+                    .pending_tool_call_for_session(&session_id, cx)
+                    .is_some()
+                {
+                    AgentThreadStatus::WaitingForConfirmation
+                } else if subagent.had_error() {
+                    AgentThreadStatus::Error
+                } else {
+                    match subagent.status() {
+                        ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
+                        ThreadStatus::Generating => AgentThreadStatus::Running,
+                        ThreadStatus::Idle => AgentThreadStatus::Completed,
+                    }
+                };
+                SubthreadInfo {
+                    session_id,
+                    title,
+                    status,
+                    last_message_at: subagent.last_message_at(),
+                    icon: root_view.agent_icon,
+                    icon_from_external_svg: root_view.agent_icon_from_external_svg.clone(),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {

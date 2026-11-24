@@ -217,6 +217,52 @@ Open the Settings Editor and search for “Threads Sidebar Auto Open”. Or add 
 }
 ```
 
+### Show Subagent Threads In Sidebar {#agent-orchestration-show-as-subthreads}
+
+- Description: Whether subagent threads are shown nested under their parent thread in the [Threads Sidebar](../ai/parallel-agents.md#threads-sidebar).
+- Setting: `agent.orchestration.show_as_subthreads`
+- Default: `true`
+
+**Options**
+
+`true` or `false`.
+
+A thread that has subagent threads shows a disclosure arrow. The subagent threads stay hidden until you expand it, and only one level is shown: a subagent's own subagents are not listed. With `false`, subagent threads stay out of the sidebar.
+
+Open the Settings Editor and search for “Show Subagent Threads In Sidebar”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "show_as_subthreads": false
+    }
+  }
+}
+```
+
+### Visible Subagent Threads {#agent-orchestration-subthreads-visible}
+
+- Description: How many subagent threads are listed under a parent thread in the [Threads Sidebar](../ai/parallel-agents.md#threads-sidebar) before a "Load more" row.
+- Setting: `agent.orchestration.subthreads_visible`
+- Default: `5`
+
+**Options**
+
+A positive integer. The most recently active subagent threads are listed first, sorted by the time of their last message. "Load more" reveals the rest.
+
+Open the Settings Editor and search for “Visible Subagent Threads”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "subthreads_visible": 10
+    }
+  }
+}
+```
+
 ## Agent UI Font Family {#agent-ui-font-family}
 
 - Description: Font family for agent responses in the Agent Panel.

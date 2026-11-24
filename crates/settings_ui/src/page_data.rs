@@ -9102,7 +9102,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 8] {
+    fn general_section() -> [SettingsPageItem; 10] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9189,6 +9189,60 @@ fn ai_page(cx: &App) -> SettingsPage {
                             .agent
                             .get_or_insert_default()
                             .set_threads_sidebar_auto_open(value);
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Subagent Threads In Sidebar",
+                description: "Whether subagent threads are shown nested under their parent thread in the Threads Sidebar.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.show_as_subthreads"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .show_as_subthreads
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .show_as_subthreads = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Visible Subagent Threads",
+                description: "How many subagent threads are listed under a parent thread in the Threads Sidebar before \"Load more\".",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.subthreads_visible"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .subthreads_visible
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .subthreads_visible = value;
                     },
                 }),
                 metadata: None,

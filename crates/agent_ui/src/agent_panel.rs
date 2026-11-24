@@ -4211,6 +4211,22 @@ impl AgentPanel {
         })
     }
 
+    /// Shows one of the subagent threads of the conversation `thread_id`.
+    pub fn navigate_to_subthread(
+        &mut self,
+        thread_id: &ThreadId,
+        session_id: acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.conversation_view_for_id(thread_id, cx).cloned() else {
+            return;
+        };
+        conversation_view.update(cx, |view, cx| {
+            view.navigate_to_thread(session_id, window, cx);
+        });
+    }
+
     pub fn regenerate_thread_title(
         &mut self,
         thread_id: ThreadId,

@@ -215,6 +215,7 @@ pub struct AgentSettings {
     pub flexible: bool,
     pub max_idle_retained_threads: usize,
     pub threads_sidebar: ThreadsSidebarSettings,
+    pub orchestration: OrchestrationSettings,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
@@ -251,6 +252,12 @@ pub struct AgentSettings {
     pub auto_generate_thread_titles: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OrchestrationSettings {
+    pub show_as_subthreads: bool,
+    pub subthreads_visible: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -764,6 +771,7 @@ impl Settings for AgentSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let agent = content.agent.clone().unwrap();
         let threads_sidebar = agent.threads_sidebar.unwrap();
+        let orchestration = agent.orchestration.unwrap();
         Self {
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
@@ -779,6 +787,10 @@ impl Settings for AgentSettings {
                     .unwrap()
                     .into_gpui()
                     .clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH),
+            },
+            orchestration: OrchestrationSettings {
+                show_as_subthreads: orchestration.show_as_subthreads.unwrap(),
+                subthreads_visible: orchestration.subthreads_visible.unwrap(),
             },
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),

@@ -226,6 +226,11 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.metadata.title
                 );
             }
+            ListEntry::Subthread(_) | ListEntry::LoadMoreSubthreads { .. } => {
+                panic!(
+                    "unexpected subagent thread row while simulating remote project integration flicker"
+                );
+            }
         }
     }
 
@@ -1475,6 +1480,19 @@ fn visible_entries_as_strings(
                             };
                             format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
                         }
+                    }
+                    ListEntry::Subthread(subthread) => {
+                        let title = &subthread.info.title;
+                        let status_str = match subthread.info.status {
+                            AgentThreadStatus::Running => " (running)",
+                            AgentThreadStatus::Error => " (error)",
+                            AgentThreadStatus::WaitingForConfirmation => " (waiting)",
+                            _ => "",
+                        };
+                        format!("    {title}{status_str}{selected}")
+                    }
+                    ListEntry::LoadMoreSubthreads { .. } => {
+                        format!("    Load more{selected}")
                     }
                     ListEntry::Terminal(terminal) => {
                         let title = terminal.metadata.display_title();
@@ -7183,7 +7201,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                _ => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7269,7 +7287,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                _ => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -7308,7 +7326,7 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                _ => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -9410,6 +9428,9 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         "unexpected sidebar terminal while opening linked worktree thread: title=`{}`",
                         terminal.metadata.title
                     );
+                }
+                ListEntry::Subthread(_) | ListEntry::LoadMoreSubthreads { .. } => {
+                    panic!("unexpected subagent thread row while opening linked worktree thread");
                 }
             }
         }
@@ -18239,4 +18260,367 @@ fn updated_entries(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) 
     sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
     visible_entries_as_strings(sidebar, cx)
+}
+
+fn set_orchestration_settings(
+    show_as_subthreads: bool,
+    subthreads_visible: usize,
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        AgentSettings::override_global(
+            AgentSettings {
+                orchestration: agent_settings::OrchestrationSettings {
+                    show_as_subthreads,
+                    subthreads_visible,
+                },
+                ..AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    });
+}
+
+/// Registers a subagent of `parent` with a title and one message.
+async fn add_subagent(
+    parent: &Entity<AcpThread>,
+    session_id: &str,
+    title: &str,
+    cx: &mut gpui::VisualTestContext,
+) -> Entity<AcpThread> {
+    let subagent = cx
+        .update(|_, cx| {
+            let parent = parent.read(cx);
+            parent.connection().clone().load_session(
+                acp::SessionId::new(session_id),
+                parent.project().clone(),
+                PathList::default(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("subagent session");
+    subagent.update(cx, |subagent, cx| {
+        subagent.set_title(title.to_string().into(), cx).detach();
+    });
+    parent.update(cx, |parent, cx| {
+        parent.register_subagent(subagent.clone(), cx)
+    });
+    cx.run_until_parked();
+    touch_subagent(&subagent, cx);
+    subagent
+}
+
+/// Adds a message to the subagent, making it the most recently active one.
+fn touch_subagent(subagent: &Entity<AcpThread>, cx: &mut gpui::VisualTestContext) {
+    // Message times are wall-clock, so make sure each one is distinct.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    subagent.update(cx, |subagent, cx| {
+        subagent.push_assistant_content_block("update".into(), false, cx);
+    });
+    cx.run_until_parked();
+}
+
+/// A live parent thread with `count` subagents named "Child 1" to "Child N",
+/// where Child N spoke last.
+async fn setup_parent_with_subagents(
+    project: &Entity<project::Project>,
+    panel: &Entity<AgentPanel>,
+    count: usize,
+    cx: &mut gpui::VisualTestContext,
+) -> (ThreadId, Entity<AcpThread>, Vec<Entity<AcpThread>>) {
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(panel, connection, cx);
+    send_message(panel, cx);
+
+    let parent_session_id = active_session_id(panel, cx);
+    save_test_thread_metadata(&parent_session_id, project, cx).await;
+    let parent_thread_id = active_thread_id(panel, cx);
+    let parent_thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+
+    let mut children = Vec::new();
+    for n in 1..=count {
+        children.push(
+            add_subagent(
+                &parent_thread,
+                &format!("child-{n}"),
+                &format!("Child {n}"),
+                cx,
+            )
+            .await,
+        );
+    }
+    (parent_thread_id, parent_thread, children)
+}
+
+#[gpui::test]
+async fn test_subagent_threads_stay_out_of_sidebar_when_setting_is_off(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(false, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 2, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.expanded_subthread_groups.insert(parent_thread_id);
+        sidebar.update_entries(cx);
+    });
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.contents.subthread_counts.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_subagent_threads_nest_under_parent_collapsed_by_default(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 3, cx).await;
+
+    // Collapsed by default, but the parent knows it has children.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(
+            sidebar.contents.subthread_counts.get(&parent_thread_id),
+            Some(&3)
+        );
+    });
+
+    // Expanded, the most recently active child comes first.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Child 3",
+            "    Child 2",
+            "    Child 1",
+        ]
+    );
+
+    // Collapsing hides them again.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"]
+    );
+}
+
+#[gpui::test]
+async fn test_subagent_threads_are_ordered_by_last_message(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, children) =
+        setup_parent_with_subagents(&project, &panel, 3, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    // Child 1 speaks again, so it is now the most recent.
+    touch_subagent(&children[0], cx);
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Child 1",
+            "    Child 3",
+            "    Child 2",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_subagent_threads_respect_visible_limit_and_load_more(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 2, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 5, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Child 5",
+            "    Child 4",
+            "    Load more",
+        ]
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.load_more_subthreads(parent_thread_id, cx)
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Child 5",
+            "    Child 4",
+            "    Child 3",
+            "    Child 2",
+            "    Child 1",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_only_one_level_of_subagent_threads_is_shown(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, children) =
+        setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    add_subagent(&children[0], "grandchild", "Grandchild", cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *", "    Child 1"]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.contents.subthread_counts.len(), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_subagent_thread_rows_show_status(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, children) =
+        setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    request_test_tool_authorization(&children[0], "child-tool-call", "allow-child", cx);
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello * (waiting)",
+            "    Child 1 (waiting)",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_opening_a_subagent_thread_row_shows_it_in_the_panel(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    let subthread = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subthread(subthread) => Some(subthread.clone()),
+                _ => None,
+            })
+            .expect("expected a subagent row")
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_subthread(&subthread, window, cx);
+    });
+    cx.run_until_parked();
+
+    let shown_session_id = panel.read_with(cx, |panel, cx| {
+        panel
+            .active_conversation_view()
+            .and_then(|view| view.read(cx).active_thread().cloned())
+            .map(|thread_view| thread_view.read(cx).thread.read(cx).session_id().clone())
+    });
+    assert_eq!(shown_session_id, Some(acp::SessionId::new("child-1")));
+}
+
+#[test]
+fn test_select_visible_subthreads_orders_by_recency_and_limits() {
+    let at = |seconds: i64| DateTime::from_timestamp(seconds, 0);
+    let subthread = |title: &str, last_message_at| agent_ui::SubthreadInfo {
+        session_id: acp::SessionId::new(title.to_string()),
+        title: title.to_string().into(),
+        status: AgentThreadStatus::Completed,
+        last_message_at,
+        icon: IconName::ZedAgent,
+        icon_from_external_svg: None,
+    };
+    let subthreads = vec![
+        subthread("silent", None),
+        subthread("old", at(10)),
+        subthread("newest", at(30)),
+        subthread("middle", at(20)),
+    ];
+    let titles = |visible: &subthreads::VisibleSubthreads| {
+        visible
+            .shown
+            .iter()
+            .map(|info| info.title.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let limited = subthreads::select_visible_subthreads(subthreads.clone(), 2, false);
+    assert_eq!(titles(&limited), vec!["newest", "middle"]);
+    assert_eq!(limited.hidden, 2);
+
+    let everything = subthreads::select_visible_subthreads(subthreads.clone(), 2, true);
+    assert_eq!(
+        titles(&everything),
+        vec!["newest", "middle", "old", "silent"]
+    );
+    assert_eq!(everything.hidden, 0);
+
+    let exact = subthreads::select_visible_subthreads(subthreads, 4, false);
+    assert_eq!(exact.hidden, 0);
 }

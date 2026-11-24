@@ -1204,6 +1204,13 @@
       // Automatically open the Threads Sidebar when opening a folder in an existing window.
       "auto_open": true,
     },
+    // Settings for how subagent threads are presented.
+    "orchestration": {
+      // Show subagent threads nested under their parent thread in the Threads Sidebar.
+      "show_as_subthreads": true,
+      // How many subagent threads to list under a parent thread before "Load more".
+      "subthreads_visible": 5,
+    },
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.
     "default_width": 640,
