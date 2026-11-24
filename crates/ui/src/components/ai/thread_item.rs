@@ -384,9 +384,9 @@ impl RenderOnce for ThreadItem {
             IconButton::new(
                 format!("disclosure-{}", self.id),
                 if disclosure.is_open {
-                    IconName::ChevronDown
+                    IconName::ChevronUp
                 } else {
-                    IconName::ChevronRight
+                    IconName::ChevronDown
                 },
             )
             .icon_size(IconSize::Small)

@@ -18809,3 +18809,120 @@ async fn test_viewed_subthread_row_is_the_active_one(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+async fn test_subagent_added_after_sidebar_was_built_appears_without_manual_rebuild(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, parent_thread, _) =
+        setup_parent_with_subagents(&project, &panel, 0, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"]
+    );
+
+    // No toggle, no update_entries: only the agent adds a subagent.
+    add_subagent(&parent_thread, "late-child", "Late Child", cx).await;
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *", "    Late Child"]
+    );
+}
+
+#[gpui::test]
+async fn test_subagent_status_and_title_changes_update_its_row(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, children) =
+        setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    children[0].update(cx, |child, cx| {
+        child.set_title("Renamed Child".into(), cx).detach();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *", "    Renamed Child"]
+    );
+
+    request_test_tool_authorization(&children[0], "child-tool-call", "allow-child", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello * (waiting)",
+            "    Renamed Child (waiting)",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_acp_announced_subagent_appears_under_its_parent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, parent_thread, _) =
+        setup_parent_with_subagents(&project, &panel, 0, cx).await;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_subthreads(parent_thread_id, cx)
+    });
+
+    // Built the way `subagent_update` builds one: agent-owned, linked to its parent by
+    // session id, labelled by the parent's association.
+    let (parent_session_id, connection) = parent_thread.read_with(cx, |parent, _| {
+        (parent.session_id().clone(), parent.connection().clone())
+    });
+    let subagent = cx.update(|_, cx| {
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+        cx.new(|cx| {
+            AcpThread::new(
+                Some(parent_session_id),
+                None,
+                None,
+                connection,
+                project.clone(),
+                action_log,
+                acp::SessionId::new("acp-child"),
+                watch::Receiver::constant(acp_v2::PromptCapabilities::default()),
+                cx,
+            )
+            .agent_owned()
+        })
+    });
+    subagent.update(cx, |subagent, cx| {
+        subagent
+            .update_subagent_association(
+                &acp_v2::SubagentUpdate::new("acp-child").title("Explore the repo"),
+                cx,
+            )
+            .unwrap();
+    });
+    parent_thread.update(cx, |parent, cx| {
+        parent.register_subagent(subagent.clone(), cx)
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *", "    Explore the repo"]
+    );
+}
