@@ -2,7 +2,7 @@
 
 This file lists every file changed for orchestrated threads, so a human reviewer can review each one individually before anything is proposed upstream to Zed. A checkmark in the "Manual review" column means a human reviewed that file; an empty cell means it has not been reviewed yet. The fork owner fills this column, nobody else.
 
-Base commit: `0be6d59`. Last commit covered: `10530cf` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17).
+Base commit: `0be6d59`. Last commit covered: `bd64c7b` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
 
 ## Files
 
@@ -56,6 +56,10 @@ Base commit: `0be6d59`. Last commit covered: `10530cf` (inclusive). Requirements
 | [crates/agent/src/tools/send_to_parent_tool.rs](../../crates/agent/src/tools/send_to_parent_tool.rs) | New native tool for a child to message its orchestrator, with an `urgent` flag. | R15 | |
 | [crates/agent/src/tools/start_child_tool.rs](../../crates/agent/src/tools/start_child_tool.rs) | New native tool that starts a child, with agent, `profile`, model and worktree options. | R1, R2, R17 | |
 | [crates/agent/src/tools/whoami_tool.rs](../../crates/agent/src/tools/whoami_tool.rs) | New native tool that returns the thread's role, its parent and its children. | R14 | |
+| [crates/agent/src/tools/list_siblings_tool.rs](../../crates/agent/src/tools/list_siblings_tool.rs) | New native tool that lists the other children of the caller's orchestrator, with their status. | R3b |
+| [crates/agent/src/tools/send_to_sibling_tool.rs](../../crates/agent/src/tools/send_to_sibling_tool.rs) | New native tool that messages a sibling child, with optional `await_reply` and a timeout. | R3b |
+| [crates/agent_ui/src/conversation_view/orchestrated_permissions.rs](../../crates/agent_ui/src/conversation_view/orchestrated_permissions.rs) | New cards in the orchestrator thread for its children's permission requests, with Allow, Deny and Open. | R13 |
+| [crates/orchestration/src/quota.rs](../../crates/orchestration/src/quota.rs) | New per-child subagent counter, ticket directory, Claude Code session options and the PreToolUse hook command. | R6 |
 | [crates/agent_servers/Cargo.toml](../../crates/agent_servers/Cargo.toml) | Adds the `orchestration` workspace dependency. | R1 | |
 | [crates/agent_servers/src/acp/v2.rs](../../crates/agent_servers/src/acp/v2.rs) | Adds the orchestration MCP entry to new and loaded ACP v2 sessions when the agent supports stdio MCP, with a test. | R1 | |
 | [crates/agent_settings/src/agent_profile.rs](../../crates/agent_settings/src/agent_profile.rs) | Adds an optional `description` to agent profiles and to profile creation, with a test. | R17 | |
@@ -162,6 +166,8 @@ Changed again in `b1c2733`: `SubthreadInfo` gains `model` and `thread_id` (`None
 - Review focus:
   - The provider icon applies only when the thread is a native one; external agents keep the agent icon.
 
+Changed again in `cbf577d`: declares the `orchestrated_permissions` module. In `bd64c7b`: `stage_session_quota` before and `clear_staged_session_quota` after `new_session`, so the grant reaches only that session.
+
 #### [`crates/agent_ui/src/agent_ui.rs`](../../crates/agent_ui/src/agent_ui.rs)
 
 - Scope: crate wiring.
@@ -171,6 +177,8 @@ Changed again in `b1c2733`: `SubthreadInfo` gains `model` and `thread_id` (`None
   - The `Stub` server path is test-only code; confirm it is behind the same cfg as before.
 
 Changed again in `b1c2733` and `d303f89`: `model_icon_parts` is re-exported; the test settings literal gains `human_summary_max_chars: 600`.
+
+Changed again in `cbf577d`: the test settings literal gains `max_concurrent_children: 6` and `max_sibling_messages: 20`.
 
 #### [`crates/agent_settings/src/agent_settings.rs`](../../crates/agent_settings/src/agent_settings.rs)
 
@@ -185,6 +193,8 @@ Changed again in `d303f89` (R16): `OrchestrationSettings.human_summary_max_chars
 - Review focus:
   - `default.json` defines `human_summary_max_chars`, so the `unwrap()` holds.
 
+Changed again in `cbf577d` (R3b, R10): `OrchestrationSettings` gains `max_concurrent_children` and `max_sibling_messages` (both `usize`), read with `unwrap()` like their siblings.
+
 #### [`crates/settings_content/src/agent.rs`](../../crates/settings_content/src/agent.rs)
 
 - Scope: the user-facing settings schema.
@@ -197,6 +207,8 @@ Changed again in `d303f89` (R16): `OrchestrationSettings.human_summary_max_chars
 Changed again in `d303f89` (R16): `OrchestrationSettingsContent.human_summary_max_chars: Option<usize>`, and the seven orchestration tool names in the profile tools schema list. In `10530cf` (R17): `AgentProfileSettingsContent.description: Option<String>`.
 - Review focus:
   - Doc comments match the default (600) and the profile description semantics.
+
+Changed again in `cbf577d`: `OrchestrationSettingsContent` gains `max_concurrent_children` (default 6) and `max_sibling_messages` (default 20); the doc comment of `enabled` lists the nine tools; `list_siblings` and `send_to_sibling` join the profile tools schema list.
 
 #### [`assets/settings/default.json`](../../assets/settings/default.json)
 
@@ -212,6 +224,8 @@ Changed again in `b1c2733`: the five tools of `b1c2733` are enabled in the `writ
   - The built-in descriptions are the text an orchestrator reads when picking a profile.
   - `ask` and `minimal` get no orchestration tools by default.
 
+Changed again in `cbf577d`: `max_concurrent_children: 6` and `max_sibling_messages: 20` with comments, the `enabled` comment lists `list_siblings` and `send_to_sibling`, and both are enabled in the `write` profile.
+
 #### [`crates/settings_ui/src/page_data.rs`](../../crates/settings_ui/src/page_data.rs)
 
 - Scope: Settings Editor entries for the new settings.
@@ -225,6 +239,8 @@ Changed again in `d303f89` (R16): a fifth item, "Human Intervention Summary Leng
 - Review focus:
   - Array length matches the item count; `json_path` matches the key.
 
+Changed again in `cbf577d`: two items, "Maximum Concurrent Child Threads" and "Maximum Sibling Messages"; the array in `general_section` goes from 13 to 15 items.
+
 #### [`crates/agent/src/tool_permissions.rs`](../../crates/agent/src/tool_permissions.rs)
 
 - Scope: test fixture only.
@@ -234,6 +250,8 @@ Changed again in `d303f89` (R16): a fifth item, "Human Intervention Summary Leng
   - Test-only; confirm nothing outside the test module changed.
 
 Changed again in `d303f89`: the test literal also sets `human_summary_max_chars: 600`.
+
+Changed again in `cbf577d`: the test literal also sets `max_concurrent_children: 6` and `max_sibling_messages: 20`.
 
 #### [`docs/src/reference/all-settings.md`](../../docs/src/reference/all-settings.md)
 
@@ -247,6 +265,8 @@ Changed again in `d303f89`: the test literal also sets `human_summary_max_chars:
 Changed again in `d303f89` (R16): section "Human Intervention Summary Length" (`agent.orchestration.human_summary_max_chars`, default `600`, behavior and example). In `10530cf` (R17): section "Profile Description" (`agent.profiles.<id>.description`), how the child's model is resolved, and a `settings.json` example.
 - Review focus:
   - The model resolution order text matches `resolve_child_model`.
+
+Changed again in `cbf577d`: sections "Maximum Concurrent Child Threads" and "Maximum Sibling Messages", each with the setting, default, behavior and an example.
 
 ### R1–R5: orchestration core (groundwork)
 
@@ -298,6 +318,10 @@ Changed again in `b1c2733`: `mod bridge;`, `mod mcp;` and their `pub use`. In `d
   - The child header text is what a child model reads first; check the wording.
   - The model order: explicit, profile default, `agent.subagent_model`, user default.
 
+Changed again in `cbf577d` (R3b, R12, R10): `ListSiblingsInput`/`Output`, `SiblingInfo`, `SendToSiblingInput`/`Output` (`await_reply`, `timeout_secs`, `reply`, `timed_out`, `messages_left`); `sibling_message_prefix` and `sibling_message_text`; `sibling_messages` on `ChildStatusInfo`; the default constants for the reply timeout, `max_sibling_messages` and `max_concurrent_children`; and the host methods `cancel_thread_turn`, `load_child`, `list_siblings` and `send_to_sibling`. In `bd64c7b` (R6): `mod quota`, `subagent_quota` on `StartChildInput`, `SubagentQuotaStatus` and `subagent_quota` on `ChildStatusInfo`; `child_header` now takes the quota, states it, and mentions the sibling tools.
+- Review focus:
+  - `child_header` is the only place that tells a child about its quota and its siblings.
+
 #### [`crates/orchestration/src/registry.rs`](../../crates/orchestration/src/registry.rs)
 
 - Scope: the live record of every child of every orchestrator (R3), including `await_children` and `child_status` (R1, R5) and the logging calls (R4).
@@ -314,6 +338,10 @@ Changed again in `b1c2733`: session tokens (`mint_pending_session_token`, `bind_
   - Urgent delivery only when the orchestrator is idle, and never delivered twice.
   - Human messages never reach the log or the orchestrator, only the summary (`direction: human_intervention`).
 
+Changed again in `cbf577d` (details in "R3b, R12, caps and restart"): sibling inbox, per-pair counters, `send_to_sibling` with waits and `would_deadlock`, `flush_sibling_inbox`, `cancel_running_descendants`, `restore_child`, `running_children` with `reserve_child_slot` and `release_child_slot`, `remove_orchestrator` (children, tokens, waits), `revoke_session_tokens`, and the settings readers `max_concurrent_children` and `max_sibling_messages`. In `bd64c7b` (details in "R6: subagent quota"): a quota per child, `set_subagent_quota`, `consume_subagent_quota`, `refund_subagent_quota`, `check_announced_subagent` and `session_quota_grant`; the grant is logged when a child is registered, and `restore_child` rebuilds the grant and the use from the log.
+- Review focus:
+  - This is the largest diff of the two commits; read the tests next to each method.
+
 #### [`crates/orchestration/src/child_log.rs`](../../crates/orchestration/src/child_log.rs)
 
 - Scope: R4, the per-child exchange log.
@@ -324,6 +352,8 @@ Changed again in `b1c2733`: session tokens (`mint_pending_session_token`, `bind_
   - Directory creation and error handling in `append`.
 
 Changed again in `d303f89`: `LogDirection` gains `ToParent` (from `send_to_parent`) and `HumanIntervention` (the summary, never the human's messages).
+
+Changed again in `cbf577d`: `LogDirection` gains `ToSibling` and `FromSibling`, `ChildLogEntry` gains an optional `sibling` (the other child's id, omitted when empty), and `append_sibling`. In `bd64c7b`: `LogDirection::Quota` for the grant, counted or refused spawns and cancelled subagents.
 
 #### [`crates/agent_ui/Cargo.toml`](../../crates/agent_ui/Cargo.toml)
 
@@ -349,6 +379,10 @@ Changed again in `d303f89` (R14 to R16): the child's first prompt is prefixed wi
   - `watch_orchestrator` subscription lifetime (one per orchestrator).
   - The "profile ignored for external agents" warning path.
 
+Changed again in `cbf577d`: `watch_saved_children` and `restore_saved_children` rebuild the registry from the thread metadata; a `ChildConversations` global with `child_conversation_view`; `open_child` and `load_child` open an unloaded child; `send_or_queue` and `flush_pending` park messages while a child's agent connects; `start_child` reserves a slot under `max_concurrent_children`; `cancel_thread_turn`; `cancel_child` cascades to the children of a child that orchestrates; the thread observer flushes parked and sibling messages when a turn ends. In `bd64c7b`: the child's first prompt uses `child_header(title, quota)` and the request carries a `ChildSubagentQuota`.
+- Review focus:
+  - A child in another workspace's panel is not reachable (error in `open_child`).
+
 #### [`crates/agent_ui/src/agent_panel.rs`](../../crates/agent_ui/src/agent_panel.rs)
 
 - Scope: the panel is the host registered with the registry (R1), starts children (R2) and links them to the parent (R3). Also adds `navigate_to_subthread` for R9 (`b7c55ae`).
@@ -364,6 +398,8 @@ Changed again in `d303f89`: only tests were added (`OrchestrationFixture` helper
   - Ordering: the profile swaps the thread to its own model, so an explicit model must be applied after it.
   - The restricted-workspace case: a model-requested profile must not lift the `minimal` downgrade.
 
+Changed again in `cbf577d`: archiving a thread cancels its running descendants; `watch_saved_children` is installed with the host; `load_thread_in_background` opens a saved thread without activating it; `remove_thread_internal` cancels descendants, revokes the thread's session tokens and removes the orchestrator from the registry; new tests for the cascade, the concurrency cap, sibling messages, the restart rebuild and the permission cards. In `bd64c7b`: `ChildSubagentQuota` and `ChildThreadRequest.subagent_quota`, and `create_child_thread` stores the grant (`set_subagent_quota`) before returning, because the session starts in the background; tests for the header, `child_status` and quota-limited starts.
+
 #### [`crates/agent_ui/src/conversation_view/thread_view.rs`](../../crates/agent_ui/src/conversation_view/thread_view.rs)
 
 - Scope: R3 follow-ups from the orchestrator to a child.
@@ -377,6 +413,8 @@ Changed again in `b1c2733`: `active_model(cx)` returns the model selector's acti
 - Review focus:
   - The first message of a thread is never counted as human (for a child it is the orchestrator's prompt).
   - A queued message keeps its origin when it is sent later.
+
+Changed again in `cbf577d` (R13): `orchestrated_child_watches`, set up with the other subscriptions, and the card block is placed above the generic permissions and the legacy awaiting-permission block in the activity bar.
 
 #### [`crates/agent_ui/src/thread_metadata_store.rs`](../../crates/agent_ui/src/thread_metadata_store.rs)
 
@@ -432,6 +470,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
 - Review focus:
   - The new arm uses the merged `AgentSettings`, so the setting takes effect without a restart.
 
+Changed again in `cbf577d`: declares and registers `list_siblings_tool` and `send_to_sibling_tool`, so the module lists nine orchestration tools.
+
 #### [`crates/agent/src/tools/orchestration_common.rs`](../../crates/agent/src/tools/orchestration_common.rs)
 
 - Scope: plumbing shared by all native orchestration tools.
@@ -441,6 +481,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
   - Error messages are written for the model ("Orchestration is not available for this thread...").
   - `d303f89` added the two child-side tools and the stricter availability check.
 
+Changed again in `cbf577d`: `ORCHESTRATION_TOOL_NAMES` grows from 7 to 9 and the availability gate requires an orchestrator for `list_siblings` and `send_to_sibling` too; the fake host gains the sibling methods. In `bd64c7b`: a test that `start_child` is refused once the caller's quota is used and that the refused call never reaches the host.
+
 #### [`crates/agent/src/tools/start_child_tool.rs`](../../crates/agent/src/tools/start_child_tool.rs), [`await_children_tool.rs`](../../crates/agent/src/tools/await_children_tool.rs), [`child_status_tool.rs`](../../crates/agent/src/tools/child_status_tool.rs), [`send_to_child_tool.rs`](../../crates/agent/src/tools/send_to_child_tool.rs) and [`cancel_child_tool.rs`](../../crates/agent/src/tools/cancel_child_tool.rs)
 
 - Scope: the orchestrator-side tools (R1 to R5).
@@ -449,6 +491,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
 - Review focus:
   - Description text is behavior: check it against R5 (no transcripts) and R15, R16.
   - No tool returns child content other than the final message.
+
+Changed again in `cbf577d` and `bd64c7b`: the descriptions of `start_child`, `cancel_child`, `child_status` and `send_to_child` now state the concurrency cap, sibling messages, the cascade, the queueing while a child connects and the opening of unloaded children; `start_child` runs through `start_child_within_quota`, and its description explains `subagent_quota` (default 0).
 
 #### [`crates/agent/src/tools/list_agents_and_models_tool.rs`](../../crates/agent/src/tools/list_agents_and_models_tool.rs)
 
@@ -465,6 +509,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
 - Why: same as `v1.rs`, for the v2 protocol.
 - Review focus:
   - The server is added only if the agent supports stdio MCP.
+
+Changed again in `bd64c7b`: `new_session` adds the quota `_meta`; tests with a scripted v2 connection check that over-quota subagents are cancelled and logged, not cancelled without `capabilities.cancel`, and that non-orchestrated threads have no quota.
 
 #### [`crates/context_server/src/listener.rs`](../../crates/context_server/src/listener.rs)
 
@@ -494,6 +540,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
   - The tool annotations (read-only or destructive) are correct.
   - The Unix-only code paths are `cfg`-gated.
 
+Changed again in `cbf577d` and `bd64c7b`: the server registers `list_siblings` and `send_to_sibling`; the MCP `start_child` goes through `start_child_within_quota`; a test lists and messages a sibling through the bridge.
+
 #### [`crates/zed/src/main.rs`](../../crates/zed/src/main.rs)
 
 - Scope: process entry point.
@@ -510,6 +558,8 @@ Commit `b1c2733` (extended by `d303f89` and `10530cf`). The orchestration tools 
 - Why: a test checks that every tool is either listed in the page or explicitly exempt.
 - Review focus:
   - Confirm that exempting these tools matches R13 (children's permission requests surface in the orchestrator).
+
+Changed again in `cbf577d`: the test list of tools without permission settings also holds `list_siblings` and `send_to_sibling`.
 
 ### R9: metadata children, rename and provider icons
 
@@ -606,6 +656,8 @@ Changed again in `10530cf` (R17): `selection_to_model_string` (formats a selecti
 - Review focus:
   - The `provider/model-id` form must match what `start_child`'s `model` accepts.
 
+Changed again in `bd64c7b` (R6 L1): `count_toward_subagent_quota` and `refund_subagent_quota` make `spawn_agent` and `create_thread` count against the caller's quota, refund it when the start fails, and look the child up by the caller's root session; `create_counted_sibling_thread` is split out of `create_sibling_thread`; a test covers the counting.
+
 #### [`crates/agent/src/thread.rs`](../../crates/agent/src/thread.rs)
 
 - Scope: access to a private field.
@@ -618,6 +670,8 @@ Changed again in `b1c2733`, `d303f89` and `10530cf`: `add_default_tools` registe
 - Review focus:
   - Availability is decided in `enabled_tools` from the host registry; check it is not stale after a host registers or a child is created.
   - Subagents (threads with a parent) must not get the tools.
+
+Changed again in `cbf577d`: `add_default_tools` registers `list_siblings` and `send_to_sibling` only for a thread with a parent link; the test expects 9 tools for a child.
 
 #### [`crates/agent_servers/src/acp.rs`](../../crates/agent_servers/src/acp.rs) and [`crates/agent_servers/src/acp/v1.rs`](../../crates/agent_servers/src/acp/v1.rs)
 
@@ -636,9 +690,83 @@ Changed again in `b1c2733`: new, loaded and resumed sessions build the MCP list 
 - Review focus:
   - Loading or resuming a session reuses the same token.
 
+Changed again in `bd64c7b` (R6): `acp.rs` gains `enforce_subagent_quota` (cancels subagents announced beyond the quota, never while history is replaying, and logs it) and `quota_session_meta` (takes the staged grant and, for Claude Code only, builds the `session/new` `_meta`). `v1.rs` adds that `_meta` to the new-session request and calls `enforce_subagent_quota` after each subagent update. The v2 path in `acp.rs` calls the check after applying each subagent update.
+- Review focus:
+  - `quota_session_meta` always takes the staged grant, so it cannot reach another session; it returns nothing for any agent other than Claude Code.
+  - The v1 path has no test of its own.
+
+### R3b, R12, caps and restart
+
+Commit `cbf577d`. Children message each other, the cascade follows the orchestrator thread's life, two caps limit load, and the registry survives a restart. Many files appear in other sections with a "Changed again in `cbf577d`" paragraph; the logic is in these two tools and in the files below.
+
+#### [`crates/agent/src/tools/list_siblings_tool.rs`](../../crates/agent/src/tools/list_siblings_tool.rs) and [`crates/agent/src/tools/send_to_sibling_tool.rs`](../../crates/agent/src/tools/send_to_sibling_tool.rs)
+
+- Scope: the two native tools of R3b, thin `AgentTool` adapters over the host, like the other orchestration tools.
+- What changed: `list_siblings` returns the other children of the caller's orchestrator (id, title, agent, model, status). `send_to_sibling` sends a message, with `await_reply` and `timeout_secs`; the description tells the model to use `send_to_parent` for blockers and results, and what the cap and the deadlock error mean.
+- Why: children need a quick fact from each other without spending the orchestrator's context (decision D1).
+- Review focus:
+  - The tool descriptions match the behavior in `registry.rs` (prefix, idle-only delivery, cap error, deadlock error).
+  - Both tools are registered only for a thread with a parent link (`thread.rs`, `orchestration_common.rs`).
+
+#### Sibling messages in [`registry.rs`](../../crates/orchestration/src/registry.rs)
+
+- Scope: `send_to_sibling`, `list_siblings`, `flush_sibling_inbox`, `would_deadlock`, the pair counters.
+- What changed: a message is logged in both children's logs, counted per pair (both directions), and put in the receiver's inbox; it is delivered as one new message in the receiver's thread only when it is idle, and the host flushes it again when a turn ends. With `await_reply` the sender waits for the receiver's next `send_to_sibling` to it; that message is the tool result and is not also delivered. A second waiter that would close a cycle of waits gets an error and nothing is sent. A wait whose receiver was dropped does not block anyone, and removing a thread ends the waits on it.
+- Why: auditable direct messaging without loops or hangs.
+- Review focus:
+  - `await_reply` returns the sibling's next `send_to_sibling`, not its final message (the reason is in R3b of the spec).
+  - A refused message (cap, deadlock) is neither logged nor counted.
+
+#### Cascade, caps and restart
+
+- Scope: `cancel_running_descendants`, `reserve_child_slot`, `restore_child`, `remove_orchestrator`, `revoke_session_tokens` in `registry.rs`; `agent_panel.rs`; `orchestration_host.rs`.
+- What changed:
+  - Cascade (R12): archiving or deleting an orchestrator thread cancels its running descendants, deepest first; `cancel_child` on a child that orchestrates cancels that child's running children and leaves its siblings. Cancelling the orchestrator's own turn does not cascade. Closing a window is not a trigger.
+  - Caps (R10): `start_child` takes a slot under `agent.orchestration.max_concurrent_children` before it creates the thread and releases it on failure or once the child is registered, so concurrent calls cannot pass the cap together. `max_sibling_messages` caps each pair.
+  - Restart (R3): an observer on the thread metadata store adds a record for each unarchived thread that has a parent link and that no panel holds. Status, final message, turn count, sibling counters and the quota are rebuilt from the child's log (a log lost with `$TMPDIR` leaves them empty). `send_to_child` opens an unloaded child without activating it and parks the message until its agent connects.
+  - Token revocation: deleting a thread revokes its session tokens and removes it from the registry.
+- Why: no orphan children spending tokens, bounded load and loops, and tools that still work after a restart.
+- Review focus:
+  - The cascade runs before the thread is dropped, because it needs the thread.
+  - A child that lives in another workspace's panel is not reachable from this panel (error text in `open_child`).
+  - `restore_child` ignores a child the registry already knows.
+
+### R13: permission cards
+
+Commit `cbf577d`.
+
+#### [`crates/agent_ui/src/conversation_view/orchestrated_permissions.rs`](../../crates/agent_ui/src/conversation_view/orchestrated_permissions.rs)
+
+- Scope: the cards that show a child's permission requests in the orchestrator's thread, and the answer path.
+- What changed: new module. `orchestrated_child_permission_cards` reads the pending requests of each direct child's root session; `render_orchestrated_child_permissions` draws one card per request (child title, agent, model, tool, a short input of at most 240 characters, and the buttons of the request: Allow tinted as success, "always" when offered, Deny, plus Open); `answer_child_permission` sends the answer through the child's own conversation, as the child's prompt would; `watch_orchestrated_children` and `sync_orchestrated_child_watches` follow each child's thread so cards appear and disappear.
+- Why: decision D4. The human decides from one place and Zed never answers for them.
+- Review focus:
+  - The answer is the same call the child's own prompt makes, so the child's tool call, its sidebar row and the registry follow from it.
+  - Only direct children and only each child's root session; a grandchild's request shows in its own orchestrator.
+  - The Open button does nothing when the child is no longer open or its workspace is gone.
+
+`thread_view.rs` places the block above the orchestrator's own awaiting-permission prompts (paragraph in the thread view section). `conversation_view.rs` declares the module.
+
+### R6: subagent quota
+
+Commit `bd64c7b`. Layers L1 to L5 of the spec.
+
+#### [`crates/orchestration/src/quota.rs`](../../crates/orchestration/src/quota.rs)
+
+- Scope: everything of R6 that does not depend on the UI.
+- What changed: new module. `SubagentQuota` counts a child's spawns (L1 `consume` and `refund`, L4 `note_announced`) and reads the tickets left in the child's ticket directory; `used()` is the largest of the counts the layers keep. `claude_code_quota_meta` builds the `session/new` `_meta`: quota 0 sets `disallowedTools` to `Agent` and `Task`; quota N writes N ticket files in `<log_dir>/<orchestrator-id>/<child-id>.quota/` and sets a `PreToolUse` command hook with matcher `Agent|Task` inside `settings` (the adapter's `hooks` option takes callbacks only). `quota_hook_command` is the shell command: it takes one ticket with `rm` and allows the call, or writes to stderr and exits with code 2. `stage_session_quota`, `take_staged_session_quota` and `clear_staged_session_quota` hand the grant to the one `new_session` that follows. `start_child_within_quota` counts a `start_child` against the caller's quota and refunds a failed start.
+- Why: the orchestrator grants capacity and Zed enforces it where each agent allows.
+- Review focus:
+  - The hook command quotes the directory path (a test uses a path with an apostrophe) and runs only `cat`, `rm` and `echo`.
+  - L2 and L3 apply only to a new session of Claude Code; a resumed session does not get the `_meta` again.
+  - L1 and L4 look only at the child's own root session.
+  - Verified by tests: the `_meta`, the hook in a shell, the counting and the v2 cancel path. Not verified: a real Claude Code session, and the ACP v1 path of L4.
+
+Other files of R6 appear in their own sections with a "Changed again in `bd64c7b`" paragraph: `orchestration.rs` (types and the quota sentence of the child header), `registry.rs` (the per-child quota and its log lines), `child_log.rs` (the `quota` direction), `agent.rs` (L1 for `spawn_agent` and `create_thread`), `acp.rs`, `v1.rs` and `v2.rs` (L2, L3, L4), `conversation_view.rs` (staging), `agent_panel.rs` and `orchestration_host.rs` (the grant reaches the registry before the session starts).
+
 ### Documentation
 
-Commits `82b86e0`, `20cd02f`, `134b4c2`, `20bec29`, `1fcdad9`, and edits in `b7c55ae`, `c449f10` and `b1c2733`. These files do not affect the build.
+Commits `82b86e0`, `20cd02f`, `134b4c2`, `20bec29`, `1fcdad9`, `307f727`, and edits in `b7c55ae`, `c449f10`, `b1c2733` and `cbf577d`. The documentation update for `bd64c7b` (a later commit) touches the four files below. These files do not affect the build.
 
 #### [`docs-product/features/orchestrated-threads.md`](orchestrated-threads.md)
 
@@ -652,6 +780,11 @@ Changed again in `1fcdad9` (adds R14 to R17: child awareness, inbox, human summa
 - Review focus:
   - R11 and R16 together define what the orchestrator may learn about human messages.
 
+Changed again in `cbf577d` (R3b, R12, R10 and AC10 edited) and in the documentation update after `bd64c7b`: status v0.2 with an "Implementation status" table (R1 to R17, R3b, E1, E2), R1 tools and the bridge, R2 and R3 details, R6 rewritten to the real layers (ticket directory, hook inside `settings`, `Agent` and `Task`, verification status), the R10 table checked against `default.json`, R11, R13 (how the cards behave), R15 and R16 deviations, R17 label and description, all acceptance criteria marked met or not verified with evidence and new AC16 to AC26, and a "Known limitations" section 12. Section 11 is unchanged.
+- Review focus:
+  - The status of each acceptance criterion comes from the tests present; the update did not run them.
+  - Section 12 lists only limitations that the code, a comment, a test or a commit message supports.
+
 #### [`docs-product/features/orchestrated-threads-r1-plan.md`](orchestrated-threads-r1-plan.md)
 
 - Scope: implementation plan for the R1 to R5 slice.
@@ -659,6 +792,8 @@ Changed again in `1fcdad9` (adds R14 to R17: child awareness, inbox, human summa
 - Why: records the intended design that `36ead50` implements the groundwork of.
 - Review focus:
   - Steps not yet implemented in `36ead50` (tool adapters, MCP server) remain open.
+
+Changed again in `cbf577d` (step 7 marked done, with its limits) and in the documentation update after `bd64c7b`: each step marked done with its commit, and a "Beyond R1 to R5" section that lists R14 to R17, R3b, R12, R10, R3 and R13 and R6 with their commits.
 
 #### [`docs-product/features/orchestrated-threads-how-it-works.md`](orchestrated-threads-how-it-works.md)
 
@@ -672,10 +807,16 @@ Changed again in `b1c2733`: the bullet about the token no longer says it is "not
 - Review focus:
   - The wording is honest about the limit and matches `bridge.rs` and `mcp.rs`.
 
+Changed again in the documentation update after `bd64c7b`: the token is also used by sibling messages and the quota and is revoked when a thread is deleted; new sections on messages between a child and its orchestrator (inbox, urgent), messages between siblings, human intervention (never logged or forwarded, summary on demand), the subagent quota (the hook and the ticket directory, and that it grants nothing beyond counting) and permission cards.
+- Review focus:
+  - The key-safety statements are unchanged: no provider key reaches the orchestrator, and the hook command holds only a directory path.
+
 #### [`docs-product/features/manual-review.md`](manual-review.md)
 
 - Scope: this checklist.
-- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`.
+- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf` and then up to `bd64c7b`.
 - Why: lets the fork owner review every file individually before anything goes upstream.
 - Review focus:
   - Only the "Manual review" column is edited by the fork owner; a "🔁" marks a file reviewed before and changed since.
+
+Changed again in the update that extends the list from `10530cf` to `bd64c7b`: four new rows (`list_siblings_tool.rs`, `send_to_sibling_tool.rs`, `orchestrated_permissions.rs`, `quota.rs`), "Changed again" paragraphs for the files touched by `cbf577d` and `bd64c7b`, and the sections "R3b, R12, caps and restart", "R13: permission cards" and "R6: subagent quota". No row was marked reviewed by this update.
