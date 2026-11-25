@@ -18,6 +18,7 @@
 mod bridge;
 mod child_log;
 mod mcp;
+mod quota;
 mod registry;
 
 use std::fmt;
@@ -34,6 +35,7 @@ use sqlez::{
 pub use bridge::*;
 pub use child_log::*;
 pub use mcp::*;
+pub use quota::*;
 pub use registry::*;
 
 /// Identifies a thread in the agent panel and the threads sidebar. It is the
@@ -169,6 +171,12 @@ pub struct StartChildInput {
     /// With `worktree: new`, a name for the new worktree.
     #[serde(default)]
     pub worktree_name: Option<String>,
+    /// How many subagents or children of its own the child may start. 0 (the
+    /// default) means none: a child cannot fan out unless you allow it. Every
+    /// spawn through Zed's tools counts, and one over the quota fails with an
+    /// error. For Claude Code the subagent tool is also blocked at the quota.
+    #[serde(default)]
+    pub subagent_quota: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -283,6 +291,8 @@ pub struct ChildStatusInfo {
     /// Only the count: the content stays in the child's log.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sibling_messages: u32,
+    /// Subagents the child was granted (`subagent_quota`) and has used.
+    pub subagent_quota: SubagentQuotaStatus,
     /// Messages the child sent with `send_to_parent` that you have not seen
     /// yet. Each is returned once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -291,6 +301,13 @@ pub struct ChildStatusInfo {
     /// since the last summary. Each is returned once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub human_interventions: Vec<HumanIntervention>,
+}
+
+/// The subagent quota of a child (R6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SubagentQuotaStatus {
+    pub granted: u32,
+    pub used: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -454,7 +471,22 @@ pub struct HumanSummaryRequest {
 
 /// Prefix of a child's first prompt: it tells the child that it is a child,
 /// who its orchestrator is and how to reach it.
-pub fn child_header(orchestrator_title: &str) -> String {
+pub fn child_header(orchestrator_title: &str, subagent_quota: u32) -> String {
+    let quota = match subagent_quota {
+        0 => "Your orchestrator granted you no subagents: do not start subagents or threads (\
+              `spawn_agent`, `start_child`, `create_thread`, or your own subagent tool). \
+              Do the work yourself."
+            .to_string(),
+        1 => "Your orchestrator granted you 1 subagent: you may start at most one (with \
+              `spawn_agent`, `start_child`, `create_thread` or your own subagent tool). A \
+              second one is refused."
+            .to_string(),
+        count => format!(
+            "Your orchestrator granted you {count} subagents: you may start at most {count} (with \
+             `spawn_agent`, `start_child`, `create_thread` or your own subagent tool). Any \
+             more are refused."
+        ),
+    };
     format!(
         "You are a child conversation started by the orchestrator thread \"{orchestrator_title}\". \
          When you finish, your final message goes back to the orchestrator automatically, so you do \
@@ -463,7 +495,7 @@ pub fn child_header(orchestrator_title: &str) -> String {
          orchestrator cannot read your chat. Use `whoami` to see your role, your orchestrator and \
          your own children. Other children of the same orchestrator may be working at the same \
          time: `list_siblings` shows them, and `send_to_sibling` asks one a quick question \
-         directly, without going through the orchestrator.\n\n---\n\n"
+         directly, without going through the orchestrator. {quota}\n\n---\n\n"
     )
 }
 

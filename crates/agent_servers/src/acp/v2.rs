@@ -5,7 +5,7 @@ use super::{
     UnsupportedVersion, apply_v2_session_notification, close_undelivered_session,
     drain_foreground_queue, enqueue_notification, first_class_terminal_auth_task,
     is_disconnect_error, is_resource_not_found, map_acp_error, mcp_configurations_for_project,
-    runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    quota_session_meta, runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -1395,6 +1395,11 @@ impl AgentConnection for AcpV2Connection {
         let mut request = acp::NewSessionRequest::new(context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
             .mcp_servers(context.mcp_servers.clone());
+        match quota_session_meta(&self.id, cx) {
+            Ok(Some(meta)) => request = request.meta(meta),
+            Ok(None) => {}
+            Err(error) => return Task::ready(Err(error)),
+        }
         if self.supports_initial_config_options(cx) {
             // `apply_new_session_defaults` still runs after creation, so defaults the agent
             // ignored here (for example, ones that depend on another option) get another chance.
@@ -2135,6 +2140,7 @@ mod tests {
     #[cfg(unix)]
     use project::agent_server_store::AgentServerCommand;
     use serde_json::json;
+    use std::path::{Path, PathBuf};
     use std::{
         sync::{Arc, Mutex},
         time::Duration,
@@ -2200,6 +2206,16 @@ mod tests {
 
     impl SessionHarness {
         async fn new(
+            capabilities: acp::AgentCapabilities,
+            after_new: Vec<acp::SessionUpdate>,
+            after_config: Vec<acp::SessionUpdate>,
+            cx: &mut TestAppContext,
+        ) -> Self {
+            Self::for_agent("session-test", capabilities, after_new, after_config, cx).await
+        }
+
+        async fn for_agent(
+            agent_id: &'static str,
             capabilities: acp::AgentCapabilities,
             after_new: Vec<acp::SessionUpdate>,
             after_config: Vec<acp::SessionUpdate>,
@@ -2388,7 +2404,7 @@ mod tests {
             );
             let client = bounded(
                 AcpV2Connection::connect(
-                    AgentId::new("session-test"),
+                    AgentId::new(agent_id),
                     WeakEntity::new_invalid(),
                     client_transport,
                     acp::Implementation::new("test", "1"),
@@ -3075,6 +3091,264 @@ mod tests {
             "cleared fields inherit again"
         );
         assert_eq!(work_dirs(&grandchild, cx), parent_dirs);
+    }
+
+    /// Host that owns one thread, whose root session is `session_id`.
+    struct QuotaHost {
+        thread: orchestration::ThreadId,
+        session_id: String,
+    }
+
+    impl orchestration::OrchestrationHost for QuotaHost {
+        fn start_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::StartChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::StartChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn send_to_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::SendToChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::SendToChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn cancel_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::CancelChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::CancelChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn list_available_agents(&self, _: &mut App) -> Result<orchestration::AvailableAgents> {
+            Ok(orchestration::AvailableAgents::default())
+        }
+
+        fn resolve_orchestrator(
+            &self,
+            session_id: &str,
+            _: &App,
+        ) -> Option<orchestration::ThreadId> {
+            (session_id == self.session_id).then_some(self.thread)
+        }
+
+        fn owns_thread(&self, thread: orchestration::ThreadId, _: &App) -> bool {
+            thread == self.thread
+        }
+    }
+
+    /// Registers the child whose root session is "session" with `granted`
+    /// subagents, and returns where its R4 log is read from.
+    fn orchestrated_child(
+        granted: u32,
+        log_dir: &Path,
+        cx: &mut TestAppContext,
+    ) -> (orchestration::ThreadId, orchestration::ThreadId) {
+        let orchestrator = orchestration::ThreadId::new();
+        let child = orchestration::ThreadId::new();
+        cx.update(|cx| {
+            orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, cx| {
+                registry.register_host(Rc::new(QuotaHost {
+                    thread: child,
+                    session_id: "session".to_string(),
+                }));
+                registry.set_subagent_quota(
+                    child,
+                    granted,
+                    orchestration::child_quota_dir(log_dir, orchestrator, child),
+                );
+                registry.register_child(
+                    orchestrator,
+                    orchestration::NewChild {
+                        child_id: child,
+                        title: "child".into(),
+                        agent_id: "session-test".to_string(),
+                        model: None,
+                        log_dir: log_dir.to_path_buf(),
+                        prompt: "work".to_string(),
+                        orchestrator_title: "orchestrator".to_string(),
+                    },
+                    cx,
+                );
+            });
+        });
+        (orchestrator, child)
+    }
+
+    fn quota_events(
+        log_dir: &Path,
+        orchestrator: orchestration::ThreadId,
+        child: orchestration::ThreadId,
+    ) -> Vec<String> {
+        orchestration::ChildLog::new(log_dir, orchestrator, child)
+            .read()
+            .expect("read the child log")
+            .into_iter()
+            .filter(|entry| entry.direction == orchestration::LogDirection::Quota)
+            .map(|entry| entry.text)
+            .collect()
+    }
+
+    fn cancellable_running_subagent(session_id: &str) -> acp::SessionUpdate {
+        acp::SessionUpdate::SubagentUpdate(
+            acp::SubagentUpdate::new(session_id)
+                .capabilities(
+                    acp::SubagentSessionCapabilities::new()
+                        .cancel(acp::SessionCancelCapabilities::new()),
+                )
+                .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+        )
+    }
+
+    #[gpui::test]
+    async fn v2_subagents_over_the_quota_are_cancelled_and_logged(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let _parent = harness.thread(cx).await;
+        let log_dir = tempfile::tempdir().expect("log dir");
+        let (orchestrator, child) = orchestrated_child(1, log_dir.path(), cx);
+
+        harness.send_update("session", cancellable_running_subagent("first"));
+        harness.send_update("session", cancellable_running_subagent("second"));
+        harness.drain_updates(cx).await;
+
+        assert_eq!(
+            bounded(harness.cancellations.recv(), cx)
+                .await
+                .expect("the extra subagent is cancelled")
+                .session_id,
+            acp::SessionId::new("second"),
+        );
+        harness.drain_updates(cx).await;
+        assert!(
+            harness.cancellations.is_empty(),
+            "the subagent within the quota is left alone"
+        );
+        let events = quota_events(log_dir.path(), orchestrator, child);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("cancelled subagent second")),
+            "{events:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_subagents_over_the_quota_are_not_cancelled_without_the_capability(
+        cx: &mut TestAppContext,
+    ) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let _parent = harness.thread(cx).await;
+        let log_dir = tempfile::tempdir().expect("log dir");
+        let (orchestrator, child) = orchestrated_child(0, log_dir.path(), cx);
+
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("extra")
+                    .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+            ),
+        );
+        harness.drain_updates(cx).await;
+
+        assert!(harness.cancellations.is_empty());
+        let events = quota_events(log_dir.path(), orchestrator, child);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("does not allow cancelling it")),
+            "{events:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_threads_that_are_not_orchestrated_children_have_no_subagent_quota(
+        cx: &mut TestAppContext,
+    ) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let _parent = harness.thread(cx).await;
+
+        harness.send_update("session", cancellable_running_subagent("first"));
+        harness.drain_updates(cx).await;
+
+        assert!(harness.cancellations.is_empty());
+    }
+
+    async fn new_session_meta(
+        agent_id: &'static str,
+        granted: u32,
+        cx: &mut TestAppContext,
+    ) -> (Option<acp::Meta>, PathBuf, tempfile::TempDir) {
+        let harness =
+            SessionHarness::for_agent(agent_id, session_capabilities(), vec![], vec![], cx).await;
+        let log_dir = tempfile::tempdir().expect("log dir");
+        let orchestrator = orchestration::ThreadId::new();
+        let child = orchestration::ThreadId::new();
+        let mut creation = cx.update(|cx| {
+            orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+                registry.set_subagent_quota(
+                    child,
+                    granted,
+                    orchestration::child_quota_dir(log_dir.path(), orchestrator, child),
+                );
+            });
+            orchestration::stage_session_quota(child, cx);
+            let creation = harness.client.clone().new_session(
+                harness.project.clone(),
+                PathList::new(&[session_path("a"), session_path("b")]),
+                cx,
+            );
+            orchestration::clear_staged_session_quota(cx);
+            creation
+        });
+        let (request, _) = harness.new_request(&mut creation, cx).await;
+        harness
+            .new_responses
+            .try_send(Ok(initial_response()))
+            .expect("initial response");
+        bounded(creation, cx).await.expect("create thread");
+        let tickets = orchestration::child_quota_dir(log_dir.path(), orchestrator, child);
+        (request.meta, tickets, log_dir)
+    }
+
+    #[gpui::test]
+    async fn v2_claude_child_with_quota_zero_has_no_subagent_tool(cx: &mut TestAppContext) {
+        let (meta, _tickets, _log_dir) = new_session_meta("claude-acp", 0, cx).await;
+        let meta = meta.expect("claude-acp gets session options");
+        assert_eq!(
+            meta["claudeCode"]["options"]["disallowedTools"],
+            json!(["Agent", "Task"])
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_claude_child_with_a_quota_gets_the_pre_tool_use_hook(cx: &mut TestAppContext) {
+        let (meta, tickets, _log_dir) = new_session_meta("claude-acp", 2, cx).await;
+        let meta = meta.expect("claude-acp gets session options");
+        let options = &meta["claudeCode"]["options"];
+        assert!(options.get("disallowedTools").is_none());
+        let hook = &options["settings"]["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Agent|Task");
+        assert_eq!(hook["hooks"][0]["type"], "command");
+        assert_eq!(
+            orchestration::count_tickets(&tickets),
+            2,
+            "one ticket per granted subagent"
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_other_agents_get_no_subagent_quota_meta(cx: &mut TestAppContext) {
+        for agent_id in ["codex-acp", "session-test"] {
+            let (meta, _tickets, _log_dir) = new_session_meta(agent_id, 0, cx).await;
+            assert_eq!(meta, None, "{agent_id}");
+        }
     }
 
     #[gpui::test]

@@ -24,7 +24,7 @@ use settings::Settings as _;
 
 use crate::{
     AgentPanel,
-    agent_panel::{ChildThreadRequest, create_child_thread},
+    agent_panel::{ChildSubagentQuota, ChildThreadRequest, create_child_thread},
     conversation_view::{ConversationView, MessageOrigin, RootThreadUpdated},
     thread_metadata_store::ThreadMetadataStore,
 };
@@ -342,7 +342,11 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                     window,
                     ChildThreadRequest {
                         title: input.title.clone().into(),
-                        prompt: format!("{}{}", child_header(&orchestrator_title), input.prompt),
+                        prompt: format!(
+                            "{}{}",
+                            child_header(&orchestrator_title, input.subagent_quota),
+                            input.prompt
+                        ),
                         agent_id: input.agent,
                         model: model.clone(),
                         profile,
@@ -350,6 +354,10 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                         base_ref: input.base_ref,
                         worktree_name: input.worktree_name,
                         parent_thread_id: Some(orchestrator),
+                        subagent_quota: Some(ChildSubagentQuota {
+                            granted: input.subagent_quota,
+                            log_dir: cx.update(|cx| orchestration_log_dir(cx)),
+                        }),
                     },
                     cx,
                 )

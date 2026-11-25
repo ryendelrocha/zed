@@ -4,10 +4,11 @@ use super::auth_status::{
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
     ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
-    drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
-    handle_elicitation, handle_v2_complete_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
-    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    drain_foreground_queue, enforce_subagent_quota, enqueue_notification, enqueue_request,
+    first_class_terminal_auth_task, handle_elicitation, handle_v2_complete_elicitation,
+    map_acp_error, mcp_configurations_for_project, quota_session_meta, respond_err, respond_result,
+    runtime, session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -1408,12 +1409,19 @@ impl AgentConnection for AcpConnection {
         let orchestration =
             orchestration::mcp_entry_for_new_session(project.read(cx).is_local(), cx);
         let mcp_servers = mcp_servers_for_project(&project, orchestration.as_ref(), cx);
+        let quota_meta = match quota_session_meta(&self.id, cx) {
+            Ok(meta) => meta,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
 
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
             let (registered, registration_finished) = futures::channel::oneshot::channel();
             let mut request = directories.into_new_session_request(mcp_servers);
+            if let Some(meta) = quota_meta {
+                request = request.meta(meta);
+            }
             if sends_initial_config_options {
                 // The default-application pass below still runs, so defaults the agent ignored
                 // here (for example, ones that depend on another option) get another chance.
@@ -10607,11 +10615,13 @@ fn apply_v1_subagent_update(
     let subagent = apply_subagent_update(parent, &update, sessions, cx)?;
     // A v1 subagent has no stream or prompt response of its own that reports its
     // activity, so the parent's snapshot is the only source.
-    subagent.update(cx, |subagent, cx| match update.state {
+    let applied = subagent.update(cx, |subagent, cx| match update.state {
         MaybeUndefined::Undefined => Ok(()),
         MaybeUndefined::Null => subagent.clear_session_state(cx),
         MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
-    })
+    });
+    enforce_subagent_quota(&subagent, sessions, cx);
+    applied
 }
 
 fn handle_session_notification(

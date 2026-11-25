@@ -10,6 +10,7 @@ use gpui::{
 };
 use settings::SettingsStore;
 
+use crate::{AnnouncedSubagent, SessionQuotaGrant, SubagentQuota, SubagentQuotaStatus};
 use crate::{
     AwaitChildrenInput, AwaitChildrenOutput, ChildLog, ChildReference, ChildResult, ChildStatus,
     ChildStatusInfo, ChildStatusInput, ChildStatusOutput, DEFAULT_AWAIT_TIMEOUT_SECS,
@@ -262,6 +263,8 @@ pub struct OrchestrationRegistry {
     /// `start_child` calls that passed the concurrency cap and have not
     /// registered their child yet.
     pending_child_starts: usize,
+    /// The subagent quota of each orchestrated child (R6).
+    quotas: HashMap<ThreadId, SubagentQuota>,
 }
 
 impl EventEmitter<OrchestrationRegistryEvent> for OrchestrationRegistry {}
@@ -416,6 +419,16 @@ impl OrchestrationRegistry {
             &child.prompt,
             ChildStatus::Starting,
         );
+        let quota = self
+            .quotas
+            .entry(child.child_id)
+            .or_insert_with(|| SubagentQuota::new(0, None));
+        log_exchange(
+            &log,
+            LogDirection::Quota,
+            &format!("subagent_quota granted: {}", quota.granted()),
+            ChildStatus::Starting,
+        );
         let (status_sender, _) = watch::channel(ChildStatus::Starting);
         let (urgent_sender, _) = watch::channel(0);
         let child_id = child.child_id;
@@ -532,6 +545,21 @@ impl OrchestrationRegistry {
                 .or_default();
             *slot = (*slot).max(count);
         }
+        let granted = entries
+            .iter()
+            .filter(|entry| entry.direction == LogDirection::Quota)
+            .find_map(|entry| entry.text.strip_prefix("subagent_quota granted: "))
+            .and_then(|count| count.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let used = entries
+            .iter()
+            .filter(|entry| entry.direction == LogDirection::Quota)
+            .filter(|entry| entry.text.starts_with("subagent_quota used"))
+            .count() as u32;
+        self.quotas.insert(
+            child.child_id,
+            SubagentQuota::restored(granted, used.min(granted), None),
+        );
         let (status_sender, _) = watch::channel(status);
         let (urgent_sender, _) = watch::channel(0);
         let child_id = child.child_id;
@@ -571,6 +599,108 @@ impl OrchestrationRegistry {
         true
     }
 
+    /// Sets the subagent quota of `thread` before it is registered as a child:
+    /// its ACP session may start before the registration, and the session
+    /// options depend on the grant. `tickets_dir` is where Claude Code's hook
+    /// finds its tickets.
+    pub fn set_subagent_quota(&mut self, thread: ThreadId, granted: u32, tickets_dir: PathBuf) {
+        self.quotas
+            .insert(thread, SubagentQuota::new(granted, Some(tickets_dir)));
+    }
+
+    pub fn subagent_quota(&self, thread: ThreadId) -> Option<&SubagentQuota> {
+        self.quotas.get(&thread)
+    }
+
+    /// What the ACP session of `thread` needs to enforce its quota.
+    pub fn session_quota_grant(&self, thread: ThreadId) -> Option<SessionQuotaGrant> {
+        let quota = self.quotas.get(&thread)?;
+        Some(SessionQuotaGrant {
+            granted: quota.granted(),
+            tickets_dir: quota.tickets_dir()?.to_path_buf(),
+        })
+    }
+
+    /// L1. Counts a subagent that `thread` starts through one of Zed's tools,
+    /// or refuses it when the quota is used up. A thread that is not an
+    /// orchestrated child has no quota.
+    pub fn consume_subagent_quota(&mut self, thread: ThreadId, tool: &str) -> Result<()> {
+        let Some(quota) = self.quotas.get_mut(&thread) else {
+            return Ok(());
+        };
+        match quota.consume(tool) {
+            Ok(()) => {
+                let text = format!(
+                    "subagent_quota used: {} of {} (`{tool}`)",
+                    quota.used(),
+                    quota.granted()
+                );
+                self.log_quota_event(thread, &text);
+                Ok(())
+            }
+            Err(error) => {
+                let text = format!("subagent_quota refused: `{tool}`");
+                self.log_quota_event(thread, &text);
+                Err(error)
+            }
+        }
+    }
+
+    /// Gives back a spawn that [`Self::consume_subagent_quota`] counted and
+    /// that then failed.
+    pub fn refund_subagent_quota(&mut self, thread: ThreadId) {
+        if let Some(quota) = self.quotas.get_mut(&thread) {
+            quota.refund();
+        }
+    }
+
+    /// L4. Records that the agent running `thread` announced the subagent
+    /// `subagent_session`, and returns whether Zed must cancel it now: it is
+    /// over the quota, running, and the agent advertised `capabilities.cancel`. Either
+    /// way, an extra subagent is logged in the child's R4 log.
+    pub fn check_announced_subagent(
+        &mut self,
+        thread: ThreadId,
+        subagent_session: &str,
+        can_cancel: bool,
+        live: bool,
+    ) -> bool {
+        let Some(quota) = self.quotas.get_mut(&thread) else {
+            return false;
+        };
+        let granted = quota.granted();
+        match quota.note_announced(subagent_session, can_cancel, live) {
+            AnnouncedSubagent::Allow => false,
+            AnnouncedSubagent::Cancel => {
+                let text = format!(
+                    "subagent_quota exceeded: cancelled subagent {subagent_session} \
+                     (quota {granted})"
+                );
+                self.log_quota_event(thread, &text);
+                true
+            }
+            AnnouncedSubagent::OverQuotaNotCancellable => {
+                let text = format!(
+                    "subagent_quota exceeded: subagent {subagent_session} is over the quota of \
+                     {granted}, but the agent does not allow cancelling it"
+                );
+                self.log_quota_event(thread, &text);
+                false
+            }
+        }
+    }
+
+    fn log_quota_event(&self, thread: ThreadId, text: &str) {
+        if let Some(record) = self
+            .children
+            .values()
+            .flatten()
+            .find(|record| record.child_id == thread)
+        {
+            log_exchange(&record.log, LogDirection::Quota, text, record.status);
+        }
+    }
+
     /// Children that have not finished their turn, across every orchestrator.
     pub fn running_children(&self) -> usize {
         self.children
@@ -608,7 +738,12 @@ impl OrchestrationRegistry {
     /// on disk.
     pub fn remove_orchestrator(&mut self, orchestrator: ThreadId, cx: &mut Context<Self>) {
         self.revoke_tokens(orchestrator);
-        let mut changed = self.children.remove(&orchestrator).is_some();
+        let removed_children = self.children.remove(&orchestrator);
+        let mut changed = removed_children.is_some();
+        for record in removed_children.iter().flatten() {
+            self.quotas.remove(&record.child_id);
+        }
+        self.quotas.remove(&orchestrator);
         for records in self.children.values_mut() {
             let before = records.len();
             records.retain(|record| record.child_id != orchestrator);
@@ -1503,6 +1638,14 @@ impl OrchestrationRegistry {
     ) -> Vec<ChildStatusInfo> {
         let mut infos = Vec::new();
         for child in children {
+            let quota = self
+                .quotas
+                .get(child)
+                .map(|quota| SubagentQuotaStatus {
+                    granted: quota.granted(),
+                    used: quota.used(),
+                })
+                .unwrap_or_default();
             let Some(record) = self.child_mut(orchestrator, *child) else {
                 continue;
             };
@@ -1515,6 +1658,7 @@ impl OrchestrationRegistry {
                 turns: record.turns,
                 last_activity: record.last_activity.to_rfc3339(),
                 sibling_messages: record.sibling_messages,
+                subagent_quota: quota,
                 pending_messages: record.take_pending_messages(),
                 human_interventions: std::mem::take(&mut record.interventions),
             });
@@ -2072,6 +2216,7 @@ mod tests {
             .unwrap();
         let lines = entries
             .iter()
+            .filter(|entry| entry.direction != LogDirection::Quota)
             .map(|entry| (entry.direction, entry.text.as_str(), entry.status))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2250,7 +2395,7 @@ mod tests {
 
     #[test]
     fn test_child_header_names_the_orchestrator_and_the_tools() {
-        let header = child_header("Refactor billing");
+        let header = child_header("Refactor billing", 0);
         assert!(header.contains("\"Refactor billing\""));
         assert!(header.contains("final message goes back to the orchestrator automatically"));
         assert!(header.contains("`send_to_parent`"));
@@ -3488,8 +3633,211 @@ mod tests {
 
     #[test]
     fn test_child_header_mentions_the_sibling_tools() {
-        let header = child_header("Refactor billing");
+        let header = child_header("Refactor billing", 0);
         assert!(header.contains("`list_siblings`"));
         assert!(header.contains("`send_to_sibling`"));
+    }
+
+    fn register_with_quota(
+        registry: &Entity<OrchestrationRegistry>,
+        orchestrator: ThreadId,
+        log_dir: &Path,
+        granted: u32,
+        cx: &mut TestAppContext,
+    ) -> ThreadId {
+        let child = new_child(log_dir, "limited");
+        let child_id = child.child_id;
+        registry.update(cx, |registry, cx| {
+            registry.set_subagent_quota(
+                child_id,
+                granted,
+                crate::child_quota_dir(log_dir, orchestrator, child_id),
+            );
+            registry.register_child(orchestrator, child, cx);
+        });
+        child_id
+    }
+
+    #[gpui::test]
+    fn test_spawns_are_refused_beyond_the_quota_and_logged(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register_with_quota(&registry, orchestrator, directory.path(), 1, cx);
+
+        registry
+            .update(cx, |registry, _| {
+                registry.consume_subagent_quota(child, "spawn_agent")
+            })
+            .unwrap();
+        let error = registry
+            .update(cx, |registry, _| {
+                registry.consume_subagent_quota(child, "create_thread")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Subagent quota exhausted"), "{error}");
+
+        let quota_lines = log_entries(directory.path(), orchestrator, child)
+            .into_iter()
+            .filter(|(direction, _)| *direction == LogDirection::Quota)
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            quota_lines,
+            [
+                "subagent_quota granted: 1",
+                "subagent_quota used: 1 of 1 (`spawn_agent`)",
+                "subagent_quota refused: `create_thread`",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_the_quota_defaults_to_zero_and_is_per_child(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let none = register(&registry, orchestrator, directory.path(), "none", cx);
+        let some = register_with_quota(&registry, orchestrator, directory.path(), 2, cx);
+
+        registry.update(cx, |registry, _| {
+            assert!(
+                registry
+                    .consume_subagent_quota(none, "start_child")
+                    .is_err()
+            );
+            registry
+                .consume_subagent_quota(some, "start_child")
+                .unwrap();
+            registry
+                .consume_subagent_quota(some, "start_child")
+                .unwrap();
+            assert!(
+                registry
+                    .consume_subagent_quota(some, "start_child")
+                    .is_err()
+            );
+            // A thread that is not an orchestrated child has no quota.
+            registry
+                .consume_subagent_quota(ThreadId::new(), "start_child")
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    async fn test_child_status_reports_the_quota_used_and_granted(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register_with_quota(&registry, orchestrator, directory.path(), 3, cx);
+        registry
+            .update(cx, |registry, _| {
+                registry.consume_subagent_quota(child, "spawn_agent")
+            })
+            .unwrap();
+
+        let output = cx
+            .update(|cx| {
+                OrchestrationRegistry::child_status_with_summaries(
+                    &registry,
+                    orchestrator,
+                    ChildStatusInput::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            output.children[0].subagent_quota,
+            SubagentQuotaStatus {
+                granted: 3,
+                used: 1
+            }
+        );
+        let serialized = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            serialized["children"][0]["subagent_quota"],
+            serde_json::json!({"granted": 3, "used": 1})
+        );
+    }
+
+    #[gpui::test]
+    fn test_announced_subagents_over_quota_are_cancelled_and_logged(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register_with_quota(&registry, orchestrator, directory.path(), 1, cx);
+
+        registry.update(cx, |registry, _| {
+            assert!(!registry.check_announced_subagent(child, "sub-1", true, true));
+            assert!(registry.check_announced_subagent(child, "sub-2", true, true));
+            // Later updates of the same subagent do not cancel it again.
+            assert!(!registry.check_announced_subagent(child, "sub-2", true, true));
+            // Without `capabilities.cancel` nothing is cancelled.
+            assert!(!registry.check_announced_subagent(child, "sub-3", false, true));
+        });
+        let events = log_entries(directory.path(), orchestrator, child)
+            .into_iter()
+            .filter(|(direction, _)| *direction == LogDirection::Quota)
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events[1].contains("cancelled subagent sub-2"), "{events:?}");
+        assert!(
+            events[2].contains("does not allow cancelling it"),
+            "{events:?}"
+        );
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(registry.subagent_quota(child).unwrap().used(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_quota_survives_a_restart_through_the_log(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register_with_quota(&registry, orchestrator, directory.path(), 2, cx);
+        registry
+            .update(cx, |registry, _| {
+                registry.consume_subagent_quota(child, "spawn_agent")
+            })
+            .unwrap();
+        registry.update(cx, |registry, cx| {
+            registry.remove_orchestrator(orchestrator, cx)
+        });
+        registry.read_with(cx, |registry, _| {
+            assert!(registry.subagent_quota(child).is_none());
+        });
+
+        registry.update(cx, |registry, cx| {
+            registry.restore_child(
+                orchestrator,
+                restored(directory.path(), child, "limited"),
+                cx,
+            );
+        });
+        registry.update(cx, |registry, _| {
+            let quota = registry.subagent_quota(child).unwrap();
+            assert_eq!((quota.granted(), quota.used()), (2, 1));
+            registry
+                .consume_subagent_quota(child, "spawn_agent")
+                .unwrap();
+            assert!(
+                registry
+                    .consume_subagent_quota(child, "spawn_agent")
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_child_header_states_the_quota() {
+        assert!(child_header("Billing", 0).contains("granted you no subagents"));
+        assert!(child_header("Billing", 1).contains("granted you 1 subagent:"));
+        let header = child_header("Billing", 3);
+        assert!(header.contains("granted you 3 subagents"));
+        assert!(header.contains("at most 3"));
     }
 }

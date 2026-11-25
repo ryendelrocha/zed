@@ -29,6 +29,9 @@ pub enum LogDirection {
     ToSibling,
     /// From a sibling to this child. The entry's `sibling` is the sender.
     FromSibling,
+    /// A subagent quota event of this child (R6): the grant, a spawn counted
+    /// or refused, and an extra subagent that Zed cancelled.
+    Quota,
 }
 
 /// One line of a child's log file.

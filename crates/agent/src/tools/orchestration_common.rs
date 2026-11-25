@@ -321,6 +321,7 @@ mod tests {
             worktree: WorktreeMode::Shared,
             base_ref: None,
             worktree_name: None,
+            subagent_quota: 0,
         }
     }
 
@@ -331,6 +332,67 @@ mod tests {
     ) -> Task<Result<T::Output, T::Output>> {
         let (event_stream, _events) = ToolCallEventStream::test();
         cx.update(|cx| Arc::new(tool).run(ToolInput::resolved(input), event_stream, cx))
+    }
+
+    #[gpui::test]
+    async fn test_start_child_is_refused_once_the_callers_subagent_quota_is_used(
+        cx: &mut TestAppContext,
+    ) {
+        let host = register_host(cx);
+        cx.update(|cx| {
+            OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+                registry.set_subagent_quota(host.orchestrator, 1, "/unused".into());
+            });
+        });
+
+        run_tool(
+            StartChildTool::new(SESSION.to_string()),
+            start_input("A", None),
+            cx,
+        )
+        .await
+        .ok()
+        .expect("the first child is within the quota");
+        let refused = run_tool(
+            StartChildTool::new(SESSION.to_string()),
+            start_input("B", None),
+            cx,
+        )
+        .await
+        .err()
+        .expect("the second child is over the quota");
+        let OrchestrationToolOutput::Error { error } = refused else {
+            panic!("expected an error");
+        };
+        assert!(error.contains("Subagent quota exhausted"), "{error}");
+        assert_eq!(
+            host.calls.borrow().len(),
+            1,
+            "the refused call never reaches the host"
+        );
+
+        // A failed start gives its spawn back.
+        cx.update(|cx| {
+            OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+                registry.set_subagent_quota(host.orchestrator, 1, "/unused".into());
+            });
+        });
+        run_tool(
+            StartChildTool::new(SESSION.to_string()),
+            start_input("C", Some("unknown")),
+            cx,
+        )
+        .await
+        .err()
+        .expect("an unknown agent fails");
+        run_tool(
+            StartChildTool::new(SESSION.to_string()),
+            start_input("D", None),
+            cx,
+        )
+        .await
+        .ok()
+        .expect("the failed start did not use the quota");
     }
 
     #[gpui::test]

@@ -37,7 +37,10 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{Future, channel::mpsc};
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, TaskExt as _,
+    WeakEntity,
+};
 use project::agent_server_store::{
     AgentServerCommand, AgentServerStore, ResolvedAgentServerCommand,
 };
@@ -883,6 +886,84 @@ fn close_undelivered_session(
 /// connection, and hands the thread to the parent. Later updates patch the association.
 /// The update's `state` is left to the caller because v2 separates history from live
 /// state per session, whereas v1 uses the response as the boundary.
+/// R6 L4: when the child that `subagent`'s parent belongs to announces
+/// subagents beyond the quota its orchestrator granted, cancels the extra
+/// ones, and logs it in the child's R4 log. Call it after the subagent's state
+/// was applied: a subagent that is not running yet has nothing to cancel, and
+/// is looked at again on its next update. Zed can only cancel a subagent whose
+/// agent advertised `capabilities.cancel`; the quota event is logged either
+/// way. History being replayed is not live work and is never cancelled.
+fn enforce_subagent_quota(
+    subagent: &Entity<AcpThread>,
+    sessions: &Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    cx: &mut App,
+) {
+    let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) else {
+        return;
+    };
+    let (subagent_session_id, parent_session_id, can_cancel, live) = {
+        let subagent = subagent.read(cx);
+        let Some(parent_session_id) = subagent.parent_session_id().cloned() else {
+            return;
+        };
+        (
+            subagent.session_id().clone(),
+            parent_session_id,
+            subagent
+                .subagent_association()
+                .is_some_and(|association| association.can_cancel),
+            !subagent.uses_reported_activity()
+                || subagent.foreground_activity() != acp_thread::ForegroundActivity::Idle,
+        )
+    };
+    let replaying = {
+        let sessions = sessions.borrow();
+        [&parent_session_id, &subagent_session_id]
+            .into_iter()
+            .any(|session_id| {
+                sessions
+                    .get(session_id)
+                    .is_some_and(|session| session.is_replaying(session_id))
+            })
+    };
+    if replaying {
+        return;
+    }
+    let Some((child, _)) = registry
+        .read(cx)
+        .host_for_session(parent_session_id.0.as_ref(), cx)
+    else {
+        return;
+    };
+    let cancel = registry.update(cx, |registry, _| {
+        registry.check_announced_subagent(child, subagent_session_id.0.as_ref(), can_cancel, live)
+    });
+    if cancel {
+        subagent
+            .update(cx, |subagent, cx| subagent.cancel(cx))
+            .detach_and_log_err(cx);
+    }
+}
+
+/// R6 L2 and L3: the `_meta` of `session/new` that enforces the subagent
+/// quota of an orchestrated child. Only Claude Code, whose adapter merges
+/// `_meta.claudeCode.options` into the Claude Code options, gets one. Always
+/// takes the staged grant, so that it cannot reach another session.
+fn quota_session_meta(
+    agent_id: &AgentId,
+    cx: &mut App,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let Some(grant) = orchestration::take_staged_session_quota(cx) else {
+        return Ok(None);
+    };
+    if agent_id.as_ref() != crate::custom::CLAUDE_AGENT_ID {
+        return Ok(None);
+    }
+    orchestration::claude_code_quota_meta(&grant)
+        .context("preparing the subagent quota of the child session")
+        .map(Some)
+}
+
 fn apply_subagent_update(
     parent: &Entity<AcpThread>,
     update: &acp_v2::SubagentUpdate,
@@ -1036,11 +1117,13 @@ fn apply_v2_session_notification(
         };
         return cx.update(|cx| {
             let subagent = apply_subagent_update(&parent, update, sessions, cx)?;
-            subagent.update(cx, |subagent, cx| match state {
+            let applied = subagent.update(cx, |subagent, cx| match state {
                 MaybeUndefined::Undefined => Ok(()),
                 MaybeUndefined::Null => subagent.clear_session_state(cx),
                 MaybeUndefined::Value(state) => subagent.update_v2_subagent_state(state, cx),
-            })
+            });
+            enforce_subagent_quota(&subagent, sessions, cx);
+            applied
         });
     }
     if is_subagent && let InboundSessionUpdate::State(state) = notification.update {
@@ -1049,7 +1132,11 @@ fn apply_v2_session_notification(
         if replaying {
             return Ok(());
         }
-        return thread.update(cx, |thread, cx| thread.update_v2_subagent_state(state, cx))?;
+        let applied = thread.update(cx, |thread, cx| thread.update_v2_subagent_state(state, cx))?;
+        if let Some(subagent) = thread.upgrade() {
+            cx.update(|cx| enforce_subagent_quota(&subagent, sessions, cx));
+        }
+        return applied;
     }
     if let InboundSessionUpdate::ConfigOptions(update) = &notification.update {
         let config_options = {

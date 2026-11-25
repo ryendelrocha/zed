@@ -30,6 +30,8 @@ At most `agent.orchestration.max_concurrent_children` children (default 6) may r
 
 Children can message each other directly with `send_to_sibling`; you only see how many sibling messages each exchanged.
 
+Subagent quota: `subagent_quota` (default 0) is how many subagents or children of its own the child may start. With 0 the child cannot fan out at all. Every spawn through Zed's tools counts, and one over the quota fails with an error. Grant more only when the child's task needs to split further. `child_status` shows the quota used and granted.
+
 Returns the `child_id` to use with the other orchestration tools, and the path of the log of the exchanges with the child.";
 
 pub struct StartChildTool {
@@ -83,7 +85,9 @@ impl AgentTool for StartChildTool {
             self.session_id.clone(),
             input,
             cx,
-            |host, orchestrator, input, cx| host.start_child(orchestrator, input, cx),
+            |host, orchestrator, input, cx| {
+                orchestration::start_child_within_quota(host, orchestrator, input, cx)
+            },
         )
     }
 }

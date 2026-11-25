@@ -5192,6 +5192,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     base_ref: request.base_ref,
                     worktree_name: request.worktree_name,
                     parent_thread_id: None,
+                    subagent_quota: None,
                 },
                 cx,
             )
@@ -5226,6 +5227,15 @@ pub(crate) struct ChildThreadRequest {
     pub base_ref: Option<String>,
     pub worktree_name: Option<String>,
     pub parent_thread_id: Option<ThreadId>,
+    /// The subagent quota the orchestrator grants the new thread (R6). `None`
+    /// for threads that are not orchestrated children.
+    pub subagent_quota: Option<ChildSubagentQuota>,
+}
+
+pub(crate) struct ChildSubagentQuota {
+    pub granted: u32,
+    /// Root directory of the R4 logs, where the child's quota tickets go.
+    pub log_dir: std::path::PathBuf,
 }
 
 pub(crate) struct ChildThread {
@@ -5288,6 +5298,7 @@ pub(crate) async fn create_child_thread(
         work_dirs: None,
         parent_thread_id: request.parent_thread_id,
     };
+    let subagent_quota = request.subagent_quota;
 
     // If the caller asked for a fresh worktree, open a new workspace
     // backed by a linked git worktree of each git repo in the parent
@@ -5374,6 +5385,27 @@ pub(crate) async fn create_child_thread(
                     .get(&thread_id)
                     .cloned()
                     .ok_or_else(|| anyhow!("the new thread was not retained by the agent panel"))?;
+                // The session options depend on the quota and the session
+                // starts in the background, so the grant is stored before this
+                // call returns.
+                if let (Some(quota), Some(orchestrator)) =
+                    (subagent_quota, request.parent_thread_id)
+                {
+                    orchestration::OrchestrationRegistry::global_or_init(cx).update(
+                        cx,
+                        |registry, _| {
+                            registry.set_subagent_quota(
+                                thread_id,
+                                quota.granted,
+                                orchestration::child_quota_dir(
+                                    &quota.log_dir,
+                                    orchestrator,
+                                    thread_id,
+                                ),
+                            )
+                        },
+                    );
+                }
                 anyhow::Ok((thread_id, conversation_view, resolved_agent.id()))
             })
         })???;
@@ -15589,6 +15621,7 @@ mod tests {
             worktree: orchestration::WorktreeMode::Shared,
             base_ref: None,
             worktree_name: None,
+            subagent_quota: 0,
         }
     }
 
@@ -17054,6 +17087,7 @@ mod tests {
             .read()
             .unwrap()
             .into_iter()
+            .filter(|entry| entry.direction != LogDirection::Quota)
             .map(|entry| (entry.direction, entry.text))
             .collect::<Vec<_>>();
 
@@ -17203,6 +17237,96 @@ mod tests {
                 )
             })
         }
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_header_states_the_quota_and_child_status_reports_it(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let default_child = fixture
+            .start_child(start_child_input("Plain", "no fan out"))
+            .await;
+        let mut input = start_child_input("Splitter", "split it");
+        input.subagent_quota = 2;
+        let child = fixture.start_child(input).await;
+
+        let default_header = fixture.user_messages(default_child).remove(0);
+        assert!(
+            default_header.contains("granted you no subagents"),
+            "{default_header}"
+        );
+        let header = fixture.user_messages(child).remove(0);
+        assert!(header.contains("granted you 2 subagents"), "{header}");
+
+        let status = fixture.child_status().await.expect("child_status");
+        let quota = |title: &str| {
+            status
+                .children
+                .iter()
+                .find(|info| info.title == title)
+                .expect("child in status")
+                .subagent_quota
+        };
+        assert_eq!(
+            quota("Plain"),
+            orchestration::SubagentQuotaStatus {
+                granted: 0,
+                used: 0
+            }
+        );
+        assert_eq!(
+            quota("Splitter"),
+            orchestration::SubagentQuotaStatus {
+                granted: 2,
+                used: 0
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_child_starts_children_only_within_its_quota(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let mut input = start_child_input("Splitter", "split it");
+        input.subagent_quota = 1;
+        let child = fixture.start_child(input).await;
+
+        let start_grandchild = |fixture: &mut OrchestrationFixture, title: &str| {
+            let input = start_child_input(title, "sub-work");
+            fixture.cx.update(|_window, cx| {
+                orchestration::start_child_within_quota(fixture.host.clone(), child, input, cx)
+            })
+        };
+        start_grandchild(&mut fixture, "First")
+            .await
+            .expect("the first grandchild is within the quota");
+        fixture.cx.run_until_parked();
+        let error = start_grandchild(&mut fixture, "Second")
+            .await
+            .expect_err("the second grandchild is over the quota");
+        assert!(
+            error.to_string().contains("Subagent quota exhausted"),
+            "{error}"
+        );
+
+        let status = fixture.child_status().await.expect("child_status");
+        assert_eq!(
+            status.children[0].subagent_quota,
+            orchestration::SubagentQuotaStatus {
+                granted: 1,
+                used: 1
+            }
+        );
+        assert!(
+            fixture
+                .log_lines(child)
+                .iter()
+                .any(|(direction, text)| *direction == LogDirection::Quota
+                    && text.contains("refused")),
+            "the refusal is a quota event in the child's log"
+        );
     }
 
     #[gpui::test]

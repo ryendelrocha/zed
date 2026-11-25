@@ -263,7 +263,7 @@ impl McpServerTool for StartChildTool {
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
         let output = with_host(caller, cx, |orchestrator, host, cx| {
-            host.start_child(orchestrator, input, cx)
+            crate::start_child_within_quota(host, orchestrator, input, cx)
         })
         .await?;
         text_response(output)

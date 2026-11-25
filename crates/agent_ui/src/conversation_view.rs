@@ -1571,10 +1571,19 @@ impl ConversationView {
                 })
                 .log_err()
             } else {
+                let thread_id = this.read_with(cx, |this, _| this.thread_id).log_err();
                 cx.update(|_, cx| {
-                    connection
-                        .clone()
-                        .new_session(project.clone(), session_work_dirs, cx)
+                    // An orchestrated child's quota shapes its session options
+                    // (R6). The connection takes the grant synchronously.
+                    if let Some(thread_id) = thread_id {
+                        orchestration::stage_session_quota(thread_id, cx);
+                    }
+                    let session =
+                        connection
+                            .clone()
+                            .new_session(project.clone(), session_work_dirs, cx);
+                    orchestration::clear_staged_session_quota(cx);
+                    session
                 })
                 .log_err()
             };

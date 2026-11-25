@@ -3681,6 +3681,40 @@ pub struct NativeThreadEnvironment {
 }
 
 impl NativeThreadEnvironment {
+    /// R6 L1: counts a subagent or thread this thread starts against the
+    /// quota its orchestrator granted, or refuses it. Returns the thread to
+    /// refund if the start then fails. A thread that is not an orchestrated
+    /// child has no quota.
+    fn count_toward_subagent_quota(
+        &self,
+        tool: &str,
+        cx: &mut App,
+    ) -> Result<Option<orchestration::ThreadId>> {
+        let session_id = self
+            .thread
+            .read_with(cx, |thread, _| thread.id().0.to_string())?;
+        let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) else {
+            return Ok(None);
+        };
+        let Some((thread, _)) = registry.read(cx).host_for_session(&session_id, cx) else {
+            return Ok(None);
+        };
+        registry.update(cx, |registry, _| {
+            registry.consume_subagent_quota(thread, tool)
+        })?;
+        Ok(Some(thread))
+    }
+
+    fn refund_subagent_quota(counted: Option<orchestration::ThreadId>, cx: &mut App) {
+        let (Some(thread), Some(registry)) = (
+            counted,
+            orchestration::OrchestrationRegistry::try_global(cx),
+        ) else {
+            return;
+        };
+        registry.update(cx, |registry, _| registry.refund_subagent_quota(thread));
+    }
+
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
@@ -3916,7 +3950,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, model, cx)
+        let counted = self.count_toward_subagent_quota("spawn_agent", cx)?;
+        let handle = self.create_subagent_thread(label, model, cx);
+        if handle.is_err() {
+            Self::refund_subagent_quota(counted, cx);
+        }
+        handle
     }
 
     fn resume_subagent(
@@ -3928,6 +3967,41 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     }
 
     fn create_sibling_thread(
+        &self,
+        request: SiblingThreadRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<SiblingThreadInfo>> {
+        let counted = match cx.update(|cx| self.count_toward_subagent_quota("create_thread", cx)) {
+            Ok(counted) => counted,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let created = self.create_counted_sibling_thread(request, cx);
+        cx.spawn(async move |cx| {
+            let info = created.await;
+            if info.is_err() {
+                cx.update(|cx| Self::refund_subagent_quota(counted, cx));
+            }
+            info
+        })
+    }
+
+    fn list_available_agents(&self, cx: &mut App) -> Result<AvailableAgents> {
+        let host = self
+            .agent
+            .read_with(cx, |agent, _| agent.sibling_thread_host())?;
+        if let Some(host) = host {
+            host.list_available_agents(cx)
+        } else {
+            Ok(AvailableAgents {
+                agents: vec![available_native_agent(cx)],
+                profiles: available_profiles(cx),
+            })
+        }
+    }
+}
+
+impl NativeThreadEnvironment {
+    fn create_counted_sibling_thread(
         &self,
         request: SiblingThreadRequest,
         cx: &mut AsyncApp,
@@ -3946,20 +4020,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             Err(err) => return Task::ready(Err(err)),
         };
         host.create_sibling_thread(request, cx)
-    }
-
-    fn list_available_agents(&self, cx: &mut App) -> Result<AvailableAgents> {
-        let host = self
-            .agent
-            .read_with(cx, |agent, _| agent.sibling_thread_host())?;
-        if let Some(host) = host {
-            host.list_available_agents(cx)
-        } else {
-            Ok(AvailableAgents {
-                agents: vec![available_native_agent(cx)],
-                profiles: available_profiles(cx),
-            })
-        }
     }
 }
 
@@ -4559,6 +4619,140 @@ mod internal_tests {
             // intentionally filtered while the model selection is applied.
             assert_eq!(thread.speed(), None);
         });
+    }
+
+    struct QuotaHost {
+        thread: orchestration::ThreadId,
+        session_id: String,
+    }
+
+    impl orchestration::OrchestrationHost for QuotaHost {
+        fn start_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::StartChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::StartChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn send_to_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::SendToChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::SendToChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn cancel_child(
+            &self,
+            _: orchestration::ThreadId,
+            _: orchestration::CancelChildInput,
+            _: &mut App,
+        ) -> Task<Result<orchestration::CancelChildOutput>> {
+            Task::ready(Err(anyhow!("not used")))
+        }
+
+        fn list_available_agents(&self, _: &mut App) -> Result<orchestration::AvailableAgents> {
+            Ok(orchestration::AvailableAgents::default())
+        }
+
+        fn resolve_orchestrator(
+            &self,
+            session_id: &str,
+            _: &App,
+        ) -> Option<orchestration::ThreadId> {
+            (session_id == self.session_id).then_some(self.thread)
+        }
+
+        fn owns_thread(&self, thread: orchestration::ThreadId, _: &App) -> bool {
+            thread == self.thread
+        }
+    }
+
+    #[gpui::test]
+    async fn test_native_spawns_are_counted_against_the_subagent_quota(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| connection.new_session(project, PathList::new(&[Path::new("/test")]), cx))
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent_thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        let child = orchestration::ThreadId::new();
+        let registry = cx.update(orchestration::OrchestrationRegistry::global_or_init);
+        registry.update(cx, |registry, _| {
+            registry.register_host(Rc::new(QuotaHost {
+                thread: child,
+                session_id: session_id.0.to_string(),
+            }));
+            registry.set_subagent_quota(child, 1, PathBuf::from("/unused"));
+        });
+        let used = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, _| {
+                registry.subagent_quota(child).unwrap().used()
+            })
+        };
+        let request = || SiblingThreadRequest {
+            title: "sibling".into(),
+            prompt: "work".into(),
+            agent_id: None,
+            model: None,
+            use_new_worktree: false,
+            worktree_name: None,
+            base_ref: None,
+        };
+
+        // This environment has no sibling-thread host, so the start fails and
+        // gives its spawn back.
+        let error = environment
+            .create_sibling_thread(request(), &mut cx.to_async())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No sibling-thread host"),
+            "{error}"
+        );
+        assert_eq!(used(cx), 0);
+
+        registry
+            .update(cx, |registry, _| {
+                registry.consume_subagent_quota(child, "spawn_agent")
+            })
+            .unwrap();
+        assert_eq!(used(cx), 1);
+        let error = environment
+            .create_sibling_thread(request(), &mut cx.to_async())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Subagent quota exhausted"),
+            "{error}"
+        );
+        let error = cx
+            .update(|cx| environment.create_subagent("worker".to_string(), None, cx))
+            .err()
+            .expect("spawn_agent is over the quota");
+        assert!(
+            error.to_string().contains("Subagent quota exhausted"),
+            "{error}"
+        );
+        assert_eq!(used(cx), 1);
     }
 
     #[cfg(target_os = "macos")]
