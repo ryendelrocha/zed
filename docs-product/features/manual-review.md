@@ -2,7 +2,7 @@
 
 This file lists every file changed for orchestrated threads, so a human reviewer can review each one individually before anything is proposed upstream to Zed. A checkmark in the "Manual review" column means a human reviewed that file; an empty cell means it has not been reviewed yet. The fork owner fills this column, nobody else.
 
-Base commit: `0be6d59`. Last commit covered: `4fc06ea` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
+Base commit: `0be6d59`. Last commit covered: `93bd256` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
 
 ## Files
 
@@ -137,6 +137,11 @@ Changed again in `10530cf` (R17): `persisted_thread_model` rebuilds the model na
 
 Changed again in `4fc06ea` (R9): `fully_loaded_subthread_groups` becomes `subthread_shown_counts` (children shown per group, not reset by collapsing); `load_more_subthreads` adds `subthreads_visible` to the count (starting from one page) instead of showing everything; the sidebar observes the `ThreadStore` and rebuilds when it changes; `persisted_subthreads_by_parent` feeds the layout when `show_as_subthreads` is on; clicking a child of a parent whose project is closed opens the project with the parent (`open_workspace_and_activate_thread`), and otherwise the panel shows the subagent through `navigate_to_subthread_when_ready`. Why: R9 paging by N and children of unloaded parents.
 
+Changed again in `93bd256` (R9, R17): `merge_live_thread_model` replaces the plain `or_else`: a live model counts only when its name is non-empty, a missing live icon falls back to the persisted one, otherwise the persisted model stays; `all_thread_infos_for_workspace` drops live models with an empty name; nested child rows get a stable element id from their thread id. Why: a loading or reconnecting child blanked its row.
+- Review focus:
+  - `merge_live_thread_model` covers all four live/persisted combinations.
+  - Top-level rows keep the index-based id; only nested rows changed.
+
 #### [`crates/sidebar/src/sidebar_tests.rs`](../../crates/sidebar/src/sidebar_tests.rs)
 
 - Scope: test coverage for R9 behavior and the stable-order rule.
@@ -151,6 +156,8 @@ Changed again in `b1c2733` and `10530cf`: new helpers `save_orchestration_thread
   - The assertions describe visible behavior (rows, labels, order), not entry-list internals.
 
 Changed again in `4fc06ea` (R9): `select_visible_subthreads` calls lose `show_all`; the limit test also asserts a second "Load more" click; new helpers `kid_titles`, `kid_names` and `save_native_subagent` (saves a native subagent with a parent session in the threads database); new tests `test_load_more_pages_by_visible_count_newest_first`, `test_loaded_count_survives_collapse_and_expand`, `test_top_level_threads_are_not_limited_by_subthreads_visible`, `test_unloaded_parent_shows_chevron_and_children_without_opening` and `test_persisted_native_subagents_nest_under_unloaded_parent`. Mostly additive.
+
+Changed again in `93bd256` (R9, R17): new helpers `ollama_model`, `child_entry_with_model` and `active_info_with_model`; new tests `test_loading_child_without_a_model_keeps_the_persisted_model_and_icon`, `test_live_model_without_an_icon_keeps_the_persisted_icon`, `test_live_model_with_an_empty_name_does_not_blank_the_persisted_model`, `test_known_live_model_replaces_the_persisted_one` and `test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted`. Additive.
 
 #### [`crates/sidebar/Cargo.toml`](../../crates/sidebar/Cargo.toml)
 
@@ -176,6 +183,8 @@ Changed again in `b1c2733`: `SubthreadInfo` gains `model` and `thread_id` (`None
 Changed again in `cbf577d`: declares the `orchestrated_permissions` module. In `bd64c7b`: `stage_session_quota` before and `clear_staged_session_quota` after `new_session`, so the grant reaches only that session.
 
 Changed again in `4fc06ea` (R9): new field `pending_navigation` and `navigate_to_thread_when_ready(session_id)`, which shows a subagent thread now or, when it is not in the conversation yet, as soon as it is added (a persisted subagent is restored asynchronously while its parent loads). Why: clicking a child of an unloaded parent must land on the child.
+
+Changed again in `93bd256` (R9, R17): the model of a subagent's own view is filtered, so a model with an empty name is treated as missing. Why: an empty live model must not replace the persisted one.
 
 #### [`crates/agent_ui/src/agent_ui.rs`](../../crates/agent_ui/src/agent_ui.rs)
 
@@ -410,6 +419,8 @@ Changed again in `d303f89`: only tests were added (`OrchestrationFixture` helper
 Changed again in `cbf577d`: archiving a thread cancels its running descendants; `watch_saved_children` is installed with the host; `load_thread_in_background` opens a saved thread without activating it; `remove_thread_internal` cancels descendants, revokes the thread's session tokens and removes the orchestrator from the registry; new tests for the cascade, the concurrency cap, sibling messages, the restart rebuild and the permission cards. In `bd64c7b`: `ChildSubagentQuota` and `ChildThreadRequest.subagent_quota`, and `create_child_thread` stores the grant (`set_subagent_quota`) before returning, because the session starts in the background; tests for the header, `child_status` and quota-limited starts.
 
 Changed again in `4fc06ea` (R9): `navigate_to_subthread_when_ready` finds the parent's conversation view and calls `navigate_to_thread_when_ready` on it; `navigate_to_subthread` is unchanged. Why: the sidebar uses it when the parent was not loaded.
+
+Changed again in `93bd256` (R9, R17): `persist_native_run_config` persists a model only when its provider id and model id are non-empty, and the profile id only when non-empty; new test `test_changing_one_child_model_leaves_its_sibling_persisted_config`. Why: a loading thread has no resolved model, and an empty one must never overwrite the stored run config.
 
 #### [`crates/agent_ui/src/conversation_view/thread_view.rs`](../../crates/agent_ui/src/conversation_view/thread_view.rs)
 
@@ -816,6 +827,8 @@ Changed again in the documentation update after `4fc06ea`: R9 now states discove
 - Scope: implementation plan for the R1 to R5 slice.
 - What changed: new document with decisions, steps, risks and tests.
 - Why: records the intended design that `36ead50` implements the groundwork of.
+
+Changed again in the documentation update after `93bd256`: R9 and R17 state that a child row keeps its persisted model and icon unless the live model is complete (non-empty name, icon falling back to the persisted one), that empty models are never persisted and that child rows use stable ids; the R9 and R17 status rows add `93bd256`; new AC32.
 - Review focus:
   - Steps not yet implemented in `36ead50` (tool adapters, MCP server) remain open.
 
@@ -840,7 +853,7 @@ Changed again in the documentation update after `bd64c7b`: the token is also use
 #### [`docs-product/features/manual-review.md`](manual-review.md)
 
 - Scope: this checklist.
-- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`, then up to `bd64c7b`, then up to `4fc06ea`.
+- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`, then up to `bd64c7b`, then up to `4fc06ea`, then up to `93bd256`.
 - Why: lets the fork owner review every file individually before anything goes upstream.
 - Review focus:
   - Only the "Manual review" column is edited by the fork owner; a "🔁" marks a file reviewed before and changed since.
@@ -848,3 +861,5 @@ Changed again in the documentation update after `bd64c7b`: the token is also use
 Changed again in the update that extends the list from `10530cf` to `bd64c7b`: four new rows (`list_siblings_tool.rs`, `send_to_sibling_tool.rs`, `orchestrated_permissions.rs`, `quota.rs`), "Changed again" paragraphs for the files touched by `cbf577d` and `bd64c7b`, and the sections "R3b, R12, caps and restart", "R13: permission cards" and "R6: subagent quota". No row was marked reviewed by this update.
 
 Changed again in the update that extends the list from `bd64c7b` to `4fc06ea`: one new row (`thread_store.rs`), "Changed again in `4fc06ea`" paragraphs for `subthreads.rs`, `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`, and the section "R9: children of unloaded parents (`4fc06ea`)". No row was marked reviewed by this update.
+
+Changed again in the update that extends the list from `4fc06ea` to `93bd256`: no new row, "Changed again in `93bd256`" paragraphs for `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`, and the "Last commit covered" line.

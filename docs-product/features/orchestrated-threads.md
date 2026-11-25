@@ -5,7 +5,7 @@
 
 ## Implementation status
 
-Status of each requirement at `bd64c7b`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`; children of unloaded parents and paging of "Load more" by N are `4fc06ea` (R9 is described at `4fc06ea`, the rest at `bd64c7b`).
+Status of each requirement at `bd64c7b`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`; children of unloaded parents and paging of "Load more" by N are `4fc06ea` (R9 is described at `4fc06ea`, the rest at `bd64c7b`). `93bd256` keeps a child row's persisted model and icon when live data is incomplete (R9, R17).
 
 | ID | Status | Commits |
 | :-- | :-- | :-- |
@@ -18,7 +18,7 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | R6 Subagent quota | Partial | `bd64c7b` |
 | R7 Shared or separate worktree | Done | `36ead50`, `b1c2733` |
 | R8 Parallel execution | Done | `b1c2733` |
-| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf`, `4fc06ea` |
+| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf`, `4fc06ea`, `93bd256` |
 | R10 Settings | Done | `36ead50`, `d303f89`, `cbf577d` |
 | R11 The human can write in a child | Done | `d303f89` (message origins); spec revised in `1fcdad9` |
 | R12 Cancellation cascades | Done | `cbf577d` |
@@ -26,7 +26,7 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | R14 A child knows it is a child | Done | `d303f89`; quota sentence in `bd64c7b`, sibling sentence in `cbf577d` |
 | R15 Child-to-orchestrator inbox | Done | `d303f89` |
 | R16 Human intervention summary | Done | `d303f89` |
-| R17 Task profiles pick the provider | Done | `10530cf` |
+| R17 Task profiles pick the provider | Done | `10530cf`, `93bd256` |
 | E1 Interact with children directly | Done | `d303f89` (see R11, R16) |
 | E2 Durable log outside `$TMPDIR` | Not started | none |
 
@@ -189,6 +189,7 @@ When `agent.orchestration.show_as_subthreads` is on:
 - the number of children loaded in each group **survives collapse and expand and rebuilds of the list**, and resets only when the app restarts;
 - children are **sorted by the time of their last message, most recent first**;
 - each child row reuses the thread row's status icons (running, waiting for confirmation, error, done).
+- each child row shows its model name and provider icon, and keeps them while its data is incomplete: the live model counts only when it is complete (a non-empty name; a missing live icon falls back to the persisted icon), otherwise the persisted run config is shown. Child rows use stable element ids, so a row is not recreated when a sibling is loaded, selected or evicted.
 
 When the setting is off, children appear as ordinary top-level threads, which is today's `create_thread` behavior.
 
@@ -288,7 +289,7 @@ When the human writes directly in a child (R11), the human's messages are **not*
 
 ### R17. Task profiles pick the provider
 
-Agent profiles (`agent.profiles`, which already have a name, a tool set and a `default_model`) gain a `description`: when to use the profile. `start_child` gains an optional `profile`. `list_agents_and_models` also returns the profiles with their descriptions, so the orchestrator picks a profile by matching the task to the descriptions. The child's model is resolved in this order: an explicit `model`; the profile's `default_model`; `agent.subagent_model`; the user's default model. The profile's tool set also applies to the child. The child's model and profile are stored in its thread metadata (`run_config`), so the sidebar shows the model and provider icon even when the child is not loaded. The sidebar labels a nested child row "Profile · model" (just the model without a profile). The profile `description` is set in the profile creation and fork form of the agent settings (it is not editable on an existing profile in that form), shown in the profile list, and can also be written in `settings.json`. `start_child` with an unknown `profile` is an error that lists the available ids. For an external agent child, `profile` is ignored with a warning (see R2).
+Agent profiles (`agent.profiles`, which already have a name, a tool set and a `default_model`) gain a `description`: when to use the profile. `start_child` gains an optional `profile`. `list_agents_and_models` also returns the profiles with their descriptions, so the orchestrator picks a profile by matching the task to the descriptions. The child's model is resolved in this order: an explicit `model`; the profile's `default_model`; `agent.subagent_model`; the user's default model. The profile's tool set also applies to the child. The child's model and profile are stored in its thread metadata (`run_config`), so the sidebar shows the model and provider icon even when the child is not loaded. The live model of a loaded child counts only when it is complete (a non-empty name; a missing live icon falls back to the persisted icon); otherwise the persisted run config is shown. An empty model (empty provider or model id) is never persisted, so it cannot replace the stored one. The sidebar labels a nested child row "Profile · model" (just the model without a profile). The profile `description` is set in the profile creation and fork form of the agent settings (it is not editable on an existing profile in that form), shown in the profile list, and can also be written in `settings.json`. `start_child` with an unknown `profile` is an error that lists the available ids. For an external agent child, `profile` is ignored with a warning (see R2).
 
 **Why:** today the user must name the model in every request. Reusing profiles adds one field and one parameter, with no new settings section or UI. Profiles cover every provider the native Zed agent supports; routing a profile to an external agent (an `agent` field) is a later step.
 
@@ -342,6 +343,7 @@ Status column: **Met (tests)** means a test in the code asserts the behavior; **
 | AC29 | R9: the number of children loaded in a group is kept when the group is collapsed and expanded again. | Met (tests) | `test_loaded_count_survives_collapse_and_expand` |
 | AC30 | R9: top-level threads are not limited by `subthreads_visible`; 12 top-level threads with `subthreads_visible: 2` are all listed, with no "Load more". | Met (tests) | `test_top_level_threads_are_not_limited_by_subthreads_visible` |
 | AC31 | R9: clicking a child of an unloaded parent opens the parent (and its project, if closed) and then shows the subagent as soon as the parent conversation has restored it. | Not verified | No test covers the click. The code path is `navigate_to_subthread_when_ready` and `open_workspace_and_activate_thread` (`4fc06ea`). That the count survives an app restart is also untested: the count is in memory only. |
+| AC32 | R9, R17: a child row keeps its persisted model and icon when its live model is missing, has no icon or has an empty name, and when another child is selected, loaded or evicted; a complete live model replaces the persisted one. | Met (tests) | `test_loading_child_without_a_model_keeps_the_persisted_model_and_icon`, `test_live_model_without_an_icon_keeps_the_persisted_icon`, `test_live_model_with_an_empty_name_does_not_blank_the_persisted_model`, `test_known_live_model_replaces_the_persisted_one`, `test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted`, `test_changing_one_child_model_leaves_its_sibling_persisted_config` |
 
 ## 10. Risks
 
