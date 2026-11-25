@@ -19,7 +19,10 @@ How results come back:
 
 Typical flow: call `start_child` once per piece of work (all in the same turn), then call `await_children` to collect the final messages. Prefer `await_children` over polling with `child_status`.
 
-Agent and model: leave `agent` and `model` unset to use the user's current defaults. Call `list_agents_and_models` first if you need a specific agent or a cheaper or faster model for bulk work. `model` is applied only for the native Zed agent; for an external agent it is ignored and the result carries a warning.
+Agent, profile and model: leave `agent`, `profile` and `model` unset to use the user's current defaults. Call `list_agents_and_models` first when you need something specific.
+- Prefer `profile` over naming a `model`. Profiles are listed by `list_agents_and_models`, each with a description of when to use it. Match the task to the descriptions and pick the best fit. The child gets the profile's tools and its default model. In your reply to the user, say which profile you used for each child and why.
+- Use `model` only when no profile fits or you need an exact model. It wins over the profile's model. The model resolves in this order: `model`, the profile's default model, the user's subagent model setting, the user's default model.
+- `profile` and `model` are applied only for the native Zed agent; for an external agent they are ignored and the result carries a warning. An unknown `profile` is an error that lists the valid ids.
 
 Worktree: `shared` (default) uses this thread's worktree. `new` creates a separate git worktree in a new workspace, based on `base_ref` (default HEAD), so the child cannot collide with you or with other children. It needs a git repository in the project.
 

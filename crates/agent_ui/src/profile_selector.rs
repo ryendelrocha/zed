@@ -971,6 +971,7 @@ mod tests {
                                     format!("custom-{index:03}").into(),
                                     settings::AgentProfileContent {
                                         name: format!("Custom {index:03}").into(),
+                                        description: None,
                                         tools: Default::default(),
                                         enable_all_context_servers: None,
                                         context_servers: Default::default(),

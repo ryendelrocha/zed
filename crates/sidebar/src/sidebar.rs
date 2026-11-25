@@ -10,7 +10,8 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    ThreadMetadata, ThreadMetadataStore, ThreadRunConfig, WorktreePaths,
+    worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -395,8 +396,55 @@ impl ThreadEntry {
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
-        self.model = info.model.clone();
+        // A loaded thread knows its model; without one, keep what was
+        // persisted so the row does not lose it.
+        self.model = info.model.clone().or_else(|| self.model.take());
     }
+}
+
+/// The name of the profile with this id, or the id when it was deleted.
+fn profile_display_name(profile_id: &SharedString, cx: &App) -> SharedString {
+    agent_settings::AgentSettings::get_global(cx)
+        .profiles
+        .get(&agent_settings::AgentProfileId(profile_id.as_ref().into()))
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| profile_id.clone())
+}
+
+/// The secondary text of a child row: `Profile · model`. The row truncates it
+/// at its end, so a narrow sidebar cuts the model first.
+fn child_model_label(profile: Option<&str>, model: Option<&str>) -> Option<SharedString> {
+    match (profile, model) {
+        (Some(profile), Some(model)) => Some(format!("{profile} \u{00b7} {model}").into()),
+        (Some(profile), None) => Some(profile.to_string().into()),
+        (None, Some(model)) => Some(model.to_string().into()),
+        (None, None) => None,
+    }
+}
+
+/// The model and provider icon of a thread that is not loaded, from what its
+/// metadata persisted. The name comes from the registry when the model is
+/// still available, and is the model id otherwise.
+fn persisted_thread_model(run_config: &ThreadRunConfig, cx: &App) -> Option<ThreadModel> {
+    let (provider_id, model_id) = run_config.model()?;
+    let registry = LanguageModelRegistry::read_global(cx);
+    let provider = registry.provider(&language_model::LanguageModelProviderId(
+        provider_id.to_string().into(),
+    ));
+    let icon = provider.as_ref().map(|provider| match provider.icon() {
+        language_model::IconOrSvg::Svg(path) => AgentModelIcon::Path(path),
+        language_model::IconOrSvg::Icon(name) => AgentModelIcon::Named(name),
+    });
+    let name = provider
+        .and_then(|provider| {
+            provider
+                .provided_models(cx)
+                .into_iter()
+                .find(|model| model.id().0.as_ref() == model_id)
+        })
+        .map(|model| model.name().0)
+        .unwrap_or_else(|| SharedString::from(model_id.to_string()));
+    Some(ThreadModel { name, icon })
 }
 
 #[derive(Clone)]
@@ -1981,6 +2029,16 @@ impl Sidebar {
                     }
                 }
                 threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
+
+                // A thread that is not loaded shows the model it was started
+                // with; a loaded one replaces it with its live model below.
+                for thread in &mut threads {
+                    if thread.model.is_none()
+                        && let Some(model) = persisted_thread_model(&thread.metadata.run_config, cx)
+                    {
+                        Arc::make_mut(thread).model = Some(model);
+                    }
+                }
 
                 // Keep empty drafts only while their thread is active; preserve
                 // drafts with content because they hold user-typed state.
@@ -6970,7 +7028,18 @@ impl Sidebar {
 
         let nested_model = thread
             .nested
-            .then(|| thread.model.as_ref().map(|model| model.name.clone()))
+            .then(|| {
+                let profile_name = thread
+                    .metadata
+                    .run_config
+                    .profile_id
+                    .as_ref()
+                    .map(|profile_id| profile_display_name(profile_id, cx));
+                child_model_label(
+                    profile_name.as_deref(),
+                    thread.model.as_ref().map(|model| model.name.as_ref()),
+                )
+            })
             .flatten();
 
         let thread_item = ThreadItem::new(id, title.clone())

@@ -148,9 +148,17 @@ pub struct StartChildInput {
     pub agent: Option<String>,
     /// Model of the child, as `provider/model-id`. Only the native Zed agent
     /// supports it for now: for an external agent it is ignored and the
-    /// output carries a warning.
+    /// output carries a warning. Prefer `profile` over naming a model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Profile of the child, as an `id` from the `profiles` of
+    /// `list_agents_and_models`. Pick it by matching the task to the profile
+    /// descriptions. The child gets the profile's tools and, unless `model`
+    /// is set, the profile's default model. Only the native Zed agent
+    /// supports it for now: for an external agent it is ignored and the
+    /// output carries a warning. An unknown profile is an error.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// Whether the child shares the orchestrator's worktree or gets its own.
     #[serde(default)]
     pub worktree: WorktreeMode,
@@ -445,6 +453,63 @@ pub struct CancelChildOutput {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AvailableAgents {
     pub agents: Vec<AvailableAgent>,
+    /// Profiles of the native Zed agent, for the `profile` field of
+    /// `start_child`. Pick one by matching the task to the descriptions.
+    #[serde(default)]
+    pub profiles: Vec<AvailableProfile>,
+}
+
+/// An agent profile a child of the native Zed agent can run with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AvailableProfile {
+    /// Value for the `profile` field of `start_child`.
+    pub id: String,
+    pub name: String,
+    /// When to use the profile. Absent when the user did not describe it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Model the profile runs on, as `provider/model-id`, when it sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+/// Where a child's model came from, in order of precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildModelSource {
+    /// The `model` the orchestrator named.
+    Explicit,
+    /// The `default_model` of the child's profile.
+    Profile,
+    /// The `agent.subagent_model` setting.
+    SubagentSetting,
+}
+
+/// Resolves the model of a native-agent child: an explicit `model`, else the
+/// profile's `default_model`, else `agent.subagent_model`. `None` means the
+/// user's default model. Every input is `provider/model-id`.
+pub fn resolve_child_model(
+    explicit: Option<&str>,
+    profile_default: Option<&str>,
+    subagent_setting: Option<&str>,
+) -> Option<(String, ChildModelSource)> {
+    explicit
+        .map(|model| (model, ChildModelSource::Explicit))
+        .or(profile_default.map(|model| (model, ChildModelSource::Profile)))
+        .or(subagent_setting.map(|model| (model, ChildModelSource::SubagentSetting)))
+        .map(|(model, source)| (model.to_string(), source))
+}
+
+/// The error for a `profile` that is not defined.
+pub fn unknown_profile_error(profile: &str, available: &[AvailableProfile]) -> String {
+    let ids = available
+        .iter()
+        .map(|profile| format!("{:?}", profile.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Unknown profile {profile:?}. Available profile ids: {ids}. \
+         Call `list_agents_and_models` to see what each profile is for."
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -580,5 +645,53 @@ pub trait OrchestrationHost {
     ) -> Task<Result<AwaitChildrenOutput>> {
         let registry = OrchestrationRegistry::global_or_init(cx);
         OrchestrationRegistry::await_children(&registry, orchestrator, input, cx)
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn test_child_model_resolution_order() {
+        let all = resolve_child_model(Some("a/explicit"), Some("b/profile"), Some("c/setting"));
+        assert_eq!(
+            all,
+            Some(("a/explicit".to_string(), ChildModelSource::Explicit))
+        );
+        let no_explicit = resolve_child_model(None, Some("b/profile"), Some("c/setting"));
+        assert_eq!(
+            no_explicit,
+            Some(("b/profile".to_string(), ChildModelSource::Profile))
+        );
+        let setting_only = resolve_child_model(None, None, Some("c/setting"));
+        assert_eq!(
+            setting_only,
+            Some(("c/setting".to_string(), ChildModelSource::SubagentSetting))
+        );
+        // Nothing set: the user's default model applies.
+        assert_eq!(resolve_child_model(None, None, None), None);
+    }
+
+    #[test]
+    fn test_unknown_profile_error_lists_ids() {
+        let profiles = vec![
+            AvailableProfile {
+                id: "write".into(),
+                name: "Write".into(),
+                description: None,
+                default_model: None,
+            },
+            AvailableProfile {
+                id: "ask".into(),
+                name: "Ask".into(),
+                description: Some("Questions".into()),
+                default_model: None,
+            },
+        ];
+        let error = unknown_profile_error("nope", &profiles);
+        assert!(error.contains("\"nope\""), "{error}");
+        assert!(error.contains("\"write\", \"ask\""), "{error}");
+        assert!(error.contains("list_agents_and_models"), "{error}");
     }
 }

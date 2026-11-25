@@ -102,6 +102,7 @@ pub struct ViewProfileMode {
 #[derive(Clone)]
 pub struct NewProfileMode {
     name_editor: Entity<Editor>,
+    description_editor: Entity<Editor>,
     base_profile_id: Option<AgentProfileId>,
 }
 
@@ -187,8 +188,18 @@ impl ManageProfilesModal {
             editor.set_placeholder_text("Profile name", window, cx);
         });
 
+        let description_editor = cx.new(|cx| Editor::single_line(window, cx));
+        description_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(
+                "Description: when to use this profile (optional)",
+                window,
+                cx,
+            );
+        });
+
         self.mode = Mode::NewProfile(NewProfileMode {
             name_editor,
+            description_editor,
             base_profile_id,
         });
         self.focus_handle(cx).focus(window, cx);
@@ -414,10 +425,17 @@ impl ManageProfilesModal {
             Mode::ChooseProfile { .. } => {}
             Mode::NewProfile(mode) => {
                 let name = mode.name_editor.read(cx).text(cx);
+                let description = mode.description_editor.read(cx).text(cx);
+                let description = Some(description.trim().to_string()).filter(|d| !d.is_empty());
                 let base_profile_id = mode.base_profile_id.clone();
 
-                let profile_id =
-                    AgentProfile::create(name, base_profile_id.clone(), self.fs.clone(), cx);
+                let profile_id = AgentProfile::create(
+                    name,
+                    description,
+                    base_profile_id.clone(),
+                    self.fs.clone(),
+                    cx,
+                );
                 telemetry::event!(
                     "Agent Profile Created",
                     profile_id = profile_id.as_str(),
@@ -670,7 +688,13 @@ impl ManageProfilesModal {
                 },
             ))
             .child(ListSeparator)
-            .child(h_flex().p_2().child(mode.name_editor))
+            .child(
+                v_flex()
+                    .p_2()
+                    .gap_1()
+                    .child(mode.name_editor)
+                    .child(mode.description_editor),
+            )
     }
 
     fn render_view_profile(
@@ -687,6 +711,11 @@ impl ManageProfilesModal {
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Unknown".into());
 
+        let profile_description = settings
+            .profiles
+            .get(&mode.profile_id)
+            .and_then(|profile| profile.description.clone());
+
         let icon = match mode.profile_id.as_str() {
             "write" => IconName::Pencil,
             "ask" => IconName::Chat,
@@ -698,6 +727,15 @@ impl ManageProfilesModal {
                 .track_focus(&self.focus_handle(cx))
                 .size_full()
                 .child(ProfileModalHeader::new(profile_name, Some(icon)))
+                .when_some(profile_description, |this, description| {
+                    this.child(
+                        div().px_3().pb_1().child(
+                            Label::new(description)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                })
                 .child(
                     v_flex()
                         .pb_1()

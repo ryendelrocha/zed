@@ -17,7 +17,8 @@ use orchestration::{
     AvailableAgent, AvailableAgents, AvailableModel, CancelChildInput, CancelChildOutput,
     ChildStatus, HumanSummaryRequest, NewChild, OrchestrationHost, OrchestrationRegistry,
     SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput, ThreadId, WorktreeMode,
-    child_header, human_summary_prompt, orchestration_log_dir,
+    child_header, human_summary_prompt, orchestration_log_dir, resolve_child_model,
+    unknown_profile_error,
 };
 use settings::Settings as _;
 
@@ -123,6 +124,40 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                 None => selected_agent_is_native,
             };
             let mut warnings = Vec::new();
+
+            // An unknown profile is an error whatever the agent, so a typo is
+            // caught instead of being ignored with a warning.
+            let (available_profiles, subagent_model) = cx.update(|cx| {
+                (
+                    agent::available_profiles(cx),
+                    agent_settings::AgentSettings::get_global(cx)
+                        .subagent_model
+                        .as_ref()
+                        .map(agent::selection_to_model_string),
+                )
+            });
+            if let Some(profile) = input.profile.as_deref()
+                && !available_profiles.iter().any(|known| known.id == profile)
+            {
+                return Err(anyhow!(unknown_profile_error(profile, &available_profiles)));
+            }
+            let profile = match input.profile {
+                Some(profile) if !is_native => {
+                    warnings.push(format!(
+                        "`profile` ({profile:?}) is not supported yet for external agents: \
+                         the child uses the agent's own configuration."
+                    ));
+                    None
+                }
+                profile => profile,
+            };
+            let profile_default_model = profile.as_deref().and_then(|profile| {
+                available_profiles
+                    .iter()
+                    .find(|known| known.id == profile)
+                    .and_then(|known| known.default_model.clone())
+            });
+
             let model = match input.model {
                 Some(model) if !is_native => {
                     warnings.push(format!(
@@ -144,6 +179,19 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                 }
                 model => model,
             };
+            // Explicit `model`, else the profile's model, else
+            // `agent.subagent_model`; none left means the user's default.
+            // External agents choose their own model.
+            let model = if is_native {
+                resolve_child_model(
+                    model.as_deref(),
+                    profile_default_model.as_deref(),
+                    subagent_model.as_deref(),
+                )
+                .map(|(model, _source)| model)
+            } else {
+                model
+            };
 
             let child = create_child_thread(
                 panel,
@@ -153,6 +201,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                     prompt: format!("{}{}", child_header(&orchestrator_title), input.prompt),
                     agent_id: input.agent,
                     model: model.clone(),
+                    profile,
                     use_new_worktree: input.worktree == WorktreeMode::New,
                     base_ref: input.base_ref,
                     worktree_name: input.worktree_name,
@@ -280,6 +329,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
             .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
         let available = panel.read(cx).available_agents(cx);
         Ok(AvailableAgents {
+            profiles: available.profiles,
             agents: available
                 .agents
                 .into_iter()

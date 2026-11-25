@@ -887,6 +887,10 @@ pub struct SiblingThreadInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableAgents {
     pub agents: Vec<AvailableAgent>,
+    /// Profiles of the native Zed agent, for the `profile` field of
+    /// `start_child`. Each has a description of when to use it.
+    #[serde(default)]
+    pub profiles: Vec<orchestration::AvailableProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4578,6 +4582,12 @@ impl Thread {
 
         log::debug!("Completion request built successfully");
         Ok(request)
+    }
+
+    /// The names of the tools the model is offered: the thread's tools that
+    /// the active profile enables.
+    pub fn enabled_tool_names(&self, cx: &App) -> Vec<SharedString> {
+        self.enabled_tools(cx).into_keys().collect()
     }
 
     fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {

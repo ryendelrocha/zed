@@ -277,6 +277,7 @@ mod tests {
             prompt: "do it".into(),
             agent: agent.map(Into::into),
             model: None,
+            profile: None,
             worktree: WorktreeMode::Shared,
             base_ref: None,
             worktree_name: None,

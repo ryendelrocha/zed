@@ -44,6 +44,7 @@ impl AgentProfile {
     /// Saves a new profile to the settings.
     pub fn create(
         name: String,
+        description: Option<String>,
         base_profile_id: Option<AgentProfileId>,
         fs: Arc<dyn Fs>,
         cx: &App,
@@ -73,6 +74,7 @@ impl AgentProfile {
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
+            description: description.map(Into::into),
             tools,
             enable_all_context_servers,
             context_servers,
@@ -104,6 +106,8 @@ impl AgentProfile {
 pub struct AgentProfileSettings {
     /// The name of the profile.
     pub name: SharedString,
+    /// When to use the profile. Orchestrator agents match tasks against it.
+    pub description: Option<SharedString>,
     pub tools: IndexMap<Arc<str>, bool>,
     pub enable_all_context_servers: bool,
     pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
@@ -167,6 +171,7 @@ impl AgentProfileSettings {
             profile_id.0,
             AgentProfileContent {
                 name: self.name.clone().into(),
+                description: self.description.as_ref().map(ToString::to_string),
                 tools: self.tools.clone(),
                 enable_all_context_servers: Some(self.enable_all_context_servers),
                 context_servers: self
@@ -194,6 +199,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
     fn from(content: AgentProfileContent) -> Self {
         let AgentProfileContent {
             name,
+            description,
             tools,
             enable_all_context_servers,
             context_servers,
@@ -202,6 +208,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
 
         Self {
             name: name.into(),
+            description: description.map(Into::into),
             tools,
             enable_all_context_servers: enable_all_context_servers.unwrap_or_default(),
             context_servers: context_servers
@@ -236,6 +243,7 @@ mod tests {
     ) -> AgentProfileSettings {
         AgentProfileSettings {
             name: "test".into(),
+            description: None,
             tools: IndexMap::default(),
             enable_all_context_servers,
             context_servers,
@@ -272,6 +280,54 @@ mod tests {
         assert!(profile.is_context_server_tool_enabled("server", "enabled_tool"));
         assert!(!profile.is_context_server_tool_enabled("server", "other_tool"));
         assert!(!profile.is_context_server_tool_enabled("other_server", "any_tool"));
+    }
+
+    #[gpui::test]
+    fn profile_descriptions_come_from_settings(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal as _;
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        // The built-in profiles ship with a description.
+        for id in [
+            builtin_profiles::WRITE,
+            builtin_profiles::ASK,
+            builtin_profiles::MINIMAL,
+        ] {
+            let profile = AgentSettings::get_global(cx)
+                .profiles
+                .get(&AgentProfileId(id.into()))
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} exists"));
+            assert!(
+                profile.description.is_some_and(|d| !d.is_empty()),
+                "{id} has a description"
+            );
+        }
+
+        // A user profile can set one, and may leave it out.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "profiles": {
+                        "reviewer": { "name": "Reviewer", "description": "Reviewing diffs." },
+                        "bare": { "name": "Bare" }
+                    } } }"#,
+                    cx,
+                )
+                .result()
+                .unwrap();
+        });
+        let settings = AgentSettings::get_global(cx);
+        let reviewer = &settings.profiles[&AgentProfileId("reviewer".into())];
+        assert_eq!(reviewer.description.as_deref(), Some("Reviewing diffs."));
+        assert_eq!(
+            settings.profiles[&AgentProfileId("bare".into())].description,
+            None
+        );
     }
 
     #[gpui::test]

@@ -1256,6 +1256,7 @@ fn save_thread_metadata(
             .unwrap_or_else(ThreadId::new);
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id,
             session_id: Some(session_id),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -1309,6 +1310,7 @@ fn save_thread_metadata_with_worktree_paths(
     });
     let metadata = ThreadMetadata {
         parent_thread_id: None,
+        run_config: Default::default(),
         thread_id,
         session_id: Some(session_id),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -1337,6 +1339,7 @@ fn save_draft_metadata_with_main_paths(
     let thread_id = ThreadId::new();
     let metadata = ThreadMetadata {
         parent_thread_id: None,
+        run_config: Default::default(),
         thread_id,
         session_id: None,
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2317,6 +2320,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
         ListEntry::Thread(Arc::new(ThreadEntry {
             metadata: ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from(name))),
                 agent_id: AgentId::new("zed-agent"),
@@ -2412,6 +2416,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-1"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2442,6 +2447,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-2"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2472,6 +2478,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-3"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2503,6 +2510,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-4"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2534,6 +2542,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: notified_thread_id,
                     session_id: Some(acp::SessionId::new(Arc::from("t-5"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -9732,6 +9741,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
             store.save(
                 ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9814,6 +9824,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
         sidebar.open_thread_from_archive(
             ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9885,6 +9896,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
         sidebar.open_thread_from_archive(
             ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("unknown-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9954,6 +9966,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
         sidebar.open_thread_from_archive(
             ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("no-context-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10013,6 +10026,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
         sidebar.open_thread_from_archive(
             ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10071,6 +10085,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
         sidebar.open_thread_from_archive(
             ThreadMetadata {
                 parent_thread_id: None,
+                run_config: Default::default(),
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10151,6 +10166,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
     let session_id = acp::SessionId::new(Arc::from("archived-cross-window-with-sidebar"));
     let metadata = ThreadMetadata {
         parent_thread_id: None,
+        run_config: Default::default(),
         thread_id: ThreadId::new(),
         session_id: Some(session_id.clone()),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10235,6 +10251,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
     let session_id = acp::SessionId::new(Arc::from("archived-current-window"));
     let metadata = ThreadMetadata {
         parent_thread_id: None,
+        run_config: Default::default(),
         thread_id: ThreadId::new(),
         session_id: Some(session_id.clone()),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10568,6 +10585,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new(Arc::from("remote-thread"))),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -11223,6 +11241,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new(Arc::from("remote-wt-thread"))),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12151,6 +12170,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
             store.save(
                 ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12246,6 +12266,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
             store.save(
                 ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: original_thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12474,6 +12495,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
             store.save(
                 ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -13326,6 +13348,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
             store.save(
                 ThreadMetadata {
                     parent_thread_id: None,
+                    run_config: Default::default(),
                     thread_id: original_thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -13878,6 +13901,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
     cx.update(|_, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(legacy_session.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -15270,6 +15294,7 @@ mod property_test {
             + chrono::Duration::seconds(state.thread_counter as i64);
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(session_id),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -15343,6 +15368,7 @@ mod property_test {
                             + chrono::Duration::seconds(state.thread_counter as i64);
                     let metadata = cx.update(|_, cx| ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id,
                         session_id: Some(session_id),
                         agent_id,
@@ -16208,6 +16234,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(remote_thread_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -17291,6 +17318,7 @@ async fn test_remote_archive_thread_with_active_connection(
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(wt_thread_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -17434,6 +17462,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: worktree_thread_id,
             session_id: Some(worktree_session_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -19166,6 +19195,7 @@ fn save_orchestration_thread_metadata(
     cx.update(|cx| {
         let metadata = ThreadMetadata {
             parent_thread_id: parent,
+            run_config: Default::default(),
             thread_id,
             session_id: Some(acp::SessionId::new(Arc::from(session_id))),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -19513,6 +19543,113 @@ async fn test_live_subagent_row_shows_its_model(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_unloaded_child_row_shows_the_persisted_model_and_icon(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    // Nothing is loaded in the agent panel: the rows come from the metadata.
+    let parent = save_orchestration_thread_metadata(
+        "orchestrator",
+        "Orchestrator",
+        None,
+        minutes(1000),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    let mut kid = |session: &str, title: &str, minute: i64, provider: &str, model: &str| {
+        let kid = save_orchestration_thread_metadata(
+            session,
+            title,
+            Some(parent),
+            minutes(minute),
+            None,
+            false,
+            &project,
+            cx,
+        );
+        let (provider, model) = (provider.to_string(), model.to_string());
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.update_run_config(
+                    kid,
+                    |config| {
+                        config.model_provider_id = Some(provider.into());
+                        config.model_id = Some(model.into());
+                        config.profile_id = Some("write".into());
+                    },
+                    cx,
+                );
+            });
+        });
+        kid
+    };
+    // The provider is registered: its icon and the model's name are used.
+    let known = kid("known", "Known", 2, "fake", "fake");
+    // The model is gone from the registry: its id is shown, with no icon.
+    let gone = kid("gone", "Gone", 1, "removed-provider", "old-model");
+    // A child nobody configured shows no model, as before.
+    let plain = save_orchestration_thread_metadata(
+        "plain",
+        "Plain",
+        Some(parent),
+        minutes(0),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    updated_entries(&sidebar, cx);
+
+    sidebar.read_with(cx, |sidebar, _| {
+        let thread = |id: ThreadId| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Thread(thread) if thread.metadata.thread_id == id => {
+                        Some(thread.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the child row is listed")
+        };
+        let known = thread(known);
+        assert!(known.nested);
+        let model = known.model.as_ref().expect("a persisted model is shown");
+        assert_eq!(model.name.as_ref(), "Fake");
+        assert!(model.icon.is_some(), "the provider's icon is known");
+        let gone = thread(gone);
+        let model = gone.model.as_ref().expect("the id is still shown");
+        assert_eq!(model.name.as_ref(), "old-model");
+        assert_eq!(model.icon, None);
+        assert_eq!(thread(plain).model, None);
+    });
+}
+
+#[test]
+fn test_child_model_label_puts_the_profile_before_the_model() {
+    assert_eq!(
+        child_model_label(Some("Reviewer"), Some("gpt-5")).as_deref(),
+        Some("Reviewer \u{00b7} gpt-5")
+    );
+    assert_eq!(
+        child_model_label(None, Some("gpt-5")).as_deref(),
+        Some("gpt-5")
+    );
+    assert_eq!(
+        child_model_label(Some("Reviewer"), None).as_deref(),
+        Some("Reviewer")
+    );
+    assert_eq!(child_model_label(None, None), None);
+}
+
+#[gpui::test]
 async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -19527,6 +19664,7 @@ async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut Tes
         Arc::new(ThreadEntry {
             metadata: ThreadMetadata {
                 parent_thread_id: parent,
+                run_config: Default::default(),
                 thread_id: id,
                 session_id: Some(acp::SessionId::new(Arc::from(format!("{id:?}")))),
                 agent_id: AgentId::new("zed-agent"),

@@ -1051,6 +1051,10 @@ pub struct CreateThreadOptions {
     /// Model override, as `provider/model-id`. Only applied when the thread
     /// uses the native Zed agent.
     pub model: Option<String>,
+    /// Agent profile id to apply to the new thread. Only applied when the
+    /// thread uses the native Zed agent. The profile's tool set applies, and so
+    /// does its default model unless `model` is set.
+    pub profile: Option<String>,
     /// Working directories to attach to the new thread (e.g., the path of a
     /// freshly-created sibling worktree). When `None`, the thread inherits
     /// the project's default path list.
@@ -3376,7 +3380,7 @@ impl AgentPanel {
     /// override.
     pub fn create_thread_with_options(
         &mut self,
-        options: CreateThreadOptions,
+        mut options: CreateThreadOptions,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3393,6 +3397,13 @@ impl AgentPanel {
         // shouldn't let that change the panel's selected_agent or the
         // last-used-agent preference. Snapshot and restore both.
         let saved_selected_agent = override_used.then(|| self.selected_agent.clone());
+        // A profile or a parent link needs the model applied after the
+        // profile (a profile swaps the thread to its own model), and the
+        // resulting configuration persisted, so those threads take the
+        // model through `apply_native_run_config` instead.
+        let run_config_overrides = (options.profile.is_some()
+            || options.parent_thread_id.is_some())
+        .then(|| (options.profile.take(), options.model.take()));
         let thread = self.create_agent_thread_with_server(
             agent,
             None,
@@ -3409,6 +3420,9 @@ impl AgentPanel {
             self.set_selected_agent_and_persist(original, cx);
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
+        if let Some((profile, model)) = run_config_overrides {
+            apply_native_run_config(&thread.conversation_view, thread_id, profile, model, cx);
+        }
         if let Some(parent_thread_id) = options.parent_thread_id {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.set_parent_thread_id(thread_id, parent_thread_id, cx);
@@ -4937,7 +4951,10 @@ impl AgentPanel {
             });
         }
 
-        agent::AvailableAgents { agents }
+        agent::AvailableAgents {
+            agents,
+            profiles: agent::available_profiles(cx),
+        }
     }
 
     fn active_thread_has_messages(&self, cx: &App) -> bool {
@@ -4962,6 +4979,84 @@ impl AgentPanel {
         self.active_agent_thread(cx)
             .is_some_and(|thread| thread.read(cx).is_draft_thread())
     }
+}
+
+/// Applies a profile and a model to the native thread of `conversation_view`
+/// once it exists, then keeps the thread's model and profile in its metadata,
+/// so the sidebar can describe the thread while it is not loaded.
+///
+/// The profile goes first, because switching profile swaps the thread to the
+/// profile's own default model. An explicit `model` then wins over it.
+fn apply_native_run_config(
+    conversation_view: &Entity<ConversationView>,
+    thread_id: ThreadId,
+    profile: Option<String>,
+    model: Option<String>,
+    cx: &mut Context<AgentPanel>,
+) {
+    let applied = Cell::new(false);
+    cx.subscribe(
+        conversation_view,
+        move |_this, view, _event: &RootThreadUpdated, cx| {
+            if applied.get() {
+                return;
+            }
+            let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+                return;
+            };
+            applied.set(true);
+            if let Some(profile) = &profile {
+                if native_thread.read(cx).profile_was_downgraded() {
+                    // An untrusted workspace starts on `minimal`. A model
+                    // that asks for a profile does not get to lift that.
+                    log::warn!(
+                        "start_child: profile {profile:?} not applied: the workspace is restricted"
+                    );
+                } else {
+                    let profile_id = agent_settings::AgentProfileId(profile.as_str().into());
+                    native_thread.update(cx, |thread, cx| thread.set_profile(profile_id, cx));
+                }
+            }
+            if let Some(model) = &model {
+                apply_native_model_override(&native_thread, model, cx);
+            }
+            persist_native_run_config(thread_id, &native_thread, cx);
+            cx.subscribe(
+                &native_thread,
+                move |_this, native_thread, _: &agent::ModelChanged, cx| {
+                    persist_native_run_config(thread_id, &native_thread, cx);
+                },
+            )
+            .detach();
+        },
+    )
+    .detach();
+}
+
+/// Stores the model and profile a native thread runs with in its metadata.
+fn persist_native_run_config(
+    thread_id: ThreadId,
+    native_thread: &Entity<agent::Thread>,
+    cx: &mut App,
+) {
+    let thread = native_thread.read(cx);
+    let model = thread
+        .model()
+        .map(|model| (model.provider_id().0, model.id().0));
+    let profile_id = thread.profile().0.clone();
+    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+        store.update_run_config(
+            thread_id,
+            |config| {
+                if let Some((provider_id, model_id)) = model {
+                    config.model_provider_id = Some(provider_id);
+                    config.model_id = Some(model_id);
+                }
+                config.profile_id = Some(profile_id.to_string().into());
+            },
+            cx,
+        );
+    });
 }
 
 /// Apply a `provider/model-id` model override to a freshly-created native thread.
@@ -5035,6 +5130,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     prompt: request.prompt,
                     agent_id: request.agent_id,
                     model: request.model,
+                    profile: None,
                     use_new_worktree: request.use_new_worktree,
                     base_ref: request.base_ref,
                     worktree_name: request.worktree_name,
@@ -5068,6 +5164,7 @@ pub(crate) struct ChildThreadRequest {
     pub prompt: String,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    pub profile: Option<String>,
     pub use_new_worktree: bool,
     pub base_ref: Option<String>,
     pub worktree_name: Option<String>,
@@ -5130,6 +5227,7 @@ pub(crate) async fn create_child_thread(
         initial_content: Some(initial_content),
         agent: agent_choice.clone(),
         model: request.model.clone(),
+        profile: request.profile.clone(),
         work_dirs: None,
         parent_thread_id: request.parent_thread_id,
     };
@@ -8468,6 +8566,7 @@ mod tests {
                 store.save(
                     ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id: ThreadId::new(),
                         session_id: Some(resume_session_id.clone()),
                         agent_id: ProjectAgentId::new("Flaky"),
@@ -11950,6 +12049,7 @@ mod tests {
                 store.save(
                     crate::thread_metadata_store::ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id,
                         session_id: Some(acp_v2::SessionId::new("saved-session")),
                         agent_id: Agent::Stub.id(),
@@ -12075,6 +12175,7 @@ mod tests {
                 store.save(
                     crate::thread_metadata_store::ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id: ThreadId::new(),
                         session_id: Some(source_session_id.clone()),
                         agent_id: Agent::NativeAgent.id(),
@@ -15421,6 +15522,7 @@ mod tests {
             prompt: prompt.to_string(),
             agent: None,
             model: None,
+            profile: None,
             worktree: orchestration::WorktreeMode::Shared,
             base_ref: None,
             worktree_name: None,
@@ -15512,6 +15614,298 @@ mod tests {
         assert_eq!(status, ChildStatus::Completed);
         assert_eq!(final_message.as_deref(), Some("child result"));
         assert_eq!(turns, 1);
+    }
+
+    /// A native-agent orchestrator with a fake provider that offers the models
+    /// `explicit-model`, `profile-model`, `subagent-model` and `fake` (the
+    /// user's default), and two profiles: `reviewer` (has a description, a
+    /// default model and its own tool set) and `plain` (no default model).
+    struct NativeProfileFixture {
+        panel: Entity<AgentPanel>,
+        cx: VisualTestContext,
+        orchestrator: ThreadId,
+        host: Rc<dyn orchestration::OrchestrationHost>,
+        _log_dir: tempfile::TempDir,
+    }
+
+    async fn setup_native_profiles(cx: &mut TestAppContext) -> NativeProfileFixture {
+        let (panel, fake_provider, mut cx) = open_draft(cx).await;
+        for model in ["explicit-model", "profile-model", "subagent-model"] {
+            fake_provider.model(model);
+        }
+        let orchestrator = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.create_thread_with_options(
+                CreateThreadOptions::default(),
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        let log_dir = tempfile::tempdir().unwrap();
+        cx.update(|_window, cx| {
+            let settings = serde_json::json!({
+                "agent": {
+                    "orchestration": { "log_dir": log_dir.path().to_string_lossy() },
+                    "subagent_model": { "provider": "fake", "model": "subagent-model" },
+                    "profiles": {
+                        "reviewer": {
+                            "name": "Reviewer",
+                            "description": "Reviewing diffs and finding bugs.",
+                            "tools": { "read_file": true, "grep": true },
+                            "default_model": { "provider": "fake", "model": "profile-model" }
+                        },
+                        "plain": {
+                            "name": "Plain",
+                            "tools": { "find_path": true }
+                        }
+                    }
+                }
+            });
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(&settings.to_string(), cx)
+                    .result()
+                    .expect("the settings should parse");
+            });
+        });
+        let host = cx
+            .update(|_window, cx| {
+                orchestration::OrchestrationRegistry::global_or_init(cx)
+                    .read(cx)
+                    .host_for_thread(orchestrator, cx)
+            })
+            .expect("the panel should register an orchestration host");
+        NativeProfileFixture {
+            panel,
+            cx,
+            orchestrator,
+            host,
+            _log_dir: log_dir,
+        }
+    }
+
+    impl NativeProfileFixture {
+        async fn start(
+            &mut self,
+            model: Option<&str>,
+            profile: Option<&str>,
+        ) -> anyhow::Result<ThreadId> {
+            let mut input = start_child_input("Child", "do it");
+            input.model = model.map(str::to_string);
+            input.profile = profile.map(str::to_string);
+            let task = self
+                .cx
+                .update(|_window, cx| self.host.start_child(self.orchestrator, input, cx));
+            let output = task.await?;
+            self.cx.run_until_parked();
+            Ok(ThreadId::from_key_string(&output.child_id).expect("child_id is a thread id"))
+        }
+
+        /// The model id, the profile id and the tools the child runs with.
+        fn child_state(&mut self, child: ThreadId) -> (String, String, Vec<String>) {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                let thread = panel.retained_threads[&child]
+                    .read(cx)
+                    .as_native_thread(cx)
+                    .expect("the child is a native thread");
+                let thread = thread.read(cx);
+                (
+                    thread
+                        .model()
+                        .expect("the child has a model")
+                        .id()
+                        .0
+                        .to_string(),
+                    thread.profile().0.to_string(),
+                    thread
+                        .enabled_tool_names(cx)
+                        .into_iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                )
+            })
+        }
+
+        fn persisted_run_config(
+            &mut self,
+            child: ThreadId,
+        ) -> crate::thread_metadata_store::ThreadRunConfig {
+            self.cx.update(|_window, cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(child)
+                    .map(|metadata| metadata.run_config.clone())
+                    .expect("the child has metadata")
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_child_model_resolution_order(cx: &mut TestAppContext) {
+        let mut fixture = setup_native_profiles(cx).await;
+
+        // 1. An explicit model wins over the profile's model.
+        let child = fixture
+            .start(Some("fake/explicit-model"), Some("reviewer"))
+            .await
+            .unwrap();
+        assert_eq!(fixture.child_state(child).0, "explicit-model");
+        assert_eq!(
+            fixture.persisted_run_config(child).model(),
+            Some(("fake", "explicit-model"))
+        );
+
+        // 2. Without a model, the profile's default model.
+        let child = fixture.start(None, Some("reviewer")).await.unwrap();
+        assert_eq!(fixture.child_state(child).0, "profile-model");
+        assert_eq!(
+            fixture.persisted_run_config(child).model(),
+            Some(("fake", "profile-model"))
+        );
+
+        // 3. A profile without a model falls back to `agent.subagent_model`,
+        // and so does a child with no profile at all.
+        let child = fixture.start(None, Some("plain")).await.unwrap();
+        assert_eq!(fixture.child_state(child).0, "subagent-model");
+        let child = fixture.start(None, None).await.unwrap();
+        assert_eq!(fixture.child_state(child).0, "subagent-model");
+
+        // 4. With no subagent model either, the user's default model.
+        fixture.cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().subagent_model = None;
+                });
+            });
+        });
+        let child = fixture.start(None, Some("plain")).await.unwrap();
+        assert_eq!(fixture.child_state(child).0, "fake");
+        assert_eq!(
+            fixture.persisted_run_config(child).model(),
+            Some(("fake", "fake")),
+            "the default model is persisted too"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_child_gets_the_profile_and_its_tool_set(cx: &mut TestAppContext) {
+        let mut fixture = setup_native_profiles(cx).await;
+
+        let child = fixture.start(None, Some("reviewer")).await.unwrap();
+        let (_, profile, tools) = fixture.child_state(child);
+        assert_eq!(profile, "reviewer");
+        assert_eq!(
+            tools,
+            vec!["grep".to_string(), "read_file".to_string()],
+            "only the tools the profile enables are offered"
+        );
+        assert_eq!(
+            fixture.persisted_run_config(child).profile_id.as_deref(),
+            Some("reviewer")
+        );
+
+        let child = fixture.start(None, Some("plain")).await.unwrap();
+        let (_, profile, tools) = fixture.child_state(child);
+        assert_eq!(profile, "plain");
+        assert_eq!(tools, vec!["find_path".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_unknown_profile_lists_the_available_ids(cx: &mut TestAppContext) {
+        let mut fixture = setup_native_profiles(cx).await;
+        let threads_before = fixture
+            .panel
+            .read_with(&fixture.cx, |panel, _| panel.retained_threads.len());
+
+        let error = fixture
+            .start(None, Some("nope"))
+            .await
+            .expect_err("an unknown profile is an error");
+
+        let message = error.to_string();
+        assert!(message.contains("\"nope\""), "{message}");
+        assert!(message.contains("\"reviewer\""), "{message}");
+        assert!(message.contains("\"plain\""), "{message}");
+        assert!(message.contains("\"write\""), "{message}");
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            fixture
+                .panel
+                .read_with(&fixture.cx, |panel, _| panel.retained_threads.len()),
+            threads_before,
+            "no thread is created for an unknown profile"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_list_returns_profiles_with_descriptions(cx: &mut TestAppContext) {
+        let mut fixture = setup_native_profiles(cx).await;
+
+        let available = fixture
+            .cx
+            .update(|_window, cx| fixture.host.list_available_agents(cx))
+            .unwrap();
+
+        let reviewer = available
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "reviewer")
+            .expect("custom profiles are listed");
+        assert_eq!(reviewer.name, "Reviewer");
+        assert_eq!(
+            reviewer.description.as_deref(),
+            Some("Reviewing diffs and finding bugs.")
+        );
+        assert_eq!(
+            reviewer.default_model.as_deref(),
+            Some("fake/profile-model")
+        );
+        let plain = available
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "plain")
+            .unwrap();
+        assert_eq!(plain.description, None);
+        assert_eq!(plain.default_model, None);
+        // The built-in profiles ship with a description.
+        for id in ["write", "ask", "minimal"] {
+            let builtin = available
+                .profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .unwrap_or_else(|| panic!("{id} is listed"));
+            assert!(builtin.description.is_some(), "{id} has a description");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_agent_ignores_the_profile_with_a_warning(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let mut input = start_child_input("External", "work");
+        input.profile = Some("write".to_string());
+
+        let task = fixture
+            .cx
+            .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx));
+        let output = task.await.expect("an external child still starts");
+        fixture.cx.run_until_parked();
+
+        let warning = output.warning.expect("the ignored profile is reported");
+        assert!(warning.contains("`profile`"), "{warning}");
+        assert!(warning.contains("external agents"), "{warning}");
+        let child = ThreadId::from_key_string(&output.child_id).unwrap();
+        assert_eq!(
+            fixture
+                .cx
+                .update(|_window, cx| ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(child)
+                    .map(|metadata| metadata.run_config.profile_id.clone())),
+            Some(None),
+            "no profile is stored for an external child"
+        );
     }
 
     #[gpui::test]

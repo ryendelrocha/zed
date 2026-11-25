@@ -7234,6 +7234,29 @@ Several of these settings have their own documentation with complete examples: [
 - Description: The model, reasoning, and speed settings for new Zed Agent subagents. This setting does not configure external agents. See [Subagent Models](../ai/agent-settings.md#subagent-models).
 - Setting: `agent.subagent_model`
 
+### Profile Description {#agent-profile-description}
+
+- Description: When to use an agent profile. An orchestrator agent reads the descriptions through `list_agents_and_models`, picks the profile that matches a task, and passes it as the `profile` of `start_child`. The child thread runs with that profile's tools, and with its `default_model` unless the orchestrator names a model. Without a `profile`, the child uses `agent.subagent_model`, then your default model.
+- Setting: `agent.profiles.<id>.description`
+- Default: unset (the built-in `write`, `ask` and `minimal` profiles ship with a description)
+
+```json [settings]
+{
+  "agent": {
+    "profiles": {
+      "reviewer": {
+        "name": "Reviewer",
+        "description": "Reviewing diffs and finding bugs: read-only tools, a strong reasoning model.",
+        "tools": { "read_file": true, "grep": true },
+        "default_model": { "provider": "anthropic", "model": "claude-opus-4" }
+      }
+    }
+  }
+}
+```
+
+The description can also be set when creating a profile in the **Manage Profiles** modal.
+
 ## Context Servers {#context-servers}
 
 - Description: Model Context Protocol (MCP) servers available to the agent, keyed by server ID.

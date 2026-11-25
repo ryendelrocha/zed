@@ -520,6 +520,12 @@ mod tests {
                     is_native: true,
                     models: Vec::new(),
                 }],
+                profiles: vec![crate::AvailableProfile {
+                    id: "write".to_string(),
+                    name: "Write".to_string(),
+                    description: Some("Implementing code.".to_string()),
+                    default_model: Some("ollama/qwen".to_string()),
+                }],
             })
         }
 
@@ -733,6 +739,14 @@ mod tests {
         assert_eq!(
             response["result"]["structuredContent"]["agents"][0]["id"],
             "zed-agent"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["profiles"][0]["description"],
+            "Implementing code."
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["profiles"][0]["default_model"],
+            "ollama/qwen"
         );
         let response = client_a
             .request(

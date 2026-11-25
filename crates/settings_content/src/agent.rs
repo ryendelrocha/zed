@@ -655,6 +655,9 @@ impl AgentSettingsContent {
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct AgentProfileContent {
     pub name: Arc<str>,
+    /// When to use this profile. Shown to an orchestrator agent, which picks a
+    /// profile for a child thread by matching the task to these descriptions.
+    pub description: Option<String>,
     #[serde(default)]
     #[schemars(schema_with = "agent_profile_tools_schema")]
     pub tools: IndexMap<Arc<str>, bool>,

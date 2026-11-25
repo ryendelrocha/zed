@@ -8555,6 +8555,7 @@ pub(crate) mod tests {
                     store.save(
                         ThreadMetadata {
                             parent_thread_id: None,
+                            run_config: Default::default(),
                             thread_id,
                             session_id: Some(session_id.clone()),
                             agent_id: AgentId::new("Test"),
@@ -9072,6 +9073,7 @@ pub(crate) mod tests {
                 store.save(
                     ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id: ThreadId::new(),
                         session_id: Some(resume_session_id.clone()),
                         agent_id: ProjectAgentId::new("Flaky"),

@@ -1330,6 +1330,7 @@
     "profiles": {
       "write": {
         "name": "Write",
+        "description": "Implementing, fixing or refactoring code: reads and edits files, runs terminal commands and can start child threads.",
         "enable_all_context_servers": true,
         "tools": {
           "apply_code_action": true,
@@ -1367,6 +1368,7 @@
       },
       "ask": {
         "name": "Ask",
+        "description": "Read-only questions, code exploration and research: no file edits and no terminal.",
         // We don't know which of the context server tools are safe for the "Ask" profile, so we don't enable them by default.
         // "enable_all_context_servers": true,
         "tools": {
@@ -1389,6 +1391,7 @@
       },
       "minimal": {
         "name": "Minimal",
+        "description": "Plain conversation with no tools: brainstorming, explanations and drafting text.",
         "enable_all_context_servers": false,
         "tools": {},
       },

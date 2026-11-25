@@ -41,9 +41,14 @@ pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
     // Thread import reads the database of another release channel, whose migrations may not have
-    // added `parent_thread_id` or `delta_clones` yet.
+    // added `parent_thread_id`, `delta_clones` or the run config columns yet.
     if let Ok(mut list_thread_metadata) =
         connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)
+    {
+        return list_thread_metadata();
+    }
+    if let Ok(mut list_thread_metadata) =
+        connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY_WITHOUT_RUN_CONFIG)
     {
         return list_thread_metadata();
     }
@@ -111,6 +116,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
 
                     Some(ThreadMetadata {
                         parent_thread_id: None,
+                        run_config: Default::default(),
                         thread_id: ThreadId::new(),
                         session_id: Some(entry.id),
                         agent_id: ZED_AGENT_ID.clone(),
@@ -346,6 +352,31 @@ pub struct ThreadMetadata {
     pub archived: bool,
     /// The orchestrator thread that started this thread as a child, if any.
     pub parent_thread_id: Option<ThreadId>,
+    /// The model and profile the thread was started with, when an orchestrator
+    /// started it. They let the sidebar describe a thread that is not loaded.
+    pub run_config: ThreadRunConfig,
+}
+
+/// The model and profile a child thread runs with, as persisted. All of it is
+/// empty for threads that nobody started with an explicit configuration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThreadRunConfig {
+    /// Id of the language model provider, as in `provider/model-id`.
+    pub model_provider_id: Option<SharedString>,
+    /// Id of the model within its provider.
+    pub model_id: Option<SharedString>,
+    /// Id of the agent profile applied to the thread.
+    pub profile_id: Option<SharedString>,
+}
+
+impl ThreadRunConfig {
+    /// The persisted model as `(provider id, model id)`, when both are known.
+    pub fn model(&self) -> Option<(&str, &str)> {
+        Some((
+            self.model_provider_id.as_deref()?,
+            self.model_id.as_deref()?,
+        ))
+    }
 }
 
 impl ThreadMetadata {
@@ -537,6 +568,9 @@ pub struct ThreadMetadataStore {
     /// Parent links requested for threads whose metadata does not exist yet.
     /// They are applied when the thread's first metadata is saved.
     pending_parent_links: HashMap<ThreadId, ThreadId>,
+    /// Run configs requested for threads whose metadata does not exist yet,
+    /// applied like `pending_parent_links`.
+    pending_run_configs: HashMap<ThreadId, ThreadRunConfig>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
@@ -753,6 +787,30 @@ impl ThreadMetadataStore {
         }
         let metadata = ThreadMetadata {
             parent_thread_id: Some(parent_thread_id),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    /// Updates the model and profile persisted for `thread_id`. When the thread
+    /// has no metadata yet, the change is applied once it is first saved.
+    pub fn update_run_config(
+        &mut self,
+        thread_id: ThreadId,
+        update: impl FnOnce(&mut ThreadRunConfig),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            update(self.pending_run_configs.entry(thread_id).or_default());
+            return;
+        };
+        let mut run_config = existing.run_config.clone();
+        update(&mut run_config);
+        if run_config == existing.run_config {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            run_config,
             ..existing.clone()
         };
         self.save(metadata, cx);
@@ -1308,6 +1366,7 @@ impl ThreadMetadataStore {
             is_loaded: false,
             conversation_subscriptions: HashMap::default(),
             pending_parent_links: HashMap::default(),
+            pending_run_configs: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
@@ -1409,12 +1468,19 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
-        let parent_thread_id = existing_thread
-            .and_then(|thread| thread.parent_thread_id)
-            .or_else(|| self.pending_parent_links.remove(&thread_id));
+        let existing_parent_thread_id = existing_thread.and_then(|thread| thread.parent_thread_id);
+        let existing_run_config = existing_thread.map(|thread| thread.run_config.clone());
+        let parent_thread_id =
+            existing_parent_thread_id.or_else(|| self.pending_parent_links.remove(&thread_id));
+        let run_config = existing_run_config.unwrap_or_else(|| {
+            self.pending_run_configs
+                .remove(&thread_id)
+                .unwrap_or_default()
+        });
 
         let metadata = ThreadMetadata {
             parent_thread_id,
+            run_config,
             thread_id,
             session_id,
             agent_id,
@@ -1544,6 +1610,11 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN parent_thread_id BLOB;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN model_provider_id TEXT;
+            ALTER TABLE sidebar_threads ADD COLUMN model_id TEXT;
+            ALTER TABLE sidebar_threads ADD COLUMN profile_id TEXT;
+        ),
     ];
 }
 
@@ -1560,20 +1631,28 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id \
+        main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id, \
+        model_provider_id, model_id, profile_id \
+        FROM sidebar_threads \
+        ORDER BY updated_at DESC";
+
+    const LIST_QUERY_WITHOUT_RUN_CONFIG: &str = "SELECT thread_id, session_id, agent_id, \
+        title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, \
+        delta_clones, parent_thread_id, NULL, NULL, NULL \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
     const LIST_QUERY_WITHOUT_PARENT_THREAD_ID: &str = "SELECT thread_id, session_id, agent_id, \
         title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
         main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, \
-        delta_clones, NULL \
+        delta_clones, NULL, NULL, NULL, NULL \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
     const LIST_QUERY_WITHOUT_DELTA_CLONES: &str = "SELECT thread_id, session_id, agent_id, \
         title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
-        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, NULL, NULL \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, NULL, NULL, NULL, NULL, NULL \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1628,10 +1707,17 @@ impl ThreadMetadataDb {
         let thread_id = row.thread_id;
         let archived = row.archived;
         let parent_thread_id = row.parent_thread_id;
+        let model_provider_id = row
+            .run_config
+            .model_provider_id
+            .as_ref()
+            .map(|id| id.to_string());
+        let model_id = row.run_config.model_id.as_ref().map(|id| id.to_string());
+        let profile_id = row.run_config.profile_id.as_ref().map(|id| id.to_string());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id, model_provider_id, model_id, profile_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1647,7 +1733,10 @@ impl ThreadMetadataDb {
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
                            delta_clones = excluded.delta_clones, \
-                           parent_thread_id = excluded.parent_thread_id";
+                           parent_thread_id = excluded.parent_thread_id, \
+                           model_provider_id = excluded.model_provider_id, \
+                           model_id = excluded.model_id, \
+                           profile_id = excluded.profile_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1664,7 +1753,10 @@ impl ThreadMetadataDb {
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
             i = stmt.bind(&delta_clones, i)?;
-            stmt.bind(&parent_thread_id, i)?;
+            i = stmt.bind(&parent_thread_id, i)?;
+            i = stmt.bind(&model_provider_id, i)?;
+            i = stmt.bind(&model_id, i)?;
+            stmt.bind(&profile_id, i)?;
             stmt.exec()
         })
         .await
@@ -1824,6 +1916,9 @@ impl Column for ThreadMetadata {
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (delta_clones, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (parent_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
+        let (model_provider_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (model_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (profile_id, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1878,6 +1973,15 @@ impl Column for ThreadMetadata {
                 remote_connection,
                 archived,
                 parent_thread_id,
+                run_config: ThreadRunConfig {
+                    model_provider_id: model_provider_id
+                        .filter(|id| !id.is_empty())
+                        .map(SharedString::from),
+                    model_id: model_id.filter(|id| !id.is_empty()).map(SharedString::from),
+                    profile_id: profile_id
+                        .filter(|id| !id.is_empty())
+                        .map(SharedString::from),
+                },
             },
             next,
         ))
@@ -1956,6 +2060,7 @@ mod tests {
     ) -> ThreadMetadata {
         ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new(session_id)),
@@ -2379,6 +2484,7 @@ mod tests {
 
         let moved_metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: session1_thread_id,
             session_id: Some(acp::SessionId::new("session-1")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2465,6 +2571,7 @@ mod tests {
 
         let existing_metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("a-session-0")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2592,6 +2699,7 @@ mod tests {
 
         let existing_metadata = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("existing-session")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -3337,6 +3445,7 @@ mod tests {
 
         let local_linked_thread = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new("local-linked")),
@@ -3352,6 +3461,7 @@ mod tests {
 
         let remote_linked_thread = ThreadMetadata {
             parent_thread_id: None,
+            run_config: Default::default(),
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new("remote-linked")),
@@ -3903,7 +4013,7 @@ mod tests {
         connection
             .migrate(
                 ThreadMetadataDb::NAME,
-                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 2],
+                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 3],
                 &mut |_, _, _| false,
             )
             .unwrap();
@@ -3940,7 +4050,7 @@ mod tests {
         connection
             .migrate(
                 ThreadMetadataDb::NAME,
-                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1],
+                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 2],
                 &mut |_, _, _| false,
             )
             .unwrap();
@@ -3961,6 +4071,169 @@ mod tests {
 
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].parent_thread_id, None);
+    }
+
+    #[test]
+    fn test_list_reads_database_saved_before_run_config() {
+        let connection = db::sqlez::connection::Connection::open_memory(Some(
+            "test_list_reads_database_saved_before_run_config",
+        ));
+        connection
+            .migrate(
+                ThreadMetadataDb::NAME,
+                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1],
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+        let parent = ThreadId::new();
+        connection
+            .exec_bound::<(uuid::Uuid, &str, &str, &str, ThreadId)>(
+                "INSERT INTO sidebar_threads (thread_id, session_id, title, updated_at, parent_thread_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .unwrap()((
+            uuid::Uuid::new_v4(),
+            "session",
+            "Saved before the run config",
+            "2024-01-01T00:00:00Z",
+            parent,
+        ))
+        .unwrap();
+
+        let threads = list_thread_metadata_from_connection(&connection).unwrap();
+
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].parent_thread_id, Some(parent));
+        assert_eq!(threads[0].run_config, ThreadRunConfig::default());
+    }
+
+    #[test]
+    fn test_run_config_migration_and_round_trip() {
+        let connection = db::sqlez::connection::Connection::open_memory(Some(
+            "test_run_config_migration_and_round_trip",
+        ));
+        run_thread_metadata_migrations(&connection);
+        let with_config = ThreadId::new();
+        let without_config = ThreadId::new();
+        let mut insert = connection
+            .exec_bound::<(ThreadId, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>)>(
+                "INSERT INTO sidebar_threads (thread_id, session_id, title, updated_at, model_provider_id, model_id, profile_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        insert((
+            with_config,
+            "a",
+            "With config",
+            "2024-01-02T00:00:00Z",
+            Some("ollama"),
+            Some("qwen3:8b"),
+            Some("reviewer"),
+        ))
+        .unwrap();
+        insert((
+            without_config,
+            "b",
+            "Without config",
+            "2024-01-01T00:00:00Z",
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+        let threads = list_thread_metadata_from_connection(&connection).unwrap();
+
+        let config_of = |thread_id: ThreadId| {
+            threads
+                .iter()
+                .find(|thread| thread.thread_id == thread_id)
+                .map(|thread| thread.run_config.clone())
+        };
+        let config = config_of(with_config).unwrap();
+        assert_eq!(config.model(), Some(("ollama", "qwen3:8b")));
+        assert_eq!(config.profile_id.as_deref(), Some("reviewer"));
+        assert_eq!(config_of(without_config), Some(ThreadRunConfig::default()));
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_run_config(_cx: &mut TestAppContext) {
+        let db = ThreadMetadataDb(
+            db::open_test_db::<ThreadMetadataDb>("test_database_round_trips_run_config").await,
+        );
+        let mut thread = make_metadata("session", "Child", Utc::now(), PathList::default());
+        thread.run_config = ThreadRunConfig {
+            model_provider_id: Some("ollama".into()),
+            model_id: Some("qwen3:8b".into()),
+            profile_id: Some("reviewer".into()),
+        };
+        db.save(thread.clone()).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_config, thread.run_config);
+
+        // Saving again without a config clears it, so a later save of a
+        // thread that lost the config is not silently kept.
+        thread.run_config = ThreadRunConfig::default();
+        db.save(thread).await.unwrap();
+        assert_eq!(db.list().unwrap()[0].run_config, ThreadRunConfig::default());
+    }
+
+    #[gpui::test]
+    async fn test_store_update_run_config_for_existing_and_pending_threads(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let existing = make_metadata("existing", "Existing", Utc::now(), PathList::default());
+        let existing_id = existing.thread_id;
+        store.update(cx, |store, cx| store.save(existing, cx));
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            store.update_run_config(
+                existing_id,
+                |config| {
+                    config.model_provider_id = Some("ollama".into());
+                    config.model_id = Some("qwen3:8b".into());
+                    config.profile_id = Some("reviewer".into());
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let config = store.read_with(cx, |store, _| {
+            store
+                .entry(existing_id)
+                .map(|thread| thread.run_config.clone())
+        });
+        assert_eq!(config.unwrap().model(), Some(("ollama", "qwen3:8b")));
+
+        // A thread without metadata yet gets the config on its first save.
+        let pending = make_metadata("pending", "Pending", Utc::now(), PathList::default());
+        let pending_id = pending.thread_id;
+        store.update(cx, |store, cx| {
+            store.update_run_config(
+                pending_id,
+                |config| config.profile_id = Some("ask".into()),
+                cx,
+            );
+            assert!(store.entry(pending_id).is_none());
+            let mut pending = pending;
+            pending.run_config = store
+                .pending_run_configs
+                .remove(&pending_id)
+                .expect("the config waits for the first save");
+            store.save(pending, cx);
+        });
+        cx.run_until_parked();
+        let config = store.read_with(cx, |store, _| {
+            store
+                .entry(pending_id)
+                .map(|thread| thread.run_config.clone())
+        });
+        assert_eq!(config.unwrap().profile_id.as_deref(), Some("ask"));
     }
 
     #[test]

@@ -3255,6 +3255,29 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
     }
 }
 
+/// Formats a model selection as `provider/model-id`, the form of the `model`
+/// field of the orchestration tools.
+pub fn selection_to_model_string(selection: &LanguageModelSelection) -> String {
+    format!("{}/{}", selection.provider.0, selection.model)
+}
+
+/// The agent profiles, with the description and default model of each.
+pub fn available_profiles(cx: &App) -> Vec<orchestration::AvailableProfile> {
+    agent_settings::AgentSettings::get_global(cx)
+        .profiles
+        .iter()
+        .map(|(id, profile)| orchestration::AvailableProfile {
+            id: id.to_string(),
+            name: profile.name.to_string(),
+            description: profile.description.as_ref().map(ToString::to_string),
+            default_model: profile
+                .default_model
+                .as_ref()
+                .map(selection_to_model_string),
+        })
+        .collect()
+}
+
 struct NativeSessionSubmissions {
     connection: NativeAgentConnection,
     session_id: acp_v2::SessionId,
@@ -3934,6 +3957,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         } else {
             Ok(AvailableAgents {
                 agents: vec![available_native_agent(cx)],
+                profiles: available_profiles(cx),
             })
         }
     }

@@ -16,9 +16,17 @@ use crate::{AgentTool, AvailableAgents, ThreadEnvironment, ToolCallEventStream, 
 /// native Zed subagent, so its `model` must be an exact `models[].id` from the
 /// agent entry where `is_native` is `true`.
 ///
-/// Call this before any of these tools if you need to pick a specific agent or a
-/// non-default model (for example, to use a cheaper model for bulk work). If
-/// you're happy with the user's current defaults, you don't need to call this.
+/// The result also lists `profiles`: the agent profiles of the native Zed
+/// agent, each with an `id`, a `name`, a `description` of when to use it and
+/// its `default_model`. To choose how a `start_child` child works, match the
+/// task to the profile descriptions and pass the best profile `id` as
+/// `profile`, and tell the user which profile you used. Prefer `profile` over
+/// naming a `model`.
+///
+/// Call this before any of these tools if you need to pick a specific agent,
+/// a profile or a non-default model (for example, to use a cheaper model for
+/// bulk work). If you're happy with the user's current defaults, you don't
+/// need to call this.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct ListAgentsAndModelsToolInput {}
