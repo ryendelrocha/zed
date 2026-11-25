@@ -767,6 +767,9 @@ pub struct ThreadView {
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
+    /// One subscription per orchestrated child, so the cards of the children's
+    /// permission requests follow them (R13).
+    pub(super) orchestrated_child_watches: HashMap<ThreadId, Subscription>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
@@ -1316,6 +1319,7 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            orchestrated_child_watches: HashMap::default(),
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
@@ -1358,6 +1362,12 @@ impl ThreadView {
         this.sync_reported_activity(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
+        {
+            let mut subscriptions = std::mem::take(&mut this._subscriptions);
+            this.watch_orchestrated_children(&mut subscriptions, cx);
+            this._subscriptions = subscriptions;
+        }
+        this.sync_orchestrated_child_watches(cx);
         this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
@@ -4147,6 +4157,19 @@ impl ThreadView {
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
         let generic_permissions = self.render_generic_permissions(cx);
+        let generic_permissions = match (
+            self.render_orchestrated_child_permissions(cx),
+            generic_permissions,
+        ) {
+            (Some(children), Some(generic)) => Some(
+                v_flex()
+                    .child(children)
+                    .child(Divider::horizontal().color(DividerColor::Border))
+                    .child(generic)
+                    .into_any(),
+            ),
+            (children, generic) => children.or(generic),
+        };
         let awaiting_permission = match (generic_permissions, awaiting_permission) {
             (Some(generic), Some(legacy)) => Some(
                 v_flex()

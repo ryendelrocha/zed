@@ -26,6 +26,10 @@ Agent, profile and model: leave `agent`, `profile` and `model` unset to use the 
 
 Worktree: `shared` (default) uses this thread's worktree. `new` creates a separate git worktree in a new workspace, based on `base_ref` (default HEAD), so the child cannot collide with you or with other children. It needs a git repository in the project.
 
+At most `agent.orchestration.max_concurrent_children` children (default 6) may run at the same time across the whole app. Beyond that, `start_child` fails with an error that states how many are running: call `await_children` to let some finish, then start the next one. Children that finished do not count.
+
+Children can message each other directly with `send_to_sibling`; you only see how many sibling messages each exchanged.
+
 Returns the `child_id` to use with the other orchestration tools, and the path of the log of the exchanges with the child.";
 
 pub struct StartChildTool {

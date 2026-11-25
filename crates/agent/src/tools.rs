@@ -21,12 +21,14 @@ mod go_to_definition_tool;
 mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
+mod list_siblings_tool;
 mod move_path_tool;
 mod orchestration_common;
 mod read_file_tool;
 mod rename_tool;
 mod send_to_child_tool;
 mod send_to_parent_tool;
+mod send_to_sibling_tool;
 mod skill_tool;
 mod spawn_agent_tool;
 mod start_child_tool;
@@ -98,12 +100,14 @@ pub use go_to_definition_tool::*;
 pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
+pub use list_siblings_tool::*;
 pub use move_path_tool::*;
 pub use orchestration_common::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use send_to_child_tool::*;
 pub use send_to_parent_tool::*;
+pub use send_to_sibling_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use start_child_tool::*;
@@ -232,11 +236,13 @@ tools! {
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    ListSiblingsTool,
     MovePathTool,
     ReadFileTool,
     RenameTool,
     SendToChildTool,
     SendToParentTool,
+    SendToSiblingTool,
     SkillTool,
     SpawnAgentTool,
     StartChildTool,

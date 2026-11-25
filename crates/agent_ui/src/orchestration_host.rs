@@ -8,7 +8,7 @@ use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow, ensure};
 use collections::HashMap;
 use futures::StreamExt as _;
-use gpui::{App, Entity, Subscription, Task, WeakEntity};
+use gpui::{App, Entity, Global, Subscription, Task, WeakEntity};
 use language_model::{
     CompletionIntent, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
@@ -16,9 +16,9 @@ use language_model::{
 use orchestration::{
     AvailableAgent, AvailableAgents, AvailableModel, CancelChildInput, CancelChildOutput,
     ChildStatus, HumanSummaryRequest, NewChild, OrchestrationHost, OrchestrationRegistry,
-    SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput, ThreadId, WorktreeMode,
-    child_header, human_summary_prompt, orchestration_log_dir, resolve_child_model,
-    unknown_profile_error,
+    RestoredChild, SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput,
+    ThreadId, WorktreeMode, child_header, human_summary_prompt, max_concurrent_children,
+    orchestration_log_dir, resolve_child_model, unknown_profile_error,
 };
 use settings::Settings as _;
 
@@ -26,7 +26,83 @@ use crate::{
     AgentPanel,
     agent_panel::{ChildThreadRequest, create_child_thread},
     conversation_view::{ConversationView, MessageOrigin, RootThreadUpdated},
+    thread_metadata_store::ThreadMetadataStore,
 };
+
+struct SavedChildrenWatch;
+
+impl gpui::Global for SavedChildrenWatch {}
+
+/// Keeps the orchestration registry in line with the saved threads: every
+/// thread that has a parent link and that nobody loaded gets a record under
+/// its orchestrator, so `child_status`, `await_children` and `whoami` know the
+/// children that existed before a restart. Safe to call from every panel: it
+/// installs one observer for the app.
+pub(crate) fn watch_saved_children(cx: &mut App) {
+    if cx.has_global::<SavedChildrenWatch>() {
+        return;
+    }
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return;
+    };
+    cx.set_global(SavedChildrenWatch);
+    restore_saved_children(cx);
+    cx.observe(&store, |_store, cx| restore_saved_children(cx))
+        .detach();
+}
+
+pub(crate) fn restore_saved_children(cx: &mut App) {
+    if !AgentSettings::get_global(cx).orchestration.enabled {
+        return;
+    }
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return;
+    };
+    let registry = OrchestrationRegistry::global_or_init(cx);
+    let log_dir = orchestration_log_dir(cx);
+    let restored = {
+        let store = store.read(cx);
+        let registry = registry.read(cx);
+        store
+            .entries()
+            .filter(|metadata| !metadata.archived)
+            .filter_map(|metadata| {
+                let parent = store.entry(metadata.parent_thread_id?)?;
+                // A thread that a panel holds is a child that is being started
+                // or that is open: its own host reports it.
+                if registry
+                    .child(parent.thread_id, metadata.thread_id)
+                    .is_some()
+                    || registry.host_for_thread(metadata.thread_id, cx).is_some()
+                {
+                    return None;
+                }
+                Some((
+                    parent.thread_id,
+                    RestoredChild {
+                        child_id: metadata.thread_id,
+                        title: metadata.display_title(),
+                        agent_id: metadata.agent_id.0.to_string(),
+                        model: metadata
+                            .run_config
+                            .model()
+                            .map(|(provider, model)| format!("{provider}/{model}")),
+                        log_dir: log_dir.clone(),
+                        orchestrator_title: parent.display_title().to_string(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    if restored.is_empty() {
+        return;
+    }
+    registry.update(cx, |registry, cx| {
+        for (orchestrator, child) in restored {
+            registry.restore_child(orchestrator, child, cx);
+        }
+    });
+}
 
 /// Reports to the orchestration registry that a message was sent in `thread`.
 /// A human message in a child counts toward its next summary. The message
@@ -56,10 +132,33 @@ pub(crate) struct AgentPanelOrchestrationHost {
     orchestrator_watches: Rc<RefCell<HashMap<ThreadId, Subscription>>>,
 }
 
+/// Every orchestrated child's conversation, whichever panel holds it. An
+/// orchestrator's thread view uses it to show the children's permission
+/// requests (R13) without going through a panel: children started with
+/// `worktree: new` live in another workspace.
+#[derive(Default)]
+struct ChildConversations(HashMap<ThreadId, WeakEntity<ConversationView>>);
+
+impl Global for ChildConversations {}
+
+/// The conversation of an orchestrated child, while it is still open.
+pub(crate) fn child_conversation_view(
+    child: ThreadId,
+    cx: &App,
+) -> Option<Entity<ConversationView>> {
+    cx.try_global::<ChildConversations>()?
+        .0
+        .get(&child)?
+        .upgrade()
+}
+
 struct ChildHandle {
     conversation_view: WeakEntity<ConversationView>,
     thread_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+    /// Messages for a child whose agent is still connecting: `send_to_child`
+    /// does not fail, it parks the text here until the child's thread exists.
+    pending: Vec<String>,
 }
 
 impl AgentPanelOrchestrationHost {
@@ -87,6 +186,44 @@ impl AgentPanelOrchestrationHost {
             .and_then(|handle| handle.conversation_view.upgrade())
             .context("The child thread is no longer open, so it cannot be reached.")
     }
+
+    /// The view of a child, opening the thread first when it is not loaded:
+    /// after a restart, or after Zed unloaded an idle thread. The agent
+    /// connects in the background, so the view may not be ready to receive
+    /// messages yet: use [`send_or_queue`].
+    fn open_child(
+        &self,
+        orchestrator: ThreadId,
+        child: ThreadId,
+        cx: &mut App,
+    ) -> Task<Result<Entity<ConversationView>>> {
+        if let Ok(view) = self.child_view(child) {
+            return Task::ready(Ok(view));
+        }
+        let owned_elsewhere = OrchestrationRegistry::global_or_init(cx)
+            .read(cx)
+            .host_for_thread(child, cx)
+            .is_some()
+            && !self.owns_thread(child, cx);
+        if owned_elsewhere {
+            return Task::ready(Err(anyhow!(
+                "The child is open in another workspace's agent panel, which this thread cannot \
+                 reach. Open the child from the threads sidebar and try again."
+            )));
+        }
+        let panel = self.panel.clone();
+        let window = self.window;
+        let children = self.children.clone();
+        cx.spawn(async move |cx| {
+            let view = window.update(cx, |_root, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.load_thread_in_background(child, window, cx)
+                })
+            })???;
+            cx.update(|cx| observe_child(&children, window, orchestrator, child, &view, cx));
+            Ok(view)
+        })
+    }
 }
 
 impl OrchestrationHost for AgentPanelOrchestrationHost {
@@ -99,154 +236,173 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
         if let Err(error) = Self::ensure_enabled(cx) {
             return Task::ready(Err(error));
         }
+        let limit = max_concurrent_children(cx);
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        if let Err(error) = registry.update(cx, |registry, _| registry.reserve_child_slot(limit)) {
+            return Task::ready(Err(error));
+        }
         let panel = self.panel.clone();
         let window = self.window;
         let children = self.children.clone();
         let orchestrator_watches = self.orchestrator_watches.clone();
+        let slot_registry = registry.downgrade();
         cx.spawn(async move |cx| {
-            let (orchestrator_view, selected_agent_is_native, orchestrator_title) = panel
-                .read_with(cx, |panel, cx| {
-                    let view = panel.conversation_view_for_id(&orchestrator, cx).cloned();
-                    let title = view
-                        .as_ref()
-                        .and_then(|view| view.read(cx).root_thread(cx))
-                        .and_then(|thread| thread.read(cx).title())
-                        .map(|title| title.to_string())
-                        .unwrap_or_else(|| "Untitled thread".to_string());
-                    (view, panel.selected_agent_is_native(), title)
-                })
-                .context("The agent panel is no longer available.")?;
-            let orchestrator_view = orchestrator_view
-                .context("This thread is not an orchestrator that this agent panel owns.")?;
+            let result: Result<StartChildOutput> = async {
+                let (orchestrator_view, selected_agent_is_native, orchestrator_title) = panel
+                    .read_with(cx, |panel, cx| {
+                        let view = panel.conversation_view_for_id(&orchestrator, cx).cloned();
+                        let title = view
+                            .as_ref()
+                            .and_then(|view| view.read(cx).root_thread(cx))
+                            .and_then(|thread| thread.read(cx).title())
+                            .map(|title| title.to_string())
+                            .unwrap_or_else(|| "Untitled thread".to_string());
+                        (view, panel.selected_agent_is_native(), title)
+                    })
+                    .context("The agent panel is no longer available.")?;
+                let orchestrator_view = orchestrator_view
+                    .context("This thread is not an orchestrator that this agent panel owns.")?;
 
-            let is_native = match input.agent.as_deref() {
-                Some(agent_id) => agent_id == agent::ZED_AGENT_ID.as_ref(),
-                None => selected_agent_is_native,
-            };
-            let mut warnings = Vec::new();
+                let is_native = match input.agent.as_deref() {
+                    Some(agent_id) => agent_id == agent::ZED_AGENT_ID.as_ref(),
+                    None => selected_agent_is_native,
+                };
+                let mut warnings = Vec::new();
 
-            // An unknown profile is an error whatever the agent, so a typo is
-            // caught instead of being ignored with a warning.
-            let (available_profiles, subagent_model) = cx.update(|cx| {
-                (
-                    agent::available_profiles(cx),
-                    agent_settings::AgentSettings::get_global(cx)
-                        .subagent_model
-                        .as_ref()
-                        .map(agent::selection_to_model_string),
-                )
-            });
-            if let Some(profile) = input.profile.as_deref()
-                && !available_profiles.iter().any(|known| known.id == profile)
-            {
-                return Err(anyhow!(unknown_profile_error(profile, &available_profiles)));
-            }
-            let profile = match input.profile {
-                Some(profile) if !is_native => {
-                    warnings.push(format!(
-                        "`profile` ({profile:?}) is not supported yet for external agents: \
-                         the child uses the agent's own configuration."
-                    ));
-                    None
-                }
-                profile => profile,
-            };
-            let profile_default_model = profile.as_deref().and_then(|profile| {
-                available_profiles
-                    .iter()
-                    .find(|known| known.id == profile)
-                    .and_then(|known| known.default_model.clone())
-            });
-
-            let model = match input.model {
-                Some(model) if !is_native => {
-                    warnings.push(format!(
-                        "`model` ({model:?}) is not supported yet for external agents: \
-                         the child uses the agent's own default model."
-                    ));
-                    None
-                }
-                Some(model)
-                    if !model
-                        .split_once('/')
-                        .is_some_and(|(provider, id)| !provider.is_empty() && !id.is_empty()) =>
+                // An unknown profile is an error whatever the agent, so a typo is
+                // caught instead of being ignored with a warning.
+                let (available_profiles, subagent_model) = cx.update(|cx| {
+                    (
+                        agent::available_profiles(cx),
+                        agent_settings::AgentSettings::get_global(cx)
+                            .subagent_model
+                            .as_ref()
+                            .map(agent::selection_to_model_string),
+                    )
+                });
+                if let Some(profile) = input.profile.as_deref()
+                    && !available_profiles.iter().any(|known| known.id == profile)
                 {
-                    warnings.push(format!(
-                        "`model` ({model:?}) must be `provider/model-id`: \
-                         the child uses the default model."
-                    ));
-                    None
+                    return Err(anyhow!(unknown_profile_error(profile, &available_profiles)));
                 }
-                model => model,
-            };
-            // Explicit `model`, else the profile's model, else
-            // `agent.subagent_model`; none left means the user's default.
-            // External agents choose their own model.
-            let model = if is_native {
-                resolve_child_model(
-                    model.as_deref(),
-                    profile_default_model.as_deref(),
-                    subagent_model.as_deref(),
-                )
-                .map(|(model, _source)| model)
-            } else {
-                model
-            };
+                let profile = match input.profile {
+                    Some(profile) if !is_native => {
+                        warnings.push(format!(
+                            "`profile` ({profile:?}) is not supported yet for external agents: \
+                         the child uses the agent's own configuration."
+                        ));
+                        None
+                    }
+                    profile => profile,
+                };
+                let profile_default_model = profile.as_deref().and_then(|profile| {
+                    available_profiles
+                        .iter()
+                        .find(|known| known.id == profile)
+                        .and_then(|known| known.default_model.clone())
+                });
 
-            let child = create_child_thread(
-                panel,
-                window,
-                ChildThreadRequest {
-                    title: input.title.clone().into(),
-                    prompt: format!("{}{}", child_header(&orchestrator_title), input.prompt),
-                    agent_id: input.agent,
-                    model: model.clone(),
-                    profile,
-                    use_new_worktree: input.worktree == WorktreeMode::New,
-                    base_ref: input.base_ref,
-                    worktree_name: input.worktree_name,
-                    parent_thread_id: Some(orchestrator),
-                },
-                cx,
-            )
-            .await?;
-            warnings.extend(child.warning);
+                let model = match input.model {
+                    Some(model) if !is_native => {
+                        warnings.push(format!(
+                            "`model` ({model:?}) is not supported yet for external agents: \
+                         the child uses the agent's own default model."
+                        ));
+                        None
+                    }
+                    Some(model)
+                        if !model.split_once('/').is_some_and(|(provider, id)| {
+                            !provider.is_empty() && !id.is_empty()
+                        }) =>
+                    {
+                        warnings.push(format!(
+                            "`model` ({model:?}) must be `provider/model-id`: \
+                         the child uses the default model."
+                        ));
+                        None
+                    }
+                    model => model,
+                };
+                // Explicit `model`, else the profile's model, else
+                // `agent.subagent_model`; none left means the user's default.
+                // External agents choose their own model.
+                let model = if is_native {
+                    resolve_child_model(
+                        model.as_deref(),
+                        profile_default_model.as_deref(),
+                        subagent_model.as_deref(),
+                    )
+                    .map(|(model, _source)| model)
+                } else {
+                    model
+                };
 
-            let agent_id = child.agent_id.0.to_string();
-            let registry = cx.update(OrchestrationRegistry::global_or_init);
-            let log_dir = cx.update(|cx| orchestration_log_dir(cx));
-            let log_path = registry.update(cx, |registry, cx| {
-                registry.register_child(
-                    orchestrator,
-                    NewChild {
-                        child_id: child.thread_id,
-                        title: input.title.into(),
-                        agent_id: agent_id.clone(),
-                        model,
-                        log_dir,
-                        prompt: input.prompt,
-                        orchestrator_title,
+                let child = create_child_thread(
+                    panel,
+                    window,
+                    ChildThreadRequest {
+                        title: input.title.clone().into(),
+                        prompt: format!("{}{}", child_header(&orchestrator_title), input.prompt),
+                        agent_id: input.agent,
+                        model: model.clone(),
+                        profile,
+                        use_new_worktree: input.worktree == WorktreeMode::New,
+                        base_ref: input.base_ref,
+                        worktree_name: input.worktree_name,
+                        parent_thread_id: Some(orchestrator),
                     },
                     cx,
                 )
-            });
-            cx.update(|cx| {
-                observe_child(
-                    &children,
-                    orchestrator,
-                    child.thread_id,
-                    &child.conversation_view,
-                    cx,
-                );
-                watch_orchestrator(&orchestrator_watches, orchestrator, &orchestrator_view, cx);
-            });
+                .await?;
+                warnings.extend(child.warning);
 
-            Ok(StartChildOutput {
-                child_id: child.thread_id.to_key_string(),
-                log_path: log_path.display().to_string(),
-                agent: agent_id,
-                warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
-            })
+                let agent_id = child.agent_id.0.to_string();
+                let registry = cx.update(OrchestrationRegistry::global_or_init);
+                let log_dir = cx.update(|cx| orchestration_log_dir(cx));
+                let log_path = registry.update(cx, |registry, cx| {
+                    // The child now counts as running, so it no longer needs its
+                    // reserved slot.
+                    registry.release_child_slot();
+                    registry.register_child(
+                        orchestrator,
+                        NewChild {
+                            child_id: child.thread_id,
+                            title: input.title.into(),
+                            agent_id: agent_id.clone(),
+                            model,
+                            log_dir,
+                            prompt: input.prompt,
+                            orchestrator_title,
+                        },
+                        cx,
+                    )
+                });
+                cx.update(|cx| {
+                    observe_child(
+                        &children,
+                        window,
+                        orchestrator,
+                        child.thread_id,
+                        &child.conversation_view,
+                        cx,
+                    );
+                    watch_orchestrator(&orchestrator_watches, orchestrator, &orchestrator_view, cx);
+                });
+
+                Ok(StartChildOutput {
+                    child_id: child.thread_id.to_key_string(),
+                    log_path: log_path.display().to_string(),
+                    agent: agent_id,
+                    warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+                })
+            }
+            .await;
+            if result.is_err() {
+                slot_registry
+                    .update(cx, |registry, _| registry.release_child_slot())
+                    .ok();
+            }
+            result
         })
     }
 
@@ -257,21 +413,30 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
         cx: &mut App,
     ) -> Task<Result<SendToChildOutput>> {
         let window = self.window;
-        let conversation_view = (|| {
+        let children = self.children.clone();
+        let child = (|| {
             Self::ensure_enabled(cx)?;
-            let child = OrchestrationRegistry::global_or_init(cx)
+            OrchestrationRegistry::global_or_init(cx)
                 .read(cx)
-                .resolve_child_id(orchestrator, &input.child_id)?;
-            Ok((child, self.child_view(child)?))
+                .resolve_child_id(orchestrator, &input.child_id)
         })();
-        let (child, conversation_view) = match conversation_view {
-            Ok(resolved) => resolved,
+        let child = match child {
+            Ok(child) => child,
             Err(error) => return Task::ready(Err(error)),
         };
+        let opening = self.open_child(orchestrator, child, cx);
         // Deferred, because sending needs the window and the caller may be
         // running inside an update of it.
         cx.spawn(async move |cx| {
-            let queued = send_text(window, &conversation_view, input.message.clone(), cx)?;
+            let conversation_view = opening.await?;
+            let queued = send_or_queue(
+                &children,
+                window,
+                child,
+                &conversation_view,
+                input.message.clone(),
+                cx,
+            )?;
             let registry = cx.update(OrchestrationRegistry::global_or_init);
             registry.update(cx, |registry, cx| {
                 registry.record_message_to_child(orchestrator, child, &input.message, cx);
@@ -292,6 +457,9 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
             let child = registry
                 .read(cx)
                 .resolve_child_id(orchestrator, &input.child_id)?;
+            // A child that orchestrates takes its running children with it,
+            // even when its own turn already ended.
+            OrchestrationRegistry::cancel_running_descendants(&registry, child, cx);
             let status = registry
                 .read(cx)
                 .child(orchestrator, child)
@@ -320,6 +488,27 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                 status: ChildStatus::Cancelled,
             })
         })())
+    }
+
+    fn cancel_thread_turn(&self, thread: ThreadId, cx: &mut App) -> Option<Option<String>> {
+        let conversation_view = self.child_view(thread).ok()?;
+        let acp_thread = conversation_view.read(cx).root_thread(cx)?;
+        let final_message = acp_thread.read(cx).last_assistant_message(cx);
+        conversation_view.update(cx, |view, cx| view.cancel_generation(cx));
+        Some(final_message)
+    }
+
+    fn load_child(
+        &self,
+        orchestrator: ThreadId,
+        child: ThreadId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let opening = self.open_child(orchestrator, child, cx);
+        cx.spawn(async move |_cx| {
+            opening.await?;
+            Ok(())
+        })
     }
 
     fn list_available_agents(&self, cx: &mut App) -> Result<AvailableAgents> {
@@ -455,6 +644,70 @@ impl AgentPanelOrchestrationHost {
     }
 }
 
+/// Sends `text` to a child, or parks it in the host when the child's agent is
+/// still connecting, and sends it as soon as the thread exists. Returns
+/// whether the message was queued (parked, or held by a generating thread).
+fn send_or_queue(
+    children: &Rc<RefCell<HashMap<ThreadId, ChildHandle>>>,
+    window: gpui::AnyWindowHandle,
+    child: ThreadId,
+    conversation_view: &Entity<ConversationView>,
+    text: String,
+    cx: &mut gpui::AsyncApp,
+) -> Result<bool> {
+    let connecting = conversation_view.read_with(cx, |view, cx| view.root_thread(cx).is_none());
+    if connecting {
+        let mut children = children.borrow_mut();
+        let handle = children
+            .get_mut(&child)
+            .context("The child thread is no longer tracked, so the message cannot be queued.")?;
+        handle.pending.push(text);
+        return Ok(true);
+    }
+    send_text(window, conversation_view, text, cx)
+}
+
+/// Sends the messages parked for a child whose thread now exists. A message
+/// that cannot be sent yet stays parked for the next try.
+fn flush_pending(
+    children: &Rc<RefCell<HashMap<ThreadId, ChildHandle>>>,
+    window: gpui::AnyWindowHandle,
+    child: ThreadId,
+    cx: &mut App,
+) {
+    let (conversation_view, messages) = {
+        let mut children = children.borrow_mut();
+        let Some(handle) = children.get_mut(&child) else {
+            return;
+        };
+        if handle.pending.is_empty() {
+            return;
+        }
+        let Some(conversation_view) = handle.conversation_view.upgrade() else {
+            return;
+        };
+        if conversation_view.read(cx).root_thread(cx).is_none() {
+            return;
+        }
+        (conversation_view, std::mem::take(&mut handle.pending))
+    };
+    let children = children.clone();
+    cx.spawn(async move |cx| {
+        let mut messages = messages.into_iter();
+        while let Some(text) = messages.next() {
+            if let Err(error) = send_text(window, &conversation_view, text.clone(), cx) {
+                log::error!("failed to send a queued message to a child: {error:#}");
+                if let Some(handle) = children.borrow_mut().get_mut(&child) {
+                    handle.pending.insert(0, text);
+                    handle.pending.extend(messages);
+                }
+                return;
+            }
+        }
+    })
+    .detach();
+}
+
 /// Sends `text` to a thread as a user message that the orchestration tools
 /// wrote. A thread that is generating queues it. Returns whether it was queued.
 fn send_text(
@@ -551,6 +804,7 @@ fn watch_orchestrator(
 /// thread exists (or the agent fails to load), and then the `AcpThread`.
 fn observe_child(
     children: &Rc<RefCell<HashMap<ThreadId, ChildHandle>>>,
+    window: gpui::AnyWindowHandle,
     orchestrator: ThreadId,
     child: ThreadId,
     conversation_view: &Entity<ConversationView>,
@@ -559,7 +813,14 @@ fn observe_child(
     let root_subscription = cx.subscribe(conversation_view, {
         let children = children.clone();
         move |conversation_view, _: &RootThreadUpdated, cx| {
-            attach_thread_observer(&children, orchestrator, child, &conversation_view, cx);
+            attach_thread_observer(
+                &children,
+                window,
+                orchestrator,
+                child,
+                &conversation_view,
+                cx,
+            );
         }
     });
     let load_subscription = cx.observe(conversation_view, move |conversation_view, cx| {
@@ -574,19 +835,30 @@ fn observe_child(
             cx,
         );
     });
+    cx.default_global::<ChildConversations>()
+        .0
+        .insert(child, conversation_view.downgrade());
+    // Messages parked while the thread was not connected survive a re-observe.
+    let pending = children
+        .borrow_mut()
+        .remove(&child)
+        .map(|handle| handle.pending)
+        .unwrap_or_default();
     children.borrow_mut().insert(
         child,
         ChildHandle {
             conversation_view: conversation_view.downgrade(),
             thread_subscription: None,
             _subscriptions: vec![root_subscription, load_subscription],
+            pending,
         },
     );
-    attach_thread_observer(children, orchestrator, child, conversation_view, cx);
+    attach_thread_observer(children, window, orchestrator, child, conversation_view, cx);
 }
 
 fn attach_thread_observer(
     children: &Rc<RefCell<HashMap<ThreadId, ChildHandle>>>,
+    window: gpui::AnyWindowHandle,
     orchestrator: ThreadId,
     child: ThreadId,
     conversation_view: &Entity<ConversationView>,
@@ -602,13 +874,37 @@ fn attach_thread_observer(
     let Some(thread) = conversation_view.read(cx).root_thread(cx) else {
         return;
     };
-    let subscription = cx.subscribe(&thread, move |thread, event, cx| {
-        on_thread_event(orchestrator, child, &thread, event, cx);
+    let subscription = cx.subscribe(&thread, {
+        let children = children.clone();
+        move |thread, event, cx| {
+            on_thread_event(orchestrator, child, &thread, event, cx);
+            // Parked and sibling messages wait for the child to be between
+            // turns, so they go after the turn's end is recorded.
+            if matches!(
+                event,
+                AcpThreadEvent::Stopped { .. }
+                    | AcpThreadEvent::StatusChanged
+                    | AcpThreadEvent::ActivityConfirmedIdle
+            ) {
+                flush_pending(&children, window, child, cx);
+                OrchestrationRegistry::flush_sibling_inbox(
+                    &OrchestrationRegistry::global_or_init(cx),
+                    child,
+                    cx,
+                );
+            }
+        }
     });
     if let Some(handle) = children.borrow_mut().get_mut(&child) {
         handle.thread_subscription = Some(subscription);
     }
     sync_live_status(orchestrator, child, &thread, cx);
+    flush_pending(children, window, child, cx);
+    OrchestrationRegistry::flush_sibling_inbox(
+        &OrchestrationRegistry::global_or_init(cx),
+        child,
+        cx,
+    );
 }
 
 fn on_thread_event(

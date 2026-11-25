@@ -1636,6 +1636,13 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
+                // Archiving a thread that orchestrates stops its running
+                // children: nobody is left to collect what they produce.
+                if let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) {
+                    orchestration::OrchestrationRegistry::cancel_running_descendants(
+                        &registry, *thread_id, cx,
+                    );
+                }
                 if this.remove_retained_thread(thread_id).is_some() {
                     cx.notify();
                 }
@@ -1654,6 +1661,7 @@ impl AgentPanel {
         orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
             registry.register_host(orchestration_host.clone());
         });
+        crate::orchestration_host::watch_saved_children(cx);
 
         cx.on_release(move |this, cx| {
             this.dismiss_all_terminal_notifications(cx);
@@ -3432,6 +3440,39 @@ impl AgentPanel {
         thread_id
     }
 
+    /// Opens a saved thread in this panel without activating it, and keeps it
+    /// loaded like the threads that orchestration starts. Returns the view
+    /// that already holds the thread when there is one. The agent connects in
+    /// the background: the thread is not ready to receive messages right away.
+    pub(crate) fn load_thread_in_background(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<ConversationView>> {
+        if let Some(view) = self.conversation_view_for_id(&thread_id, cx) {
+            return Ok(view.clone());
+        }
+        let metadata = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(thread_id).cloned())
+            .ok_or_else(|| anyhow!("The thread is no longer saved, so it cannot be opened."))?;
+        let thread = self.create_agent_thread_with_server(
+            Agent::from(metadata.agent_id.clone()),
+            None,
+            Some(thread_id),
+            Some(metadata.folder_paths().clone()),
+            metadata.title.clone(),
+            None,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        let conversation_view = thread.conversation_view;
+        self.insert_retained_thread(thread_id, conversation_view.clone(), cx);
+        Ok(conversation_view)
+    }
+
     pub fn active_thread_id(&self, cx: &App) -> Option<ThreadId> {
         match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
@@ -3464,6 +3505,22 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) {
+            // Deleting a thread that orchestrates stops its running children,
+            // and revokes the session tokens that let its agent call the
+            // orchestration tools. Both need the thread, so they run before it
+            // is dropped.
+            orchestration::OrchestrationRegistry::cancel_running_descendants(&registry, id, cx);
+            let session_id = self
+                .conversation_view_for_id(&id, cx)
+                .and_then(|view| view.read(cx).root_thread(cx))
+                .map(|thread| thread.read(cx).session_id().0.to_string());
+            if let Some(session_id) = session_id {
+                registry.update(cx, |registry, _| {
+                    registry.revoke_session_tokens(&session_id)
+                });
+            }
+        }
         self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
@@ -15469,8 +15526,14 @@ mod tests {
     }
 
     async fn setup_orchestration(cx: &mut TestAppContext) -> OrchestrationFixture {
+        setup_orchestration_with_connection(cx, StubAgentConnection::new()).await
+    }
+
+    async fn setup_orchestration_with_connection(
+        cx: &mut TestAppContext,
+        connection: StubAgentConnection,
+    ) -> OrchestrationFixture {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection = StubAgentConnection::new();
         let connection_override =
             crate::test_support::use_connection_for_stub_agent(connection.clone());
         panel.update(&mut cx, |panel, _cx| {
@@ -15614,6 +15677,379 @@ mod tests {
         assert_eq!(status, ChildStatus::Completed);
         assert_eq!(final_message.as_deref(), Some("child result"));
         assert_eq!(turns, 1);
+    }
+
+    /// A stub connection whose tool calls with these ids ask for permission,
+    /// with the options a real agent offers (allow, always, deny).
+    fn permission_connection(tool_ids: &[&str]) -> StubAgentConnection {
+        let options = acp_thread::PermissionOptions::Flat(vec![
+            acp_v2::PermissionOption::new(
+                "allow",
+                "Allow",
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ),
+            acp_v2::PermissionOption::new(
+                "allow_always",
+                "Always allow",
+                acp_v2::PermissionOptionKind::AllowAlways,
+            ),
+            acp_v2::PermissionOption::new("deny", "Deny", acp_v2::PermissionOptionKind::RejectOnce),
+        ]);
+        StubAgentConnection::new().with_permission_requests(
+            tool_ids
+                .iter()
+                .map(|id| (acp_v2::ToolCallId::new(*id), options.clone()))
+                .collect(),
+        )
+    }
+
+    fn permission_tool_call(id: &'static str, title: &'static str) -> acp::SessionUpdate {
+        acp::SessionUpdate::ToolCall(acp::ToolCall::new(id, title).kind(acp::ToolKind::Execute))
+    }
+
+    impl OrchestrationFixture {
+        fn thread_view(
+            &mut self,
+            thread: ThreadId,
+        ) -> Entity<crate::conversation_view::ThreadView> {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                panel
+                    .conversation_view_for_id(&thread, cx)
+                    .expect("the thread should be open")
+                    .read(cx)
+                    .root_thread_view()
+                    .expect("the thread should have a root view")
+            })
+        }
+
+        /// The (child, child title, tool) of each permission card in `thread`.
+        fn cards(&mut self, thread: ThreadId) -> Vec<(ThreadId, String, String)> {
+            let view = self.thread_view(thread);
+            self.cx.update(|_window, cx| {
+                view.read(cx)
+                    .orchestrated_child_permission_cards(cx)
+                    .into_iter()
+                    .map(|card| {
+                        (
+                            card.child_id,
+                            card.child_title.to_string(),
+                            card.tool.to_string(),
+                        )
+                    })
+                    .collect()
+            })
+        }
+
+        /// Presses the button of `kind` on the card of `child` shown in
+        /// `thread`.
+        fn press_card_button(
+            &mut self,
+            thread: ThreadId,
+            child: ThreadId,
+            kind: crate::conversation_view::orchestrated_permissions::CardActionKind,
+        ) {
+            let view = self.thread_view(thread);
+            view.update(&mut self.cx, |view, cx| {
+                let card = view
+                    .orchestrated_child_permission_cards(cx)
+                    .into_iter()
+                    .find(|card| card.child_id == child)
+                    .expect("the child should have a card");
+                let action = card
+                    .actions
+                    .iter()
+                    .find(|action| action.kind == kind)
+                    .expect("the card should offer this action")
+                    .clone();
+                view.answer_child_permission(
+                    child,
+                    &card.session_id,
+                    card.request_id,
+                    action.answer,
+                    cx,
+                );
+            });
+            self.cx.run_until_parked();
+        }
+
+        fn child_waits_for_input(&mut self, child: ThreadId) -> bool {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                panel.retained_threads[&child]
+                    .read(cx)
+                    .root_thread_is_waiting_for_input(cx)
+            })
+        }
+
+        /// Records the status the child's first tool call has each time the
+        /// child receives an answer. The stub agent resets the status when it
+        /// goes on, so the status at that moment is the evidence of the answer.
+        fn record_answers(
+            &mut self,
+            child: ThreadId,
+        ) -> (
+            Rc<std::cell::RefCell<Vec<acp_thread::ToolCallStatus>>>,
+            gpui::Subscription,
+        ) {
+            let thread = self.panel.read_with(&self.cx, |panel, cx| {
+                panel.retained_threads[&child]
+                    .read(cx)
+                    .root_thread(cx)
+                    .expect("the child should have a root thread")
+            });
+            let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let recorded = seen.clone();
+            let subscription = self.cx.update(|_window, cx| {
+                cx.subscribe(&thread, move |thread, event, cx| {
+                    if matches!(
+                        event,
+                        acp_thread::AcpThreadEvent::ToolAuthorizationReceived(_)
+                    ) && let Some(status) =
+                        thread
+                            .read(cx)
+                            .entries()
+                            .iter()
+                            .find_map(|entry| match entry {
+                                acp_thread::AgentThreadEntry::ToolCall(call) => {
+                                    Some(call.status().clone())
+                                }
+                                _ => None,
+                            })
+                    {
+                        recorded.borrow_mut().push(status);
+                    }
+                })
+            });
+            (seen, subscription)
+        }
+
+        /// The current status of the child's first tool call.
+        fn child_tool_call_status(&mut self, child: ThreadId) -> acp_thread::ToolCallStatus {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                let thread = panel.retained_threads[&child]
+                    .read(cx)
+                    .root_thread(cx)
+                    .expect("the child should have a root thread");
+                thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .find_map(|entry| match entry {
+                        acp_thread::AgentThreadEntry::ToolCall(call) => Some(call.status().clone()),
+                        _ => None,
+                    })
+                    .expect("the child should have a tool call")
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_orchestrated_child_permission_card_allow_resolves_the_child(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::conversation_view::orchestrated_permissions::CardActionKind;
+        let mut fixture =
+            setup_orchestration_with_connection(cx, permission_connection(&["t1"])).await;
+        let orchestrator = fixture.orchestrator;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t1", "Run `cargo build`")]);
+
+        let child = fixture
+            .start_child(start_child_input("Builder", "build it"))
+            .await;
+        let (answers, _answers_subscription) = fixture.record_answers(child);
+
+        assert_eq!(
+            fixture.cards(orchestrator),
+            vec![(
+                child,
+                "Builder".to_string(),
+                "Run `cargo build`".to_string()
+            )]
+        );
+        assert_eq!(
+            fixture.child_record(child).0,
+            ChildStatus::WaitingForConfirmation
+        );
+        assert!(
+            fixture.child_waits_for_input(child),
+            "the child's sidebar row shows waiting for confirmation"
+        );
+        let view = fixture.thread_view(orchestrator);
+        let card = fixture.cx.update(|_window, cx| {
+            view.read(cx)
+                .orchestrated_child_permission_cards(cx)
+                .pop()
+                .unwrap()
+        });
+        assert!(!card.agent_name.is_empty());
+        let labels: Vec<_> = card.actions.iter().map(|a| a.label.to_string()).collect();
+        assert_eq!(labels, ["Allow", "Always allow", "Deny"]);
+        assert_eq!(
+            fixture.child_tool_call_status(child),
+            acp_thread::ToolCallStatus::WaitingForConfirmation,
+            "nothing is auto-approved"
+        );
+        let view = fixture.thread_view(orchestrator);
+        let shows_activity_bar = view.update_in(&mut fixture.cx, |view, window, cx| {
+            view.render_activity_bar(window, cx).is_some()
+        });
+        assert!(
+            shows_activity_bar,
+            "the orchestrator's activity bar carries the child's request"
+        );
+
+        fixture.press_card_button(orchestrator, child, CardActionKind::Allow);
+
+        assert!(fixture.cards(orchestrator).is_empty());
+        assert!(!fixture.child_waits_for_input(child));
+        assert_eq!(
+            answers.borrow().as_slice(),
+            [acp_thread::ToolCallStatus::InProgress],
+            "the child received the allow"
+        );
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Completed);
+    }
+
+    #[gpui::test]
+    async fn test_orchestrated_child_permission_card_deny_resolves_the_child(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::conversation_view::orchestrated_permissions::CardActionKind;
+        let mut fixture =
+            setup_orchestration_with_connection(cx, permission_connection(&["t1"])).await;
+        let orchestrator = fixture.orchestrator;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t1", "Run `rm -rf target`")]);
+        let child = fixture
+            .start_child(start_child_input("Cleaner", "clean it"))
+            .await;
+        assert_eq!(fixture.cards(orchestrator).len(), 1);
+        let (answers, _answers_subscription) = fixture.record_answers(child);
+
+        fixture.press_card_button(orchestrator, child, CardActionKind::Deny);
+
+        assert!(fixture.cards(orchestrator).is_empty());
+        assert_eq!(
+            answers.borrow().as_slice(),
+            [acp_thread::ToolCallStatus::Rejected],
+            "the child received the deny"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestrated_child_permission_answered_in_the_child_removes_the_card(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture =
+            setup_orchestration_with_connection(cx, permission_connection(&["t1"])).await;
+        let orchestrator = fixture.orchestrator;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t1", "Run `ls`")]);
+        let child = fixture
+            .start_child(start_child_input("Lister", "list it"))
+            .await;
+        assert_eq!(fixture.cards(orchestrator).len(), 1);
+        assert!(
+            fixture.cards(child).is_empty(),
+            "a child's own request is not a card in the child"
+        );
+
+        let session_id = fixture.child_session_id(child);
+        let child_view = fixture.thread_view(child);
+        child_view.update(&mut fixture.cx, |view, cx| {
+            view.conversation.update(cx, |conversation, cx| {
+                conversation
+                    .authorize_pending_tool_call(
+                        &session_id,
+                        acp_v2::PermissionOptionKind::AllowOnce,
+                        cx,
+                    )
+                    .expect("the child has a pending request");
+            });
+        });
+        fixture.cx.run_until_parked();
+
+        assert!(fixture.cards(orchestrator).is_empty());
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Completed);
+    }
+
+    #[gpui::test]
+    async fn test_two_orchestrated_children_waiting_show_one_card_each(cx: &mut TestAppContext) {
+        use crate::conversation_view::orchestrated_permissions::CardActionKind;
+        let mut fixture =
+            setup_orchestration_with_connection(cx, permission_connection(&["t1", "t2"])).await;
+        let orchestrator = fixture.orchestrator;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t1", "Run `first`")]);
+        let first = fixture.start_child(start_child_input("First", "one")).await;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t2", "Run `second`")]);
+        let second = fixture
+            .start_child(start_child_input("Second", "two"))
+            .await;
+
+        assert_eq!(
+            fixture.cards(orchestrator),
+            vec![
+                (first, "First".to_string(), "Run `first`".to_string()),
+                (second, "Second".to_string(), "Run `second`".to_string()),
+            ]
+        );
+
+        fixture.press_card_button(orchestrator, first, CardActionKind::Allow);
+
+        assert_eq!(
+            fixture.cards(orchestrator),
+            vec![(second, "Second".to_string(), "Run `second`".to_string())],
+            "answering one card leaves the other"
+        );
+        assert!(fixture.child_waits_for_input(second));
+    }
+
+    #[gpui::test]
+    async fn test_grandchild_permission_shows_only_in_its_own_orchestrator(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture =
+            setup_orchestration_with_connection(cx, permission_connection(&["t1", "t2"])).await;
+        let orchestrator = fixture.orchestrator;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t1", "Run `child`")]);
+        let child = fixture
+            .start_child(start_child_input("Child", "work"))
+            .await;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![permission_tool_call("t2", "Run `grandchild`")]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture
+                .host
+                .start_child(child, start_child_input("Grandchild", "sub-work"), cx)
+        });
+        let output = task.await.expect("the child can start a child");
+        fixture.cx.run_until_parked();
+        let grandchild = ThreadId::from_key_string(&output.child_id).unwrap();
+
+        assert_eq!(
+            fixture.cards(orchestrator),
+            vec![(child, "Child".to_string(), "Run `child`".to_string())],
+            "the top orchestrator sees its own child only"
+        );
+        assert_eq!(
+            fixture.cards(child),
+            vec![(
+                grandchild,
+                "Grandchild".to_string(),
+                "Run `grandchild`".to_string()
+            )],
+            "the child sees its own child"
+        );
     }
 
     /// A native-agent orchestrator with a fake provider that offers the models
@@ -16132,6 +16568,414 @@ mod tests {
         let (status, _, turns) = fixture.child_record(child);
         assert_eq!(status, ChildStatus::Cancelled);
         assert_eq!(turns, 1, "the cancelled turn is counted once");
+    }
+
+    impl OrchestrationFixture {
+        fn set_orchestration_setting(
+            &mut self,
+            update: impl FnOnce(&mut settings::OrchestrationSettingsContent),
+        ) {
+            self.cx.update(|_window, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        update(
+                            settings
+                                .agent
+                                .get_or_insert_default()
+                                .orchestration
+                                .get_or_insert_default(),
+                        );
+                    });
+                });
+            });
+        }
+
+        fn cancel_calls_include(&mut self, session_id: &acp_v2::SessionId) -> bool {
+            self.connection.take_cancel_calls().contains(session_id)
+        }
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_start_child_stops_at_the_concurrency_cap(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture.set_orchestration_setting(|orchestration| {
+            orchestration.max_concurrent_children = Some(1);
+        });
+        // With no scripted updates the first turn stays open: the child runs.
+        let first = fixture
+            .start_child(start_child_input("First", "task"))
+            .await;
+        assert_eq!(fixture.child_record(first).0, ChildStatus::Running);
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.start_child(
+                fixture.orchestrator,
+                start_child_input("Second", "task"),
+                cx,
+            )
+        });
+        let error = task.await.unwrap_err().to_string();
+        assert!(error.contains("1 of 1"), "{error}");
+        assert!(error.contains("max_concurrent_children"), "{error}");
+        let started = fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx)
+                .read(cx)
+                .children(fixture.orchestrator)
+                .len()
+        });
+        assert_eq!(started, 1, "the refused child was not created");
+
+        // A cancelled child frees its slot.
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.cancel_child(
+                fixture.orchestrator,
+                orchestration::CancelChildInput {
+                    child_id: first.to_key_string(),
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        let second = fixture
+            .start_child(start_child_input("Second", "task"))
+            .await;
+        assert_eq!(fixture.child_record(second).0, ChildStatus::Running);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_cancelling_the_orchestrator_turn_keeps_children_running(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "long task"))
+            .await;
+        let child_session = fixture.child_session_id(child);
+        let orchestrator = fixture.orchestrator;
+
+        fixture.panel.update(&mut fixture.cx, |panel, cx| {
+            panel
+                .conversation_view_for_id(&orchestrator, cx)
+                .unwrap()
+                .clone()
+                .update(cx, |view, cx| view.cancel_generation(cx));
+        });
+        fixture.cx.run_until_parked();
+
+        assert!(!fixture.cancel_calls_include(&child_session));
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Running);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_removing_the_orchestrator_cancels_its_running_children(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let running = fixture
+            .start_child(start_child_input("Running", "long task"))
+            .await;
+        let running_session = fixture.child_session_id(running);
+        let orchestrator = fixture.orchestrator;
+        let session = fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            panel
+                .conversation_view_for_id(&orchestrator, cx)
+                .and_then(|view| view.read(cx).root_thread(cx))
+                .map(|thread| thread.read(cx).session_id().0.to_string())
+                .unwrap()
+        });
+        let token = fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx)
+                .update(cx, |registry, _| registry.token_for_session(&session))
+        });
+
+        fixture
+            .panel
+            .update_in(&mut fixture.cx, |panel, window, cx| {
+                panel.remove_thread(orchestrator, window, cx);
+            });
+        fixture.cx.run_until_parked();
+
+        assert!(fixture.cancel_calls_include(&running_session));
+        // The session's token no longer opens the orchestration tools.
+        fixture.cx.update(|_window, cx| {
+            let registry = orchestration::OrchestrationRegistry::global(cx);
+            assert!(!registry.read(cx).is_session_token_live(&token));
+            assert!(registry.read(cx).resolve_caller(&token, cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_archiving_the_orchestrator_cancels_its_running_children(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let running = fixture
+            .start_child(start_child_input("Running", "long task"))
+            .await;
+        let running_session = fixture.child_session_id(running);
+        let orchestrator = fixture.orchestrator;
+
+        fixture.cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.archive(orchestrator, None, cx);
+            });
+        });
+        fixture.cx.run_until_parked();
+
+        assert!(fixture.cancel_calls_include(&running_session));
+        assert_eq!(fixture.child_record(running).0, ChildStatus::Cancelled);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_cancel_child_cancels_the_children_of_a_child_that_orchestrates(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let middle = fixture
+            .start_child(start_child_input("Middle", "long task"))
+            .await;
+        let bystander = fixture
+            .start_child(start_child_input("Bystander", "long task"))
+            .await;
+        // The middle child orchestrates a child of its own.
+        let task = fixture.cx.update(|_window, cx| {
+            fixture
+                .host
+                .start_child(middle, start_child_input("Grandchild", "task"), cx)
+        });
+        let grandchild = ThreadId::from_key_string(&task.await.unwrap().child_id).unwrap();
+        fixture.cx.run_until_parked();
+        let grandchild_session = fixture.child_session_id(grandchild);
+        let bystander_session = fixture.child_session_id(bystander);
+        let record = |fixture: &mut OrchestrationFixture, parent, child| {
+            fixture.cx.update(|_window, cx| {
+                orchestration::OrchestrationRegistry::global(cx)
+                    .read(cx)
+                    .child(parent, child)
+                    .map(|record| record.status)
+            })
+        };
+        assert_eq!(
+            record(&mut fixture, middle, grandchild),
+            Some(ChildStatus::Running)
+        );
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.cancel_child(
+                fixture.orchestrator,
+                orchestration::CancelChildInput {
+                    child_id: middle.to_key_string(),
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        fixture.cx.run_until_parked();
+
+        assert!(fixture.cancel_calls_include(&grandchild_session));
+        assert_eq!(
+            record(&mut fixture, middle, grandchild),
+            Some(ChildStatus::Cancelled)
+        );
+        assert_eq!(fixture.child_record(middle).0, ChildStatus::Cancelled);
+        // A sibling of the cancelled child is not part of the cascade.
+        assert_eq!(fixture.child_record(bystander).0, ChildStatus::Running);
+        assert!(!fixture.cancel_calls_include(&bystander_session));
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_sibling_message_reaches_an_idle_sibling_and_never_interrupts(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let first = fixture
+            .start_child(start_child_input("Api", "api task"))
+            .await;
+        let second = fixture
+            .start_child(start_child_input("Tests", "tests task"))
+            .await;
+        let second_session = fixture.child_session_id(second);
+        assert_eq!(fixture.user_messages(second).len(), 1);
+
+        // `second` is mid-turn: the message waits, and the turn is not touched.
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_sibling(
+                first,
+                orchestration::SendToSiblingInput {
+                    child_id: second.to_key_string(),
+                    message: "which file are you on?".to_string(),
+                    await_reply: false,
+                    timeout_secs: None,
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        fixture.cx.run_until_parked();
+        assert_eq!(fixture.user_messages(second).len(), 1);
+        assert!(!fixture.cancel_calls_include(&second_session));
+
+        // When its turn ends, the message arrives as a new user message.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("reply to sibling".into()),
+            )]);
+        fixture
+            .connection
+            .end_turn(second_session.clone(), acp::StopReason::EndTurn);
+        fixture.cx.run_until_parked();
+        let messages = fixture.user_messages(second);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[1].starts_with("[from sibling Api] which file are you on?"),
+            "{}",
+            messages[1]
+        );
+
+        // The orchestrator's context got nothing, and the logs have the exchange.
+        assert_eq!(fixture.user_messages(fixture.orchestrator).len(), 0);
+        let log_dir = fixture.log_dir.path().to_path_buf();
+        let orchestrator = fixture.orchestrator;
+        let directions = |child| {
+            orchestration::ChildLog::new(&log_dir, orchestrator, child)
+                .read()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.direction)
+                .collect::<Vec<_>>()
+        };
+        assert!(directions(first).contains(&LogDirection::ToSibling));
+        assert!(directions(second).contains(&LogDirection::FromSibling));
+        let statuses = fixture
+            .cx
+            .update(|_window, cx| {
+                fixture.host.child_status(
+                    fixture.orchestrator,
+                    orchestration::ChildStatusInput::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .children;
+        assert!(statuses.iter().all(|info| info.sibling_messages == 1));
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_registry_is_rebuilt_and_an_unloaded_child_is_opened_by_send_to_child(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration_with_connection(
+            cx,
+            StubAgentConnection::new().with_supports_load_session(true),
+        )
+        .await;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("first result".into()),
+            )]);
+        let child = fixture
+            .start_child(start_child_input("Worker", "first task"))
+            .await;
+        assert_eq!(
+            fixture.child_record(child).1.as_deref(),
+            Some("first result")
+        );
+
+        // Simulate a restart: the child is no longer loaded, and the registry
+        // is empty.
+        let orchestrator = fixture.orchestrator;
+        fixture.panel.update(&mut fixture.cx, |panel, _cx| {
+            panel.remove_retained_thread(&child);
+        });
+        fixture.cx.run_until_parked();
+        fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx).update(cx, |registry, cx| {
+                registry.remove_orchestrator(orchestrator, cx)
+            });
+            assert!(
+                orchestration::OrchestrationRegistry::global(cx)
+                    .read(cx)
+                    .children(orchestrator)
+                    .is_empty()
+            );
+            crate::orchestration_host::restore_saved_children(cx);
+        });
+
+        // The skeleton comes back from the thread metadata and the child's log.
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("first result"));
+        assert_eq!(turns, 1);
+        let statuses = fixture
+            .cx
+            .update(|_window, cx| {
+                fixture.host.child_status(
+                    fixture.orchestrator,
+                    orchestration::ChildStatusInput::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .children;
+        assert_eq!(statuses.len(), 1);
+        // The title is the one the sidebar shows, from the saved metadata.
+        assert!(!statuses[0].title.is_empty());
+        let awaited = fixture
+            .cx
+            .update(|_window, cx| {
+                fixture.host.await_children(
+                    fixture.orchestrator,
+                    orchestration::AwaitChildrenInput {
+                        child_ids: vec![child.to_key_string()],
+                        timeout_secs: Some(5),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            awaited.children[0].final_message.as_deref(),
+            Some("first result")
+        );
+
+        // `send_to_child` opens the unloaded child, parks the message while its
+        // agent connects, and delivers it once the thread exists.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("second result".into()),
+            )]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "second task".to_string(),
+                },
+                cx,
+            )
+        });
+        let output = task
+            .await
+            .expect("an unloaded child is opened, not refused");
+        assert!(output.queued, "the child's agent was still connecting");
+        fixture.cx.run_until_parked();
+        let messages = fixture.user_messages(child);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("second task")),
+            "{messages:?}"
+        );
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("second result"));
+        assert_eq!(turns, 2);
     }
 
     #[gpui::test]

@@ -16,13 +16,15 @@ use serde::{Deserialize, Serialize};
 use crate::ToolInput;
 
 /// Names of the tools that exist only while orchestration is available.
-pub const ORCHESTRATION_TOOL_NAMES: [&str; 7] = [
+pub const ORCHESTRATION_TOOL_NAMES: [&str; 9] = [
     "start_child",
     "await_children",
     "child_status",
     "send_to_child",
     "cancel_child",
     "send_to_parent",
+    "list_siblings",
+    "send_to_sibling",
     "whoami",
 ];
 
@@ -77,13 +79,17 @@ pub fn orchestration_available(session_id: &str, cx: &App) -> bool {
 }
 
 /// Whether the calling session can use `tool_name`, one of
-/// [`ORCHESTRATION_TOOL_NAMES`], right now. `send_to_parent` also needs the
-/// thread to have been started by an orchestrator.
+/// [`ORCHESTRATION_TOOL_NAMES`], right now. `send_to_parent`, `list_siblings`
+/// and `send_to_sibling` also need the thread to have been started by an
+/// orchestrator.
 pub fn orchestration_tool_available(tool_name: &str, session_id: &str, cx: &App) -> bool {
     let Ok((thread, _)) = resolve_orchestrator(session_id, cx) else {
         return false;
     };
-    if tool_name != "send_to_parent" {
+    if !matches!(
+        tool_name,
+        "send_to_parent" | "list_siblings" | "send_to_sibling"
+    ) {
         return true;
     }
     OrchestrationRegistry::try_global(cx)
@@ -120,8 +126,9 @@ where
 mod tests {
     use super::*;
     use crate::{
-        AgentTool, AwaitChildrenTool, CancelChildTool, ChildStatusTool, SendToChildTool,
-        SendToParentTool, StartChildTool, ToolCallEventStream, WhoAmITool,
+        AgentTool, AwaitChildrenTool, CancelChildTool, ChildStatusTool, ListSiblingsTool,
+        SendToChildTool, SendToParentTool, SendToSiblingTool, StartChildTool, ToolCallEventStream,
+        WhoAmITool,
     };
     use gpui::TestAppContext;
     use orchestration::{
@@ -223,6 +230,39 @@ mod tests {
                 parent_id: "parent-1".into(),
                 parent_title: "Parent".into(),
                 urgent: input.urgent,
+            }))
+        }
+
+        fn list_siblings(
+            &self,
+            caller: ThreadId,
+            _cx: &mut App,
+        ) -> Result<orchestration::ListSiblingsOutput> {
+            self.record("list_siblings", caller);
+            Ok(orchestration::ListSiblingsOutput {
+                siblings: vec![orchestration::SiblingInfo {
+                    child_id: "sibling-1".into(),
+                    title: "Sibling".into(),
+                    agent: "zed".into(),
+                    model: None,
+                    status: ChildStatus::Running,
+                }],
+            })
+        }
+
+        fn send_to_sibling(
+            &self,
+            caller: ThreadId,
+            input: orchestration::SendToSiblingInput,
+            _cx: &mut App,
+        ) -> Task<Result<orchestration::SendToSiblingOutput>> {
+            self.record("send_to_sibling", caller);
+            Task::ready(Ok(orchestration::SendToSiblingOutput {
+                child_id: input.child_id,
+                title: "Sibling".into(),
+                reply: input.await_reply.then(|| "the answer".to_string()),
+                timed_out: false,
+                messages_left: 19,
             }))
         }
 
@@ -418,6 +458,47 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_sibling_tools_call_the_host_for_the_calling_thread(cx: &mut TestAppContext) {
+        let host = register_host(cx);
+
+        let listed = run_tool(
+            ListSiblingsTool::new(SESSION.into()),
+            orchestration::ListSiblingsInput {},
+            cx,
+        )
+        .await
+        .ok()
+        .unwrap();
+        let OrchestrationToolOutput::Success(listed) = listed else {
+            panic!("expected success");
+        };
+        assert_eq!(listed.siblings[0].child_id, "sibling-1");
+
+        let sent = run_tool(
+            SendToSiblingTool::new(SESSION.into()),
+            orchestration::SendToSiblingInput {
+                child_id: "sibling-1".into(),
+                message: "which file?".into(),
+                await_reply: true,
+                timeout_secs: None,
+            },
+            cx,
+        )
+        .await
+        .ok()
+        .unwrap();
+        let OrchestrationToolOutput::Success(sent) = sent else {
+            panic!("expected success");
+        };
+        assert_eq!(sent.reply.as_deref(), Some("the answer"));
+
+        let calls = host.calls.borrow();
+        let names: Vec<_> = calls.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["list_siblings", "send_to_sibling"]);
+        assert!(calls.iter().all(|(_, thread)| *thread == host.orchestrator));
+    }
+
+    #[gpui::test]
     async fn test_host_errors_reach_the_model(cx: &mut TestAppContext) {
         register_host(cx);
         let result = run_tool(
@@ -472,6 +553,8 @@ mod tests {
             SendToChildTool::NAME,
             CancelChildTool::NAME,
             SendToParentTool::NAME,
+            ListSiblingsTool::NAME,
+            SendToSiblingTool::NAME,
             WhoAmITool::NAME,
         ];
         assert_eq!(names, ORCHESTRATION_TOOL_NAMES);

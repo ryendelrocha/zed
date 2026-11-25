@@ -260,6 +260,8 @@ pub struct OrchestrationSettings {
     pub subthreads_visible: usize,
     pub enabled: bool,
     pub human_summary_max_chars: usize,
+    pub max_concurrent_children: usize,
+    pub max_sibling_messages: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -795,6 +797,8 @@ impl Settings for AgentSettings {
                 subthreads_visible: orchestration.subthreads_visible.unwrap(),
                 enabled: orchestration.enabled.unwrap(),
                 human_summary_max_chars: orchestration.human_summary_max_chars.unwrap(),
+                max_concurrent_children: orchestration.max_concurrent_children.unwrap(),
+                max_sibling_messages: orchestration.max_sibling_messages.unwrap(),
             },
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),

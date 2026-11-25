@@ -10,7 +10,9 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 const DESCRIPTION: &str = "\
 Cancel the current turn of a child thread you started.
 
-Use it when a child is going in the wrong direction, is no longer needed, or its work is made obsolete by another child. The child is left in `cancelled` status; you can still send it a new message with `send_to_child`. Cancelling a child that is not running has no effect.";
+Use it when a child is going in the wrong direction, is no longer needed, or its work is made obsolete by another child. The child is left in `cancelled` status; you can still send it a new message with `send_to_child`. Cancelling a child that is not running has no effect on that child.
+
+If the child is itself an orchestrator, cancelling it also cancels the turns of its own running children, and theirs in turn. Cancelling a thread's own turn never cancels its children: they run in parallel by design. Children are cancelled when their orchestrator's thread is closed, archived or deleted.";
 
 pub struct CancelChildTool {
     session_id: String,

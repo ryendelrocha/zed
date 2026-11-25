@@ -10,7 +10,7 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 const DESCRIPTION: &str = "\
 Report where child threads are, without any of their content.
 
-Returns, for each child, its title, agent, model, status (`starting`, `running`, `waiting_for_confirmation`, `completed`, `failed` or `cancelled`), the number of completed turns and the time of the last activity. It never returns the child's messages.
+Returns, for each child, its title, agent, model, status (`starting`, `running`, `waiting_for_confirmation`, `completed`, `failed` or `cancelled`), the number of completed turns, the time of the last activity and `sibling_messages` (how many messages the child exchanged with its siblings; their content is not shown to you and stays in the child's log). It never returns the child's messages.
 
 Also check these two fields, each returned once:
 - `pending_messages`: what the child told you with `send_to_parent` (a blocker, a question). Answer with `send_to_child`.

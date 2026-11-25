@@ -640,6 +640,8 @@ mod tests {
                 subthreads_visible: 5,
                 enabled: true,
                 human_summary_max_chars: 600,
+                max_concurrent_children: 6,
+                max_sibling_messages: 20,
             },
             thinking_display: Default::default(),
         }

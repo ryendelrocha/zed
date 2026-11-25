@@ -24,6 +24,11 @@ pub enum LogDirection {
     /// The summary of what a human did in the child. The human's own
     /// messages are never logged.
     HumanIntervention,
+    /// From this child to a sibling, through `send_to_sibling`. The entry's
+    /// `sibling` is the receiver.
+    ToSibling,
+    /// From a sibling to this child. The entry's `sibling` is the sender.
+    FromSibling,
 }
 
 /// One line of a child's log file.
@@ -33,6 +38,10 @@ pub struct ChildLogEntry {
     pub direction: LogDirection,
     pub text: String,
     pub status: ChildStatus,
+    /// The other child of a sibling exchange (`to_sibling` or
+    /// `from_sibling`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sibling: Option<String>,
 }
 
 /// Directory used when `agent.orchestration.log_dir` is not set.
@@ -74,11 +83,33 @@ impl ChildLog {
     }
 
     pub fn append(&self, direction: LogDirection, text: &str, status: ChildStatus) -> Result<()> {
+        self.append_entry(direction, text, status, None)
+    }
+
+    /// Appends a sibling exchange. `sibling` is the id of the other child.
+    pub fn append_sibling(
+        &self,
+        direction: LogDirection,
+        text: &str,
+        status: ChildStatus,
+        sibling: ThreadId,
+    ) -> Result<()> {
+        self.append_entry(direction, text, status, Some(sibling.to_key_string()))
+    }
+
+    fn append_entry(
+        &self,
+        direction: LogDirection,
+        text: &str,
+        status: ChildStatus,
+        sibling: Option<String>,
+    ) -> Result<()> {
         let entry = ChildLogEntry {
             ts: Utc::now(),
             direction,
             text: text.to_string(),
             status,
+            sibling,
         };
         let parent = self
             .path
@@ -158,5 +189,29 @@ mod tests {
         assert_eq!(entries[0].text, "do it");
         assert_eq!(entries[1].direction, LogDirection::FromChild);
         assert_eq!(entries[1].status, ChildStatus::Completed);
+        assert_eq!(entries[1].sibling, None);
+        assert!(!raw.contains("sibling"));
+    }
+
+    #[test]
+    fn test_sibling_entries_carry_the_other_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = ChildLog::new(directory.path(), ThreadId::new(), ThreadId::new());
+        let other = ThreadId::new();
+        log.append_sibling(
+            LogDirection::ToSibling,
+            "which file?",
+            ChildStatus::Running,
+            other,
+        )
+        .unwrap();
+        let entries = log.read().unwrap();
+        assert_eq!(entries[0].direction, LogDirection::ToSibling);
+        assert_eq!(entries[0].sibling, Some(other.to_key_string()));
+        assert!(
+            fs::read_to_string(log.path())
+                .unwrap()
+                .contains("\"direction\":\"to_sibling\"")
+        );
     }
 }

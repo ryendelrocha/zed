@@ -1434,6 +1434,8 @@ mod tests {
             "send_to_child",
             "cancel_child",
             "send_to_parent",
+            "list_siblings",
+            "send_to_sibling",
             "whoami",
         ];
 

@@ -205,7 +205,8 @@ pub struct OrchestrationSettingsContent {
     /// Default: 5
     pub subthreads_visible: Option<usize>,
     /// Whether the orchestration tools (`start_child`, `await_children`,
-    /// `child_status`, `send_to_child`, `cancel_child`) are exposed to agents.
+    /// `child_status`, `send_to_child`, `cancel_child`, `send_to_parent`,
+    /// `list_siblings`, `send_to_sibling`, `whoami`) are exposed to agents.
     ///
     /// Default: true
     pub enabled: Option<bool>,
@@ -215,6 +216,17 @@ pub struct OrchestrationSettingsContent {
     ///
     /// Default: 600
     pub human_summary_max_chars: Option<usize>,
+    /// Maximum number of child threads that may be running at the same time,
+    /// across every orchestrator in the app. `start_child` fails with an error
+    /// that reports the count when the cap is reached.
+    ///
+    /// Default: 6
+    pub max_concurrent_children: Option<usize>,
+    /// Maximum number of messages two sibling children may exchange with
+    /// `send_to_sibling`, counting both directions. It prevents message loops.
+    ///
+    /// Default: 20
+    pub max_sibling_messages: Option<usize>,
     /// Directory where the per-child exchange logs (JSONL) are written, as
     /// `<log_dir>/<orchestrator-id>/<child-id>.jsonl`. When unset, a
     /// `zed-orchestration` folder in the system temporary directory is used.
@@ -696,12 +708,14 @@ fn agent_profile_tools_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sc
         "grep",
         "list_agents_and_models",
         "list_directory",
+        "list_siblings",
         "move_path",
         "read_file",
         "rename_symbol",
         "search_web",
         "send_to_child",
         "send_to_parent",
+        "send_to_sibling",
         "skill",
         "spawn_agent",
         "start_child",

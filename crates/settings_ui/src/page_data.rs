@@ -9102,7 +9102,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 13] {
+    fn general_section() -> [SettingsPageItem; 15] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9297,6 +9297,60 @@ fn ai_page(cx: &App) -> SettingsPage {
                             .orchestration
                             .get_or_insert_default()
                             .human_summary_max_chars = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Maximum Concurrent Child Threads",
+                description: "Maximum number of child threads running at the same time, across every orchestrator. start_child fails when the cap is reached.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.max_concurrent_children"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .max_concurrent_children
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .max_concurrent_children = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Maximum Sibling Messages",
+                description: "Maximum number of messages two sibling child threads may exchange with each other, in both directions.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.max_sibling_messages"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .max_sibling_messages
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .max_sibling_messages = value;
                     },
                 }),
                 metadata: None,

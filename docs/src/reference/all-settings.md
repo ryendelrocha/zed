@@ -309,6 +309,54 @@ Open the Settings Editor and search for “Human Intervention Summary Length”.
 }
 ```
 
+### Maximum Concurrent Child Threads {#agent-orchestration-max-concurrent-children}
+
+- Description: Maximum number of child threads that may be running at the same time, across every orchestrator in the app.
+- Setting: `agent.orchestration.max_concurrent_children`
+- Default: `6`
+
+**Options**
+
+A positive integer.
+
+A child counts as running from the moment it starts until its turn finishes, fails or is cancelled. When the cap is reached, `start_child` fails with an error that states how many children are running, and the orchestrator can wait for one with `await_children` and try again.
+
+Open the Settings Editor and search for “Maximum Concurrent Child Threads”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "max_concurrent_children": 3
+    }
+  }
+}
+```
+
+### Maximum Sibling Messages {#agent-orchestration-max-sibling-messages}
+
+- Description: Maximum number of messages two sibling child threads may exchange with `send_to_sibling`, counting both directions.
+- Setting: `agent.orchestration.max_sibling_messages`
+- Default: `20`
+
+**Options**
+
+A positive integer.
+
+Once a pair of siblings reaches the cap, `send_to_sibling` between them fails with an error. The orchestrator is not told the content of sibling messages, only how many exchanges each child had (`sibling_messages` in `child_status`). The content is in the per-child logs.
+
+Open the Settings Editor and search for “Maximum Sibling Messages”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "max_sibling_messages": 10
+    }
+  }
+}
+```
+
 ### Orchestration Log Directory {#agent-orchestration-log-dir}
 
 - Description: Directory where Zed writes one JSONL log per child thread, with only the exchanges between the orchestrator and the child.

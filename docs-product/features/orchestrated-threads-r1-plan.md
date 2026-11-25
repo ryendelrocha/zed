@@ -44,6 +44,7 @@
 5. **MCP server and bridge (D-R1).** `McpServerTool` adapters over the same core, with the server started lazily. Add the hidden bridge mode in `crates/zed/src/main.rs`. `agent_servers` asks the registry for the `acp::McpServer` entry to inject.
 6. **Sidebar.** While `show_as_subthreads` is on, metadata threads that have `parent_thread_id` leave the top level and render under their parent as indented thread rows. They reuse `collapsed_subthread_groups`, `fully_loaded_subthread_groups`, `subthreads_visible` and the recency order, and they open like any thread. The existing live-subagent path stays.
 7. **Restart.** Rebuild the registry skeleton from metadata. After a restart, `await_children` returns the persisted last message when there is one.
+   - Done: an observer on the thread metadata store adds a record for every unarchived thread with a parent link that no panel holds (`restore_child`). The status is `completed` unless the child's R4 log says `failed` or `cancelled`, or ends with a message nobody answered (then `failed`, with a note that Zed restarted). The last final message, the turn count and the sibling counters come from the log, so after a reboot that clears `$TMPDIR` the child has no final message. `send_to_child` to an unloaded child opens it in the orchestrator's panel without activating it, and parks the message until its agent connects. Limit: a child in another workspace's panel (`worktree: new`) that is already open there is not reachable from this one.
 8. **Spec.** Update R1 in `orchestrated-threads.md` with D-R1.
 
 ## Risks

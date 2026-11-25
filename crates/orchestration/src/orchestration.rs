@@ -279,6 +279,10 @@ pub struct ChildStatusInfo {
     pub turns: u32,
     /// RFC 3339 time of the last exchange or status change.
     pub last_activity: String,
+    /// How many messages the child sent to or received from its siblings.
+    /// Only the count: the content stays in the child's log.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sibling_messages: u32,
     /// Messages the child sent with `send_to_parent` that you have not seen
     /// yet. Each is returned once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -306,6 +310,68 @@ pub struct SendToChildInput {
 pub struct SendToChildOutput {
     /// True when the child was busy and the message was queued.
     pub queued: bool,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Lists the other children of the orchestrator that started this thread.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ListSiblingsInput {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SiblingInfo {
+    /// Value for the `child_id` field of `send_to_sibling`.
+    pub child_id: String,
+    pub title: String,
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub status: ChildStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListSiblingsOutput {
+    pub siblings: Vec<SiblingInfo>,
+}
+
+/// Sends a message to a sibling: another child of the orchestrator that
+/// started this thread. The orchestrator does not see it.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendToSiblingInput {
+    /// The sibling, as listed by `list_siblings`.
+    pub child_id: String,
+    /// What the sibling needs to know or answer. Be specific and
+    /// self-contained: the sibling does not see your conversation.
+    pub message: String,
+    /// Wait for the sibling's reply. The reply is the next `send_to_sibling`
+    /// the sibling sends to you, so the sibling must answer with that tool and
+    /// not in its own chat. Defaults to false: you get an acknowledgement and
+    /// the reply, if any, arrives later as a new message in your thread.
+    #[serde(default)]
+    pub await_reply: bool,
+    /// How long to wait for the reply, in seconds, when `await_reply` is set.
+    /// Defaults to 120.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendToSiblingOutput {
+    pub child_id: String,
+    pub title: String,
+    /// The sibling's reply, when `await_reply` was set and it answered in
+    /// time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    /// True when `await_reply` was set and no reply arrived before the
+    /// timeout. The message was still delivered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+    /// How many more messages you and this sibling can exchange before the
+    /// `agent.orchestration.max_sibling_messages` cap.
+    pub messages_left: u32,
 }
 
 /// Sends a message to the orchestrator that started this thread.
@@ -395,8 +461,36 @@ pub fn child_header(orchestrator_title: &str) -> String {
          not need to send it. If you need to reach the orchestrator during the task (a blocker, a \
          question, a decision), use the `send_to_parent` tool. Do not write it in your own chat: the \
          orchestrator cannot read your chat. Use `whoami` to see your role, your orchestrator and \
-         your own children.\n\n---\n\n"
+         your own children. Other children of the same orchestrator may be working at the same \
+         time: `list_siblings` shows them, and `send_to_sibling` asks one a quick question \
+         directly, without going through the orchestrator.\n\n---\n\n"
     )
+}
+
+/// Prefix of a message that `send_to_sibling` adds to the receiving child's
+/// thread.
+pub fn sibling_message_prefix(sibling_title: &str) -> String {
+    format!("[from sibling {sibling_title}]")
+}
+
+/// The text a receiving child gets for one sibling message: the prefix, the
+/// message, and how to answer.
+pub fn sibling_message_text(
+    sibling_title: &str,
+    sibling_id: &str,
+    message: &str,
+    awaiting_reply: bool,
+) -> String {
+    let prefix = sibling_message_prefix(sibling_title);
+    let how_to_reply = if awaiting_reply {
+        format!(
+            "{sibling_title} is waiting for your reply. Answer with `send_to_sibling` \
+             (child_id {sibling_id}), not in your own chat."
+        )
+    } else {
+        format!("To answer, use `send_to_sibling` (child_id {sibling_id}).")
+    };
+    format!("{prefix} {message}\n\n({how_to_reply})")
 }
 
 /// Prefix of a message that `send_to_parent` adds to the orchestrator's thread.
@@ -535,6 +629,15 @@ pub struct AvailableModel {
 /// the tool timeout of common MCP clients.
 pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 120;
 
+/// Default for [`SendToSiblingInput::timeout_secs`].
+pub const DEFAULT_SIBLING_REPLY_TIMEOUT_SECS: u64 = 120;
+
+/// Default of `agent.orchestration.max_sibling_messages`.
+pub const DEFAULT_MAX_SIBLING_MESSAGES: usize = 20;
+
+/// Default of `agent.orchestration.max_concurrent_children`.
+pub const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 6;
+
 /// Upper bound applied to [`AwaitChildrenInput::timeout_secs`].
 pub const MAX_AWAIT_TIMEOUT_SECS: u64 = 3600;
 
@@ -608,6 +711,40 @@ pub trait OrchestrationHost {
         _cx: &mut App,
     ) -> Task<Result<Option<String>>> {
         Task::ready(Ok(None))
+    }
+
+    /// Cancels the running turn of `thread`, if this host holds a handle to
+    /// it and it is running. Returns the thread's last assistant message when
+    /// it did. The cancellation cascade uses it to stop descendants without
+    /// going through the orchestrator's `cancel_child`.
+    fn cancel_thread_turn(&self, _thread: ThreadId, _cx: &mut App) -> Option<Option<String>> {
+        None
+    }
+
+    /// Opens a child that is not loaded (after a restart) so it can receive
+    /// messages. Does not wait for its agent to connect.
+    fn load_child(
+        &self,
+        _orchestrator: ThreadId,
+        _child: ThreadId,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!("This host cannot open child threads.")))
+    }
+
+    fn list_siblings(&self, caller: ThreadId, cx: &mut App) -> Result<ListSiblingsOutput> {
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        registry.read(cx).list_siblings(caller)
+    }
+
+    fn send_to_sibling(
+        &self,
+        caller: ThreadId,
+        input: SendToSiblingInput,
+        cx: &mut App,
+    ) -> Task<Result<SendToSiblingOutput>> {
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        OrchestrationRegistry::send_to_sibling(&registry, caller, input, cx)
     }
 
     fn child_status(

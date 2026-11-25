@@ -40,9 +40,10 @@ use util::ResultExt as _;
 
 use crate::{
     AvailableAgents, AwaitChildrenInput, AwaitChildrenOutput, BRIDGE_TOKEN_ENV, CancelChildInput,
-    CancelChildOutput, ChildStatusInput, ChildStatusOutput, OrchestrationHost,
-    OrchestrationRegistry, SendToChildInput, SendToChildOutput, SendToParentInput,
-    SendToParentOutput, StartChildInput, StartChildOutput, ThreadId, WhoAmIInput, WhoAmIOutput,
+    CancelChildOutput, ChildStatusInput, ChildStatusOutput, ListSiblingsInput, ListSiblingsOutput,
+    OrchestrationHost, OrchestrationRegistry, SendToChildInput, SendToChildOutput,
+    SendToParentInput, SendToParentOutput, SendToSiblingInput, SendToSiblingOutput,
+    StartChildInput, StartChildOutput, ThreadId, WhoAmIInput, WhoAmIOutput,
 };
 
 /// Name of the MCP server in the agent's session.
@@ -200,6 +201,8 @@ pub fn register_orchestration_tools(server: &mut McpServer) {
     server.add_tool(ListAgentsAndModelsTool);
     server.add_tool(SendToParentTool);
     server.add_tool(WhoAmITool);
+    server.add_tool(ListSiblingsTool);
+    server.add_tool(SendToSiblingTool);
 }
 
 /// Resolves the caller and runs `f` against its host.
@@ -391,6 +394,58 @@ impl McpServerTool for SendToParentTool {
     ) -> Result<ToolResponse<Self::Output>> {
         let output = with_host(caller, cx, |thread, host, cx| {
             host.send_to_parent(thread, input, cx)
+        })
+        .await?;
+        text_response(output)
+    }
+}
+
+#[derive(Clone)]
+pub struct ListSiblingsTool;
+
+impl McpServerTool for ListSiblingsTool {
+    type Input = ListSiblingsInput;
+    type Output = ListSiblingsOutput;
+    const NAME: &'static str = "list_siblings";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations(true, false)
+    }
+
+    async fn run(
+        &self,
+        _input: Self::Input,
+        caller: &McpCaller,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let output = with_host(caller, cx, |thread, host, cx| {
+            Task::ready(host.list_siblings(thread, cx))
+        })
+        .await?;
+        text_response(output)
+    }
+}
+
+#[derive(Clone)]
+pub struct SendToSiblingTool;
+
+impl McpServerTool for SendToSiblingTool {
+    type Input = SendToSiblingInput;
+    type Output = SendToSiblingOutput;
+    const NAME: &'static str = "send_to_sibling";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations(false, false)
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        caller: &McpCaller,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let output = with_host(caller, cx, |thread, host, cx| {
+            host.send_to_sibling(thread, input, cx)
         })
         .await?;
         text_response(output)
@@ -674,8 +729,10 @@ mod tests {
                 "cancel_child",
                 "child_status",
                 "list_agents_and_models",
+                "list_siblings",
                 "send_to_child",
                 "send_to_parent",
+                "send_to_sibling",
                 "start_child",
                 "whoami",
             ]
@@ -784,12 +841,41 @@ mod tests {
                 .contains("no orchestrator")
         );
 
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "list_siblings", "arguments": {}}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no siblings")
+        );
+
         // Once it has an orchestrator, the message goes through and is logged.
         let directory = tempfile::tempdir().unwrap();
         let child = setup.orchestrators[0].1;
+        let orchestrator = ThreadId::new();
+        let sibling = ThreadId::new();
         setup.registry.update(cx, |registry, cx| {
             registry.register_child(
-                ThreadId::new(),
+                orchestrator,
+                crate::NewChild {
+                    child_id: sibling,
+                    title: "sibling".into(),
+                    agent_id: "zed-agent".to_string(),
+                    model: None,
+                    log_dir: directory.path().to_path_buf(),
+                    prompt: "prompt".to_string(),
+                    orchestrator_title: "parent".to_string(),
+                },
+                cx,
+            );
+            registry.register_child(
+                orchestrator,
                 crate::NewChild {
                     child_id: child,
                     title: "child".into(),
@@ -814,6 +900,30 @@ mod tests {
             .request("tools/call", json!({"name": "whoami", "arguments": {}}))
             .await;
         assert_eq!(response["result"]["structuredContent"]["role"], "child");
+
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "list_siblings", "arguments": {}}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"]["siblings"][0]["child_id"],
+            sibling.to_key_string()
+        );
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "send_to_sibling", "arguments": {
+                    "child_id": sibling.to_key_string(),
+                    "message": "which file?",
+                }}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["title"], "sibling");
+        assert_eq!(response["result"]["structuredContent"]["messages_left"], 19);
     }
 
     #[gpui::test]

@@ -3,10 +3,10 @@ use crate::{
     CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool,
     DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
     FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
-    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SendToChildTool, SendToParentTool, SpawnAgentTool,
-    StartChildTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ToolPermissionDecision, WebSearchTool, WhoAmITool, WriteFileTool,
+    ListAgentsAndModelsTool, ListDirectoryTool, ListSiblingsTool, MovePathTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, SandboxedTerminalTool, SendToChildTool, SendToParentTool,
+    SendToSiblingTool, SpawnAgentTool, StartChildTool, SystemPromptTemplate, Template, Templates,
+    TerminalTool, ToolPermissionDecision, WebSearchTool, WhoAmITool, WriteFileTool,
     decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
@@ -2425,6 +2425,8 @@ impl Thread {
             self.add_tool(SendToChildTool::new(session_id.clone()));
             self.add_tool(CancelChildTool::new(session_id.clone()));
             self.add_tool(SendToParentTool::new(session_id.clone()));
+            self.add_tool(ListSiblingsTool::new(session_id.clone()));
+            self.add_tool(SendToSiblingTool::new(session_id.clone()));
             self.add_tool(WhoAmITool::new(session_id));
         }
     }
@@ -7777,8 +7779,9 @@ mod tests {
                 registry.register_host(Rc::new(SessionHost(session_id, thread_id)));
             });
         });
-        // Every orchestration tool except `send_to_parent`: nobody started
-        // this thread, so it has no orchestrator to write to.
+        // Every orchestration tool except `send_to_parent` and the sibling
+        // tools: nobody started this thread, so it has no orchestrator and no
+        // siblings.
         assert_eq!(orchestration_tools(cx), 6);
         let tool_names = cx.update(|cx| {
             thread
@@ -7790,8 +7793,11 @@ mod tests {
         });
         assert!(tool_names.contains(&"whoami".to_string()));
         assert!(!tool_names.contains(&"send_to_parent".to_string()));
+        assert!(!tool_names.contains(&"list_siblings".to_string()));
+        assert!(!tool_names.contains(&"send_to_sibling".to_string()));
 
-        // Once an orchestrator has started the thread, `send_to_parent` appears.
+        // Once an orchestrator has started the thread, `send_to_parent` and the
+        // sibling tools appear.
         let log_dir = std::env::temp_dir().join("zed-orchestration-tool-gating-test");
         cx.update(|cx| {
             orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, cx| {
@@ -7810,7 +7816,7 @@ mod tests {
                 );
             });
         });
-        assert_eq!(orchestration_tools(cx), 7);
+        assert_eq!(orchestration_tools(cx), 9);
         std::fs::remove_dir_all(&log_dir).ok();
 
         // Setting off again hides them even with a host.

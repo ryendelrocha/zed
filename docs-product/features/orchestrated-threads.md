@@ -74,13 +74,16 @@ A child can message a sibling (another child of the same orchestrator) without g
 | Tool | Input | Returns |
 | :-- | :-- | :-- |
 | `list_siblings` | none | `child_id`, title, agent and model, and status of each sibling |
-| `send_to_sibling` | `child_id`, `message`, `await_reply?` | Acknowledgement, or the sibling's reply when `await_reply` is set |
+| `send_to_sibling` | `child_id`, `message`, `await_reply?`, `timeout_secs?` | Acknowledgement, or the sibling's reply when `await_reply` is set |
 
 Rules:
-- Each sibling exchange is logged in the R4 files of **both** children, with `direction: from_sibling` or `to_sibling` and the other child's id.
-- The orchestrator does not receive sibling messages in its context. `child_status` reports a count of sibling exchanges, and the content stays in the logs.
-- `await_reply` has a timeout. It cannot be used if the sibling is itself waiting on the caller, which prevents deadlock.
-- `agent.orchestration.max_sibling_messages` caps the messages per pair of children, which prevents loops.
+- Both tools exist only for a thread that has an orchestrator. Siblings are the other children of the same orchestrator.
+- The message reuses the R15 inbox. The receiving sibling gets it as a new message in its thread, prefixed `[from sibling <title>]`, only when it is idle. It never interrupts a running turn; a busy sibling gets it when its turn ends. A sibling that is not loaded (after a restart) is opened first.
+- Each sibling exchange is logged in the R4 files of **both** children, with `direction: from_sibling` or `to_sibling` and the other child's id in `sibling`.
+- The orchestrator does not receive sibling messages in its context. `child_status` reports `sibling_messages`, a count per child, and the content stays in the logs.
+- `await_reply` waits for the sibling's **next `send_to_sibling` addressed to the caller**, up to `timeout_secs` (default 120). The delivered message tells the sibling to answer with that tool. That message is returned to the caller as the reply and is not also added to the caller's thread. On timeout the call returns `timed_out: true` (the message was still delivered). The alternative, taking the sibling's final message of its next turn, was rejected: a busy sibling would answer with the end of a turn that started before the question, and the final message already belongs to the orchestrator (R5).
+- Deadlock: `await_reply` fails with an error to the second waiter when the target already waits for the caller, directly or through a chain of siblings. Nothing is sent. The way out is a plain `send_to_sibling` (no `await_reply`), which is the reply that unblocks the first waiter.
+- `agent.orchestration.max_sibling_messages` (default 20) caps the messages per pair of children, in both directions, which prevents loops. After the cap the call fails with an error that points to `send_to_parent`.
 
 **Why (decision D1):** children working at the same time often need a quick fact from each other ("which file are you touching?", "what did the API return?"). Routing it through the orchestrator would spend its context and add a round trip. The logs and the counter keep the exchange auditable without the orchestrator reading it.
 
@@ -148,7 +151,7 @@ When the setting is off, children appear as ordinary top-level threads, which is
 | `agent.orchestration.enabled` | bool | `true` | Expose the orchestration tools (R1) |
 | `agent.orchestration.show_as_subthreads` | bool | `true` | Nest children under the orchestrator in the sidebar (R9) |
 | `agent.orchestration.subthreads_visible` | int | `5` | Children shown before "Load more" (R9) |
-| `agent.orchestration.max_concurrent_children` | int | `6` | Global cap on running children |
+| `agent.orchestration.max_concurrent_children` | int | `6` | Global cap on running children, across every orchestrator in the app. `start_child` beyond it fails with an error that states the count |
 | `agent.orchestration.max_sibling_messages` | int | `20` | Cap on messages per pair of children (R3b) |
 | `agent.orchestration.human_summary_max_chars` | int | `600` | Length cap of the human-intervention summary (R16) |
 | `agent.orchestration.log_dir` | path | `$TMPDIR/zed-orchestration` | Where the R4 logs go |
@@ -161,11 +164,15 @@ Orchestrated children are ordinary Zed threads, so they keep their message edito
 
 **Why (revised after testing):** the original V1 made children read-only to avoid turn-taking problems. In practice, steering a child directly is useful, and R16 gives the orchestrator what it needs to continue without reading the human's messages.
 
-### R12. Cancellation cascades
+### R12. Cancellation cascades (revised)
 
-Cancelling the orchestrator, or closing its thread, cancels all its running children. Cancelling a child cancels that child's own subagents.
+Cancelling the orchestrator's running turn does **not** cancel its children: they run in parallel by design, and the human often stops the orchestrator only to talk to it. Children are cancelled, deepest first, in these cases:
+- the orchestrator's thread is **closed, archived or deleted** (archive is how Zed closes a thread; delete is `remove_thread`);
+- `cancel_child` is called on a child that itself orchestrates: its running children are cancelled too, even when its own turn had already ended. Its siblings are not touched.
 
-**Why:** without it, background children keep spending tokens after their purpose is gone.
+Cancelling a child also cancels its own agent-owned subagents, through Zed's existing cancellation of the child's session (the native thread cancels its running subagents, and ACP agents that announce subagents get the cancel for them). Closing the window or workspace is not a trigger.
+
+**Why:** without it, background children keep spending tokens after their purpose is gone. Tying the cascade to the thread's life, and not to its turn, keeps the parallel work alive while the human steers the orchestrator.
 
 ## 5. Out of scope in V1
 
@@ -247,7 +254,7 @@ Agent profiles (`agent.profiles`, which already have a name, a tool set and a `d
 - **AC7.** The group is expanded when the orchestrator thread is first shown, and a group the user collapsed with the chevron stays collapsed across rebuilds and thread switches.
 - **AC8.** With `show_as_subthreads: false`, the children appear as top-level threads.
 - **AC9.** Two children with `worktree: new` run at the same time in separate worktrees, and one with `worktree: shared` runs in the orchestrator's worktree.
-- **AC10.** Cancelling the orchestrator stops every running child.
+- **AC10.** Cancelling the orchestrator's running turn leaves its children running. Closing, archiving or deleting the orchestrator thread stops every running child, and `cancel_child` on a child that orchestrates stops that child's running children.
 - **AC11.** A child thread opens in full view with no message editor.
 - **AC12.** Child A calls `send_to_sibling` to child B. The message appears in both children's logs, and the orchestrator's context receives nothing about it.
 - **AC13.** Two children that `await_reply` on each other get a deadlock error instead of hanging.

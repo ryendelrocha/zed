@@ -110,6 +110,7 @@ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis
 
 pub(crate) mod elicitation;
 mod message_queue;
+pub(crate) mod orchestrated_permissions;
 mod subagent_card;
 mod thread_search_bar;
 mod thread_view;
