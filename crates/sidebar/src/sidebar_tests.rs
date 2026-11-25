@@ -1481,7 +1481,10 @@ fn visible_entries_as_strings(
                             } else {
                                 ""
                             };
-                            format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
+                            let indent = if thread.nested { "    " } else { "  " };
+                            format!(
+                                "{indent}{title}{worktree}{live}{status_str}{notified}{selected}"
+                            )
                         }
                     }
                     ListEntry::Subthread(subthread) => {
@@ -2337,6 +2340,8 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            model: None,
+            nested: false,
         }))
     };
 
@@ -2430,6 +2435,8 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                model: None,
+                nested: false,
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -2458,6 +2465,8 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                model: None,
+                nested: false,
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -2486,6 +2495,8 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                model: None,
+                nested: false,
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -2515,6 +2526,8 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                model: None,
+                nested: false,
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -2544,6 +2557,8 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                model: None,
+                nested: false,
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {
@@ -18612,6 +18627,8 @@ fn test_select_visible_subthreads_orders_by_recency_and_limits() {
         last_message_at,
         icon: IconName::ZedAgent,
         icon_from_external_svg: None,
+        model: None,
+        thread_id: None,
     };
     let subthreads = vec![
         subthread("silent", None),
@@ -19133,4 +19150,480 @@ async fn test_replaying_a_subagent_history_does_not_reorder_its_siblings(cx: &mu
             "    Child 2",
         ]
     );
+}
+
+fn save_orchestration_thread_metadata(
+    session_id: &str,
+    title: &str,
+    parent: Option<ThreadId>,
+    updated_at: DateTime<Utc>,
+    interacted_at: Option<DateTime<Utc>>,
+    archived: bool,
+    project: &Entity<project::Project>,
+    cx: &mut TestAppContext,
+) -> ThreadId {
+    let thread_id = ThreadId::new();
+    cx.update(|cx| {
+        let metadata = ThreadMetadata {
+            parent_thread_id: parent,
+            thread_id,
+            session_id: Some(acp::SessionId::new(Arc::from(session_id))),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some(SharedString::from(title.to_string())),
+            title_override: None,
+            updated_at,
+            created_at: Some(updated_at),
+            interacted_at,
+            worktree_paths: project.read(cx).worktree_paths(cx),
+            archived,
+            remote_connection: None,
+        };
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+    });
+    cx.run_until_parked();
+    thread_id
+}
+
+fn minutes(n: i64) -> DateTime<Utc> {
+    chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap()
+        + chrono::Duration::minutes(n)
+}
+
+/// A parent thread with `count` metadata children "Kid 1".."Kid N", where
+/// Kid N spoke last. Nothing is loaded in the agent panel.
+fn save_parent_with_metadata_children(
+    project: &Entity<project::Project>,
+    count: i64,
+    cx: &mut TestAppContext,
+) -> (ThreadId, Vec<ThreadId>) {
+    let parent = save_orchestration_thread_metadata(
+        "orchestrator",
+        "Orchestrator",
+        None,
+        minutes(1000),
+        None,
+        false,
+        project,
+        cx,
+    );
+    let kids = (1..=count)
+        .map(|n| {
+            save_orchestration_thread_metadata(
+                &format!("kid-{n}"),
+                &format!("Kid {n}"),
+                Some(parent),
+                minutes(n),
+                None,
+                false,
+                project,
+                cx,
+            )
+        })
+        .collect();
+    (parent, kids)
+}
+
+#[gpui::test]
+async fn test_metadata_children_nest_under_parent_and_leave_top_level(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    // Built from the metadata alone, as after a restart: no conversation is
+    // loaded for the parent or the children.
+    save_orchestration_thread_metadata(
+        "other",
+        "Other",
+        None,
+        minutes(500),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    let (parent, _) = save_parent_with_metadata_children(&project, 3, cx);
+
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orchestrator",
+            "    Kid 3",
+            "    Kid 2",
+            "    Kid 1",
+            "  Other",
+        ]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.contents.subthread_counts.get(&parent), Some(&3));
+    });
+
+    // Collapsing hides the children, and the choice survives rebuilds.
+    sidebar.update(cx, |sidebar, cx| sidebar.toggle_subthreads(parent, cx));
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec!["v [my-project]", "  Orchestrator", "  Other"]
+    );
+}
+
+#[gpui::test]
+async fn test_metadata_children_respect_limit_load_more_and_message_order(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 2, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent, kids) = save_parent_with_metadata_children(&project, 4, cx);
+    // Kid 1 was interacted with most recently, but it did not speak last:
+    // opening or messaging a child never reorders the group.
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            let mut metadata = store.entry(kids[0]).cloned().unwrap();
+            metadata.interacted_at = Some(minutes(5000));
+            store.save(metadata, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orchestrator",
+            "    Kid 4",
+            "    Kid 3",
+            "    Load more",
+        ]
+    );
+
+    sidebar.update(cx, |sidebar, cx| sidebar.load_more_subthreads(parent, cx));
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orchestrator",
+            "    Kid 4",
+            "    Kid 3",
+            "    Kid 2",
+            "    Kid 1",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_metadata_children_are_ordinary_threads_when_setting_is_off(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(false, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    save_parent_with_metadata_children(&project, 2, cx);
+
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec!["v [my-project]", "  Orchestrator", "  Kid 2", "  Kid 1"]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.contents.subthread_counts.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_metadata_child_of_archived_parent_stays_top_level(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let archived_parent = save_orchestration_thread_metadata(
+        "archived-parent",
+        "Archived parent",
+        None,
+        minutes(10),
+        None,
+        true,
+        &project,
+        cx,
+    );
+    save_orchestration_thread_metadata(
+        "orphan",
+        "Orphan",
+        Some(archived_parent),
+        minutes(20),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    let live_parent = save_orchestration_thread_metadata(
+        "parent",
+        "Parent",
+        None,
+        minutes(30),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    let child = save_orchestration_thread_metadata(
+        "child",
+        "Child",
+        Some(live_parent),
+        minutes(25),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    // A child of a child is not nested: one level only.
+    save_orchestration_thread_metadata(
+        "grandchild",
+        "Grandchild",
+        Some(child),
+        minutes(24),
+        None,
+        false,
+        &project,
+        cx,
+    );
+
+    assert_eq!(
+        updated_entries(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Parent",
+            "    Child",
+            "  Grandchild",
+            "  Orphan",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_rename_metadata_child_from_sidebar(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (_, kids) = save_parent_with_metadata_children(&project, 1, cx);
+    updated_entries(&sidebar, cx);
+
+    let child_ix = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::Thread(t) if t.nested))
+            .expect("a nested child row")
+    });
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(child_ix)
+    });
+    cx.dispatch_action(RenameSelectedThread);
+    cx.run_until_parked();
+    enter_renamed_title(&sidebar, RenameTarget::Thread(kids[0]), "Renamed kid", cx);
+
+    let metadata = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(kids[0])
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(metadata.title_override.as_deref(), Some("Renamed kid"));
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orchestrator",
+            "    Renamed kid  <== selected"
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_rename_live_subagent_from_sidebar(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (parent_thread_id, _, _) = setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    let child_ix = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::Subthread(_)))
+            .expect("a live subagent row")
+    });
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(child_ix)
+    });
+    cx.dispatch_action(RenameSelectedThread);
+    cx.run_until_parked();
+    enter_renamed_title(
+        &sidebar,
+        RenameTarget::Subthread(parent_thread_id, acp::SessionId::new("child-1")),
+        "Renamed subagent",
+        cx,
+    );
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Renamed subagent  <== selected"
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_live_subagent_row_shows_its_model(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    setup_parent_with_subagents(&project, &panel, 1, cx).await;
+    sidebar.read_with(cx, |sidebar, _| {
+        let info = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subthread(subthread) => Some(subthread.info.clone()),
+                _ => None,
+            })
+            .expect("a live subagent row");
+        assert_eq!(info.model.as_deref(), Some("Visual Test Model"));
+    });
+}
+
+#[gpui::test]
+async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let entry = |id: ThreadId,
+                 parent: Option<ThreadId>,
+                 icon: IconName,
+                 svg: Option<&str>,
+                 model: Option<ThreadModel>| {
+        Arc::new(ThreadEntry {
+            metadata: ThreadMetadata {
+                parent_thread_id: parent,
+                thread_id: id,
+                session_id: Some(acp::SessionId::new(Arc::from(format!("{id:?}")))),
+                agent_id: AgentId::new("zed-agent"),
+                worktree_paths: WorktreePaths::default(),
+                title: Some("t".into()),
+                title_override: None,
+                updated_at: Utc::now(),
+                created_at: None,
+                interacted_at: None,
+                archived: false,
+                remote_connection: None,
+            },
+            icon,
+            icon_from_external_svg: svg.map(SharedString::from),
+            status: AgentThreadStatus::Completed,
+            workspace: ThreadEntryWorkspace::Open(workspace.clone()),
+            is_live: false,
+            is_background: false,
+            is_title_generating: false,
+            draft: None,
+            highlight_positions: Vec::new(),
+            worktrees: Vec::new(),
+            diff_stats: DiffStats::default(),
+            model,
+            nested: false,
+        })
+    };
+    let parent_id = ThreadId::new();
+    let native_id = ThreadId::new();
+    let external_id = ThreadId::new();
+    let mut entries = vec![
+        ListEntry::Thread(entry(parent_id, None, IconName::ZedAgent, None, None)),
+        // A native-agent child on its own model: the provider's icon.
+        ListEntry::Thread(entry(
+            native_id,
+            Some(parent_id),
+            IconName::ZedAgent,
+            None,
+            Some(ThreadModel {
+                name: "deepseek-v4.1-flash".into(),
+                icon: Some(AgentModelIcon::Named(IconName::AiOllama)),
+            }),
+        )),
+        // An external-agent child: its own agent's icon, not the parent's.
+        ListEntry::Thread(entry(
+            external_id,
+            Some(parent_id),
+            IconName::Terminal,
+            Some("claude.svg"),
+            None,
+        )),
+    ];
+    let groups = HashMap::new();
+    let (collapsed, fully_loaded) = (HashSet::new(), HashSet::new());
+    let mut counts = HashMap::new();
+    subthreads::insert_subthread_entries(
+        &mut entries,
+        0,
+        &subthreads::SubthreadLayout {
+            groups: &groups,
+            nest_children: true,
+            collapsed: &collapsed,
+            fully_loaded: &fully_loaded,
+            visible: 5,
+        },
+        &mut counts,
+    );
+
+    let threads: Vec<_> = entries
+        .iter()
+        .map(|entry| match entry {
+            ListEntry::Thread(thread) => thread.clone(),
+            _ => panic!("only thread rows expected"),
+        })
+        .collect();
+    assert_eq!(threads.len(), 3);
+    assert!(!threads[0].nested);
+    assert_eq!(threads[0].icon, IconName::ZedAgent);
+    let native = threads
+        .iter()
+        .find(|t| t.metadata.thread_id == native_id)
+        .unwrap();
+    assert!(native.nested);
+    assert_eq!(native.icon, IconName::AiOllama);
+    assert_eq!(
+        native.model.as_ref().map(|m| m.name.as_ref()),
+        Some("deepseek-v4.1-flash")
+    );
+    let external = threads
+        .iter()
+        .find(|t| t.metadata.thread_id == external_id)
+        .unwrap();
+    assert!(external.nested);
+    assert_eq!(external.icon, IconName::Terminal);
+    assert_eq!(
+        external.icon_from_external_svg.as_deref(),
+        Some("claude.svg")
+    );
+    assert_eq!(counts.get(&parent_id), Some(&2));
 }

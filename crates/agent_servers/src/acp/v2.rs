@@ -1028,8 +1028,10 @@ impl AcpV2Connection {
             )));
         }
         let path_style = project.read(cx).path_style(cx);
+        let orchestration =
+            orchestration::mcp_entry_for_session(project.read(cx).is_local(), &session_id.0, cx);
         let context = match self.session_context(
-            mcp_configurations_for_project(&project, cx),
+            mcp_configurations_for_project(&project, orchestration.as_ref(), cx),
             &work_dirs,
             |path| path_style.is_absolute(path),
         ) {
@@ -1380,8 +1382,10 @@ impl AgentConnection for AcpV2Connection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         let path_style = project.read(cx).path_style(cx);
+        let orchestration =
+            orchestration::mcp_entry_for_new_session(project.read(cx).is_local(), cx);
         let context = match self.session_context(
-            mcp_configurations_for_project(&project, cx),
+            mcp_configurations_for_project(&project, orchestration.as_ref(), cx),
             &work_dirs,
             |path| path_style.is_absolute(path),
         ) {
@@ -1446,6 +1450,9 @@ impl AgentConnection for AcpV2Connection {
                         }
                     };
                     let thread = cx.update(|cx| {
+                        if let Some(orchestration) = &orchestration {
+                            orchestration.bind_session(&session_id.0, cx);
+                        }
                         this.create_session_thread(session_id.clone(), project, context, None, cx)
                     })?;
                     let result = (|| {
@@ -7262,6 +7269,70 @@ done
             connection.upgrade().is_none(),
             "session initialization must not form an ownership cycle"
         );
+    }
+
+    #[gpui::test]
+    async fn v2_session_adds_the_orchestration_server_when_stdio_is_supported(
+        cx: &mut TestAppContext,
+    ) {
+        let entry = orchestration::OrchestrationMcpEntry::new(
+            session_path("bin/zed"),
+            &session_path("tmp/zed-mcp/mcp.sock"),
+            "token-1".to_string(),
+        );
+        for stdio in [false, true] {
+            let mut mcp = acp::McpCapabilities::new();
+            if stdio {
+                mcp = mcp.stdio(acp::McpStdioCapabilities::new());
+            }
+            let harness = SessionHarness::new(
+                acp::AgentCapabilities::new().session(acp::SessionCapabilities::new().mcp(mcp)),
+                Vec::new(),
+                Vec::new(),
+                cx,
+            )
+            .await;
+            let path_style = harness
+                .project
+                .read_with(cx, |project, cx| project.path_style(cx));
+            let directories = PathList::new(&[session_path("a")]);
+            let build = |orchestration: Option<&orchestration::OrchestrationMcpEntry>,
+                         cx: &mut TestAppContext| {
+                let configurations = cx.update(|cx| {
+                    mcp_configurations_for_project(&harness.project, orchestration, cx)
+                });
+                harness
+                    .client
+                    .session_context(configurations, &directories, |path| {
+                        path_style.is_absolute(path)
+                    })
+                    .expect("session context")
+            };
+            assert!(build(None, cx).mcp_servers.is_empty());
+            let servers = build(Some(&entry), cx).mcp_servers;
+            if !stdio {
+                assert!(servers.is_empty());
+                continue;
+            }
+            let [acp::McpServer::Stdio(server)] = servers.as_slice() else {
+                panic!("expected the orchestration stdio server, got {servers:?}");
+            };
+            assert_eq!(server.name, "zed-orchestration");
+            assert_eq!(server.command.0, session_path("bin/zed"));
+            assert_eq!(
+                server.args,
+                [
+                    "--orchestration-bridge".to_string(),
+                    session_path("tmp/zed-mcp/mcp.sock")
+                        .to_string_lossy()
+                        .into_owned()
+                ]
+            );
+            assert_eq!(
+                server.env,
+                [acp::EnvVariable::new("ZED_ORCH_TOKEN", "token-1")]
+            );
+        }
     }
 
     #[gpui::test]

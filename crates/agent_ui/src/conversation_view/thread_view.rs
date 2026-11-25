@@ -1524,6 +1524,16 @@ impl ThreadView {
         message_editor.update(cx, |message_editor, cx| message_editor.contents(expand, cx))
     }
 
+    /// The model this thread runs on, with its provider icon, as the model
+    /// selector shows it.
+    pub fn active_model(&self, cx: &App) -> Option<acp_thread::AgentModelInfo> {
+        self.model_selector
+            .as_ref()?
+            .read(cx)
+            .active_model(cx)
+            .cloned()
+    }
+
     pub fn current_model_id(&self, cx: &App) -> Option<String> {
         let selector = self.model_selector.as_ref()?;
         let model = selector.read(cx).active_model(cx)?;

@@ -4272,6 +4272,23 @@ impl AcpThread {
         self.subagent_association.as_ref()
     }
 
+    /// Renames a subagent the user chose to rename. The parent's label for it
+    /// is replaced, so the new title is what the sidebar shows, and it is
+    /// also set as the thread's own title, which an agent that persists
+    /// titles saves. An agent-owned subagent has no persistence of its own.
+    pub fn rename_subagent(
+        &mut self,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if let Some(association) = self.subagent_association.as_mut() {
+            association.title = Some(title.clone());
+            cx.emit(AcpThreadEvent::SubagentAssociationUpdated);
+            cx.notify();
+        }
+        self.set_title(title, cx)
+    }
+
     pub fn update_subagent_association(
         &mut self,
         update: &acp_v2::SubagentUpdate,

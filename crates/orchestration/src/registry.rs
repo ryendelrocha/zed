@@ -90,6 +90,11 @@ pub fn orchestration_log_dir(cx: &App) -> PathBuf {
 pub struct OrchestrationRegistry {
     children: HashMap<ThreadId, Vec<ChildRecord>>,
     tokens: HashMap<String, ThreadId>,
+    /// Tokens handed to agent sessions, mapped to the session they belong to
+    /// (`None` until the session exists). Unlike `tokens`, they are minted
+    /// before the Zed thread is known: the code that creates ACP sessions
+    /// knows only the session id. See [`Self::resolve_caller`].
+    session_tokens: HashMap<String, Option<String>>,
     hosts: Vec<Rc<dyn OrchestrationHost>>,
 }
 
@@ -135,6 +140,56 @@ impl OrchestrationRegistry {
     /// The orchestrator a token was minted for.
     pub fn resolve_token(&self, token: &str) -> Option<ThreadId> {
         self.tokens.get(token).copied()
+    }
+
+    /// Mints a token for a session that is about to be created, before its
+    /// session id exists. Call [`Self::bind_session_token`] once it does.
+    pub fn mint_pending_session_token(&mut self) -> String {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.session_tokens.insert(token.clone(), None);
+        token
+    }
+
+    /// Ties a token to the ACP session it was given to.
+    pub fn bind_session_token(&mut self, token: &str, session_id: &str) {
+        if let Some(session) = self.session_tokens.get_mut(token) {
+            *session = Some(session_id.to_string());
+        }
+    }
+
+    /// The token of an existing session, minted on first use. Loading or
+    /// resuming the same session again returns the same token, so the MCP
+    /// server entry stays identical.
+    pub fn token_for_session(&mut self, session_id: &str) -> String {
+        if let Some((token, _)) = self
+            .session_tokens
+            .iter()
+            .find(|(_, session)| session.as_deref() == Some(session_id))
+        {
+            return token.clone();
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.session_tokens
+            .insert(token.clone(), Some(session_id.to_string()));
+        token
+    }
+
+    /// Resolves the token an MCP connection presented to the orchestrator
+    /// thread it speaks for, and the host that owns that thread. A token that
+    /// was never minted, or whose session is not an orchestrator's root
+    /// session, resolves to `None`.
+    pub fn resolve_caller(
+        &self,
+        token: &str,
+        cx: &App,
+    ) -> Option<(ThreadId, Rc<dyn OrchestrationHost>)> {
+        if let Some(thread) = self.tokens.get(token) {
+            return self
+                .host_for_thread(*thread, cx)
+                .map(|host| (*thread, host));
+        }
+        let session = self.session_tokens.get(token)?.as_deref()?;
+        self.host_for_session(session, cx)
     }
 
     pub fn revoke_tokens(&mut self, orchestrator: ThreadId) {

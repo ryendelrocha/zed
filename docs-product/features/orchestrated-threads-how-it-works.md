@@ -51,7 +51,7 @@ Its properties:
 - **It grants nothing outside the orchestration tool.** With it, a caller can only open, message, check or cancel children of that one orchestrator.
 - **It is local.** The tool talks to Zed through a socket in a private temporary folder (permissions 0700) on your machine. Nothing listens on the network.
 - **It is short-lived.** It is minted when the session starts and is useless once Zed or the session closes.
-- **It is not shown to the model.** It sits in the environment of the small bridge process that the agent starts for the tool, not in the conversation.
+- **It is not part of the conversation.** It sits in the environment of the small bridge process that the agent starts for the tool, never in a prompt or a tool argument. A model with shell access on the same machine could still read it from that process's environment (`ps eww`). That would only let it act on its own orchestrator's children, which it can already do through the tool.
 
 ## Why there is a bridge process at all
 

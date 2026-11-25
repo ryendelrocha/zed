@@ -1,5 +1,8 @@
 mod apply_code_action_tool;
 mod ask_user_tool;
+mod await_children_tool;
+mod cancel_child_tool;
+mod child_status_tool;
 mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
@@ -19,10 +22,13 @@ mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
 mod move_path_tool;
+mod orchestration_common;
 mod read_file_tool;
 mod rename_tool;
+mod send_to_child_tool;
 mod skill_tool;
 mod spawn_agent_tool;
+mod start_child_tool;
 mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
@@ -72,6 +78,9 @@ where
 
 pub use apply_code_action_tool::*;
 pub use ask_user_tool::*;
+pub use await_children_tool::*;
+pub use cancel_child_tool::*;
+pub use child_status_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
@@ -88,10 +97,13 @@ pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
 pub use move_path_tool::*;
+pub use orchestration_common::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
+pub use send_to_child_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
+pub use start_child_tool::*;
 pub use symbol_locator::*;
 
 pub use terminal_tool::*;
@@ -199,6 +211,9 @@ macro_rules! tools {
 tools! {
     ApplyCodeActionTool,
     AskUserTool,
+    AwaitChildrenTool,
+    CancelChildTool,
+    ChildStatusTool,
     CopyPathTool,
     CreateDirectoryTool,
     CreateThreadTool,
@@ -216,8 +231,10 @@ tools! {
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    SendToChildTool,
     SkillTool,
     SpawnAgentTool,
+    StartChildTool,
     TerminalTool,
     WebSearchTool,
     WriteFileTool,
@@ -238,6 +255,11 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
         | ApplyCodeActionTool::NAME
         | GoToDefinitionTool::NAME => cx.has_flag::<LspToolFeatureFlag>(),
         CreateThreadTool::NAME => cx.has_flag::<CreateThreadToolFeatureFlag>(),
+        name if is_orchestration_tool(name) => {
+            <agent_settings::AgentSettings as settings::Settings>::get_global(cx)
+                .orchestration
+                .enabled
+        }
         _ => true,
     }
 }

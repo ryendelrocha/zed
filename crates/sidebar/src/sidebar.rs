@@ -1,7 +1,7 @@
 mod subthreads;
 mod thread_switcher;
 
-use acp_thread::ThreadStatus;
+use acp_thread::{AgentModelIcon, ThreadStatus};
 use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::v2::schema as acp;
@@ -216,6 +216,15 @@ struct ActiveThreadInfo {
     is_background: bool,
     is_title_generating: bool,
     diff_stats: DiffStats,
+    model: Option<ThreadModel>,
+}
+
+/// The model a loaded thread runs on. For a native agent `icon` is the
+/// model provider's.
+#[derive(Clone, Debug, PartialEq)]
+struct ThreadModel {
+    name: SharedString,
+    icon: Option<AgentModelIcon>,
 }
 
 #[derive(Clone)]
@@ -356,6 +365,10 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// The model the thread runs on, known while the thread is loaded.
+    model: Option<ThreadModel>,
+    /// Listed under its parent thread as an indented child row.
+    nested: bool,
 }
 
 #[derive(Clone)]
@@ -382,6 +395,7 @@ impl ThreadEntry {
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
+        self.model = info.model.clone();
     }
 }
 
@@ -407,9 +421,11 @@ enum ListEntry {
     Terminal(TerminalEntry),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RenameTarget {
     Thread(ThreadId),
+    /// A live subagent of a thread, identified by its parent and its session.
+    Subthread(ThreadId, acp::SessionId),
     Terminal(TerminalId),
 }
 
@@ -420,13 +436,18 @@ impl RenameTarget {
                 Self::Thread(thread.metadata.thread_id),
                 thread.metadata.display_title(),
             )),
+            ListEntry::Subthread(subthread) => Some((
+                Self::Subthread(
+                    subthread.parent.metadata.thread_id,
+                    subthread.info.session_id.clone(),
+                ),
+                subthread.info.title.clone(),
+            )),
             ListEntry::Terminal(terminal) => Some((
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. }
-            | ListEntry::Subthread(_)
-            | ListEntry::LoadMoreSubthreads { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::LoadMoreSubthreads { .. } => None,
         }
     }
 }
@@ -1657,6 +1678,7 @@ impl Sidebar {
         let fully_loaded_subthread_groups = self.fully_loaded_subthread_groups.clone();
         let subthread_layout = SubthreadLayout {
             groups: &subthread_groups,
+            nest_children: orchestration.show_as_subthreads,
             collapsed: &collapsed_subthread_groups,
             fully_loaded: &fully_loaded_subthread_groups,
             visible: orchestration.subthreads_visible.max(1),
@@ -1856,6 +1878,8 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            model: None,
+                            nested: false,
                         })
                     };
 
@@ -3749,7 +3773,7 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.rename_target == Some(target) {
+        if self.rename_target.as_ref() == Some(&target) {
             self.rename_editor.update(cx, |editor, cx| {
                 editor.select_all(&editor::actions::SelectAll, window, cx);
                 editor.focus_handle(cx).focus(window, cx);
@@ -3789,16 +3813,23 @@ impl Sidebar {
                     return;
                 }
                 let new_title = title_editor.read(cx).text(cx);
-                let Some(target) = self.rename_target else {
+                let Some(target) = self.rename_target.clone() else {
                     return;
                 };
-                if matches!(target, RenameTarget::Thread(_)) && new_title.is_empty() {
+                if matches!(
+                    target,
+                    RenameTarget::Thread(_) | RenameTarget::Subthread(..)
+                ) && new_title.is_empty()
+                {
                     return;
                 }
                 let new_title = SharedString::from(new_title);
                 match target {
                     RenameTarget::Thread(thread_id) => {
                         self.apply_thread_rename(thread_id, new_title, window, cx);
+                    }
+                    RenameTarget::Subthread(parent_id, session_id) => {
+                        self.apply_subthread_rename(parent_id, session_id, new_title, cx);
                     }
                     RenameTarget::Terminal(terminal_id) => {
                         self.apply_terminal_rename(terminal_id, new_title, cx);
@@ -3843,6 +3874,47 @@ impl Sidebar {
                 store.set_title_override(thread_id, title, cx);
             });
         }
+    }
+
+    /// Renames a live subagent of `parent_id`. It has no thread metadata, so
+    /// the new title lives on the subagent's thread: it lasts as long as the
+    /// conversation is loaded, and is saved only when the agent saves titles
+    /// (a native subagent does; an agent-owned one starts over after a restart).
+    fn apply_subthread_rename(
+        &mut self,
+        parent_id: ThreadId,
+        session_id: acp::SessionId,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        for workspace in workspaces {
+            let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+                continue;
+            };
+            let Some(view) = agent_panel
+                .read(cx)
+                .conversation_view_for_id(&parent_id, cx)
+            else {
+                continue;
+            };
+            let Some(root) = view.read(cx).root_thread_view() else {
+                continue;
+            };
+            let subagent = root.read(cx).thread.read(cx).subagent(&session_id).cloned();
+            if let Some(subagent) = subagent {
+                subagent.update(cx, |subagent, cx| {
+                    subagent
+                        .rename_subagent(title.clone(), cx)
+                        .detach_and_log_err(cx);
+                });
+                break;
+            }
+        }
+        self.update_entries(cx);
     }
 
     fn apply_terminal_rename(
@@ -6689,26 +6761,101 @@ impl Sidebar {
             .map(format_history_entry_timestamp)
             .unwrap_or_default()
             .into();
-        let subthread = subthread.clone();
+        let title = info.title.clone();
+        let target =
+            RenameTarget::Subthread(subthread.parent.metadata.thread_id, info.session_id.clone());
+        let is_renaming = self.rename_target.as_ref() == Some(&target);
+        let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
+        let is_hovered = self.hovered_thread_index == Some(ix);
+        let color = cx.theme().colors();
+        let button_hover_bg = color.element_background;
+        let button_active_bg = color.element_active;
+        let focus_handle = self.focus_handle.clone();
+        let click_subthread = subthread.clone();
 
-        ThreadItem::new(
+        let item = ThreadItem::new(
             SharedString::from(format!("subthread-entry-{}", ix)),
-            info.title.clone(),
+            title.clone(),
         )
-        .base_bg(cx.theme().colors().panel_background)
+        .base_bg(color.panel_background)
         .icon(info.icon)
         .when_some(info.icon_from_external_svg.clone(), |this, svg| {
             this.custom_icon_from_external_svg(svg)
         })
+        .when_some(info.model.clone(), |this, model| this.model(model))
         .status(info.status)
         .timestamp(timestamp)
         .indented(true)
         .selected(is_active)
         .focused(is_focused)
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_subthread(&subthread, window, cx);
+        .hovered(is_hovered)
+        .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
+            if *is_hovered {
+                this.hovered_thread_index = Some(ix);
+            } else if this.hovered_thread_index == Some(ix) {
+                this.hovered_thread_index = None;
+            }
+            cx.notify();
         }))
-        .into_any_element()
+        .when_some(rename_title_editor, |this, title_editor| {
+            this.is_truncated(false).title_slot(title_editor)
+        })
+        .when(is_hovered && !is_renaming, |this| {
+            this.action_slot(
+                IconButton::new(("rename-subthread", ix), IconName::Pencil)
+                    .hover_background(button_hover_bg)
+                    .active_background(button_active_bg)
+                    .icon_size(IconSize::Small)
+                    .tooltip({
+                        let focus_handle = focus_handle.clone();
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Rename Thread",
+                                &RenameSelectedThread,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click({
+                        let title = title.clone();
+                        let target = target.clone();
+                        cx.listener(move |this, _, window, cx| {
+                            this.start_renaming_entry(
+                                ix,
+                                target.clone(),
+                                title.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                    }),
+            )
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_subthread(&click_subthread, window, cx);
+        }));
+
+        let sidebar = cx.weak_entity();
+        right_click_menu(SharedString::from(format!("subthread-context-menu-{}", ix)))
+            .trigger(move |_, _, _| item)
+            .menu(move |window, cx| {
+                let sidebar = sidebar.clone();
+                let title = title.clone();
+                let target = target.clone();
+                ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.entry("Rename Title", None, move |window, cx| {
+                        let target = target.clone();
+                        let title = title.clone();
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.start_renaming_entry(ix, target, title, window, cx);
+                            })
+                            .ok();
+                    })
+                })
+            })
+            .into_any_element()
     }
 
     fn render_load_more_subthreads(
@@ -6787,6 +6934,9 @@ impl Sidebar {
 
         let timestamp: SharedString = if is_empty_draft {
             SharedString::default()
+        } else if thread.nested {
+            // A child is ordered by its last message, not by interaction.
+            format_history_entry_timestamp(thread.metadata.updated_at).into()
         } else {
             format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
         };
@@ -6818,8 +6968,15 @@ impl Sidebar {
                     .contains(&thread.metadata.thread_id)
             });
 
+        let nested_model = thread
+            .nested
+            .then(|| thread.model.as_ref().map(|model| model.name.clone()))
+            .flatten();
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .indented(thread.nested)
+            .when_some(nested_model, |this, model| this.model(model))
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -8725,6 +8882,11 @@ fn all_thread_infos_for_workspace(
             };
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
+            let is_native = thread_view_ref.as_native_thread(cx).is_some();
+            let model = thread_view_ref.active_model(cx).map(|model| ThreadModel {
+                name: model.name,
+                icon: if is_native { model.icon } else { None },
+            });
 
             Some(ActiveThreadInfo {
                 session_id,
@@ -8735,6 +8897,7 @@ fn all_thread_infos_for_workspace(
                 is_background,
                 is_title_generating,
                 diff_stats,
+                model,
             })
         });
 

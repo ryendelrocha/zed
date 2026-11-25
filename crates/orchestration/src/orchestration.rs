@@ -15,7 +15,9 @@
 //! [`OrchestrationRegistry::resolve_token`], and a native tool resolves its
 //! session id with [`OrchestrationRegistry::host_for_session`].
 
+mod bridge;
 mod child_log;
+mod mcp;
 mod registry;
 
 use std::fmt;
@@ -29,7 +31,9 @@ use sqlez::{
     statement::Statement,
 };
 
+pub use bridge::*;
 pub use child_log::*;
+pub use mcp::*;
 pub use registry::*;
 
 /// Identifies a thread in the agent panel and the threads sidebar. It is the

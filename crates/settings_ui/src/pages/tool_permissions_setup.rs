@@ -1426,6 +1426,13 @@ mod tests {
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
             "spawn_agent",
+            // Orchestration tools only talk to child threads; permission checks
+            // happen inside those threads.
+            "start_child",
+            "await_children",
+            "child_status",
+            "send_to_child",
+            "cancel_child",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

@@ -229,6 +229,16 @@ fn main() {
         return;
     }
 
+    // `zed --orchestration-bridge` relays stdio to the orchestration MCP server's socket, so
+    // external agents can use the orchestration tools.
+    if let Some(socket) = &args.orchestration_bridge {
+        if let Err(error) = orchestration::run_bridge(socket) {
+            eprintln!("orchestration bridge failed: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
     if let Some(socket) = &args.crash_handler {
         crashes::crash_server(socket.as_path(), paths::logs_dir().clone());
@@ -2241,6 +2251,11 @@ struct Args {
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
     askpass: Option<String>,
+
+    /// Relays stdin and stdout to the orchestration MCP server's Unix socket. Zed adds it to
+    /// the MCP servers of an agent session; the token comes from `ZED_ORCH_TOKEN`.
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    orchestration_bridge: Option<String>,
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,

@@ -66,6 +66,7 @@ pub struct ThreadItem {
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    model: Option<SharedString>,
     archived: bool,
     indented: bool,
     disclosure: Option<ThreadItemDisclosure>,
@@ -102,6 +103,7 @@ impl ThreadItem {
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            model: None,
             archived: false,
             indented: false,
             disclosure: None,
@@ -206,6 +208,12 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    /// The model the thread runs on, shown as secondary text on the row.
+    pub fn model(mut self, model: impl Into<SharedString>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -466,7 +474,9 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let has_metadata = has_project_name
+        let has_model = self.model.is_some();
+        let has_metadata = has_model
+            || has_project_name
             || has_project_paths
             || has_worktree
             || has_diff_stats
@@ -557,6 +567,23 @@ impl RenderOnce for ThreadItem {
                                 ),
                             )
                         })
+                        .when_some(self.model, |this, model| {
+                            this.child(
+                                Label::new(model)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        })
+                        .when(
+                            has_model
+                                && (has_project_name
+                                    || has_project_paths
+                                    || has_worktree
+                                    || has_diff_stats
+                                    || has_timestamp),
+                            |this| this.child(dot_separator()),
+                        )
                         .when(
                             has_project_name || has_project_paths || has_worktree,
                             |this| {

@@ -31,6 +31,25 @@ use crate::{
     },
 };
 
+/// Method of the notification a client sends first on a connection to say
+/// who it is. Its `params` are `{"token": "<opaque string>"}`. The server
+/// does not interpret the token: it hands it to tools through [`McpCaller`].
+/// Only the first identification on a connection counts.
+pub const IDENTIFY_METHOD: &str = "zed/identify";
+
+/// Who is on the other end of the connection a tool call came from.
+#[derive(Clone, Debug, Default)]
+pub struct McpCaller {
+    /// The token from the connection's [`IDENTIFY_METHOD`] notification, if
+    /// the client sent one.
+    pub token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IdentifyParams {
+    token: String,
+}
+
 pub struct McpServer {
     socket_path: PathBuf,
     tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
@@ -46,6 +65,7 @@ struct RegisteredTool {
 type ToolHandler = Box<
     dyn Fn(
         Option<serde_json::Value>,
+        McpCaller,
         &mut AsyncApp,
     ) -> Task<Result<ToolResponse<serde_json::Value>>>,
 >;
@@ -53,35 +73,75 @@ type RequestHandler = Box<dyn Fn(RequestId, Option<Box<RawValue>>, &App) -> Task
 
 impl McpServer {
     pub fn new(cx: &AsyncApp) -> Task<Result<Self>> {
-        let task = cx.background_spawn(async move {
-            let temp_dir = tempfile::Builder::new().prefix("zed-mcp").tempdir()?;
-            let socket_path = temp_dir.path().join("mcp.sock");
-            let listener = UnixListener::bind(&socket_path).context("creating mcp socket")?;
-
-            anyhow::Ok((temp_dir, socket_path, listener))
-        });
+        let task = cx.background_spawn(async move { Self::bind() });
 
         cx.spawn(async move |cx| {
             let (temp_dir, socket_path, listener) = task.await?;
-            let tools = Rc::new(RefCell::new(HashMap::default()));
-            let handlers = Rc::new(RefCell::new(HashMap::default()));
-            let server_task = cx.spawn({
-                let tools = tools.clone();
-                let handlers = handlers.clone();
-                async move |cx| {
-                    while let Ok((stream, _)) = listener.accept().await {
-                        Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
-                    }
-                    drop(temp_dir)
-                }
-            });
-            Ok(Self {
-                socket_path,
-                _server_task: server_task,
-                tools,
-                handlers,
-            })
+            Ok(Self::serve(temp_dir, socket_path, listener, cx))
         })
+    }
+
+    /// Like [`Self::new`], but binds the socket right away, so the caller
+    /// knows [`Self::socket_path`] without waiting. Creating the tempdir and
+    /// binding are two quick syscalls.
+    pub fn start(cx: &mut App) -> Result<Self> {
+        let (temp_dir, socket_path, listener) = Self::bind()?;
+        let tools = Rc::new(RefCell::new(HashMap::default()));
+        let handlers = Rc::new(RefCell::new(HashMap::default()));
+        let server_task = cx.spawn({
+            let tools = tools.clone();
+            let handlers = handlers.clone();
+            async move |cx| Self::accept_loop(listener, temp_dir, tools, handlers, cx).await
+        });
+        Ok(Self {
+            socket_path,
+            _server_task: server_task,
+            tools,
+            handlers,
+        })
+    }
+
+    /// Creates the socket in a private (0700) tempdir. Only the user that runs
+    /// Zed can connect to it.
+    fn bind() -> Result<(tempfile::TempDir, PathBuf, UnixListener)> {
+        let temp_dir = tempfile::Builder::new().prefix("zed-mcp").tempdir()?;
+        let socket_path = temp_dir.path().join("mcp.sock");
+        let listener = UnixListener::bind(&socket_path).context("creating mcp socket")?;
+        Ok((temp_dir, socket_path, listener))
+    }
+
+    fn serve(
+        temp_dir: tempfile::TempDir,
+        socket_path: PathBuf,
+        listener: UnixListener,
+        cx: &mut AsyncApp,
+    ) -> Self {
+        let tools = Rc::new(RefCell::new(HashMap::default()));
+        let handlers = Rc::new(RefCell::new(HashMap::default()));
+        let server_task = cx.spawn({
+            let tools = tools.clone();
+            let handlers = handlers.clone();
+            async move |cx| Self::accept_loop(listener, temp_dir, tools, handlers, cx).await
+        });
+        Self {
+            socket_path,
+            _server_task: server_task,
+            tools,
+            handlers,
+        }
+    }
+
+    async fn accept_loop(
+        listener: UnixListener,
+        temp_dir: tempfile::TempDir,
+        tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
+        handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
+        cx: &mut AsyncApp,
+    ) {
+        while let Ok((stream, _)) = listener.accept().await {
+            Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
+        }
+        drop(temp_dir)
     }
 
     pub fn add_tool<T: McpServerTool + Clone + 'static>(&mut self, tool: T) {
@@ -114,16 +174,19 @@ impl McpServer {
                 annotations: Some(tool.annotations()),
             },
             handler: Box::new({
-                move |input_value, cx| {
+                move |input_value, caller, cx| {
                     let input = match input_value {
                         Some(input) => serde_json::from_value(input),
-                        None => serde_json::from_value(serde_json::Value::Null),
+                        // A client may omit `arguments` for a tool without
+                        // required fields.
+                        None => serde_json::from_value(json!({}))
+                            .or_else(|_| serde_json::from_value(serde_json::Value::Null)),
                     };
 
                     let tool = tool.clone();
                     match input {
                         Ok(input) => cx.spawn(async move |cx| {
-                            let output = tool.run(input, cx).await?;
+                            let output = tool.run(input, &caller, cx).await?;
 
                             Ok(ToolResponse {
                                 content: output.content,
@@ -211,14 +274,34 @@ impl McpServer {
             .detach();
 
         cx.spawn(async move |cx| {
+            let mut caller = McpCaller::default();
             while let Some(request) = incoming_rx.next().await {
+                if request.method == IDENTIFY_METHOD {
+                    if caller.token.is_none() {
+                        caller.token = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| {
+                                serde_json::from_str::<IdentifyParams>(params.get()).ok()
+                            })
+                            .map(|params| params.token);
+                    }
+                    continue;
+                }
                 let Some(request_id) = request.id.clone() else {
                     continue;
                 };
 
                 if request.method == CallTool::METHOD {
-                    Self::handle_call_tool(request_id, request.params, &tools, &outgoing_tx, cx)
-                        .await;
+                    Self::handle_call_tool(
+                        request_id,
+                        request.params,
+                        &caller,
+                        &tools,
+                        &outgoing_tx,
+                        cx,
+                    )
+                    .await;
                 } else if request.method == ListTools::METHOD {
                     Self::handle_list_tools(request_id, &tools, &outgoing_tx);
                 } else if let Some(handler) = handlers.borrow().get(&request.method.as_ref()) {
@@ -268,6 +351,7 @@ impl McpServer {
     async fn handle_call_tool(
         request_id: RequestId,
         params: Option<Box<RawValue>>,
+        caller: &McpCaller,
         tools: &Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         outgoing_tx: &UnboundedSender<String>,
         cx: &mut AsyncApp,
@@ -282,7 +366,7 @@ impl McpServer {
                 if let Some(tool) = tools.borrow().get(&params.name.as_ref()) {
                     let outgoing_tx = outgoing_tx.clone();
 
-                    let task = (tool.handler)(params.arguments, cx);
+                    let task = (tool.handler)(params.arguments, caller.clone(), cx);
                     cx.spawn(async move |_| {
                         let response = match task.await {
                             Ok(result) => CallToolResponse {
@@ -415,9 +499,11 @@ pub trait McpServerTool {
         }
     }
 
+    /// `caller` identifies the connection the call arrived on.
     fn run(
         &self,
         input: Self::Input,
+        caller: &McpCaller,
         cx: &mut AsyncApp,
     ) -> impl Future<Output = Result<ToolResponse<Self::Output>>>;
 }

@@ -1405,7 +1405,9 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let orchestration =
+            orchestration::mcp_entry_for_new_session(project.read(cx).is_local(), cx);
+        let mcp_servers = mcp_servers_for_project(&project, orchestration.as_ref(), cx);
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
 
         cx.spawn(async move |cx| {
@@ -1544,6 +1546,9 @@ impl AgentConnection for AcpConnection {
             });
 
             cx.update(|cx| {
+                if let Some(orchestration) = &orchestration {
+                    orchestration.bind_session(&session_id.0, cx);
+                }
                 self.register_session(
                     session_id,
                     &thread,
@@ -1598,7 +1603,9 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let orchestration =
+            orchestration::mcp_entry_for_session(project.read(cx).is_local(), &session_id.0, cx);
+        let mcp_servers = mcp_servers_for_project(&project, orchestration.as_ref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1642,7 +1649,9 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let orchestration =
+            orchestration::mcp_entry_for_session(project.read(cx).is_local(), &session_id.0, cx);
+        let mcp_servers = mcp_servers_for_project(&project, orchestration.as_ref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -2568,6 +2577,39 @@ mod tests {
                 .description
                 .as_deref(),
             Some("Sign in again"),
+        );
+    }
+
+    #[gpui::test]
+    async fn orchestration_server_is_added_only_when_an_entry_is_given(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_settings_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let entry = orchestration::OrchestrationMcpEntry::new(
+            std::path::PathBuf::from("/bin/zed"),
+            std::path::Path::new("/tmp/zed-mcp/mcp.sock"),
+            "token-1".to_string(),
+        );
+
+        let servers = cx.update(|cx| mcp_servers_for_project(&project, None, cx));
+        assert!(servers.is_empty());
+
+        let servers = cx.update(|cx| mcp_servers_for_project(&project, Some(&entry), cx));
+        let [acp::McpServer::Stdio(server)] = servers.as_slice() else {
+            panic!("expected the orchestration stdio server, got {servers:?}");
+        };
+        assert_eq!(server.name, "zed-orchestration");
+        assert_eq!(server.command, std::path::PathBuf::from("/bin/zed"));
+        assert_eq!(
+            server.args,
+            ["--orchestration-bridge", "/tmp/zed-mcp/mcp.sock"]
+        );
+        assert_eq!(
+            server.env,
+            [acp::EnvVariable::new("ZED_ORCH_TOKEN", "token-1")]
         );
     }
 
@@ -10193,8 +10235,12 @@ exit 7
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
-    mcp_configurations_for_project(project, cx)
+fn mcp_servers_for_project(
+    project: &Entity<Project>,
+    orchestration: Option<&orchestration::OrchestrationMcpEntry>,
+    cx: &App,
+) -> Vec<acp::McpServer> {
+    mcp_configurations_for_project(project, orchestration, cx)
         .into_iter()
         .map(|(name, configuration)| match &*configuration {
             project::context_server_store::ContextServerConfiguration::Custom {

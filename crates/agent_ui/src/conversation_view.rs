@@ -308,8 +308,23 @@ pub struct SubthreadInfo {
     pub title: SharedString,
     pub status: AgentThreadStatus,
     pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The icon of the agent, or for a native agent the provider of the model,
+    /// that runs this thread itself, not the one of its parent.
     pub icon: IconName,
     pub icon_from_external_svg: Option<SharedString>,
+    /// The model this thread runs on, when known.
+    pub model: Option<SharedString>,
+    /// Set for a thread that is a conversation of its own, listed under its
+    /// parent through the thread metadata. `None` for a live subagent.
+    pub thread_id: Option<ThreadId>,
+}
+
+/// The icon to show for a model: its provider's icon.
+pub fn model_icon_parts(icon: &acp_thread::AgentModelIcon) -> (IconName, Option<SharedString>) {
+    match icon {
+        acp_thread::AgentModelIcon::Named(name) => (*name, None),
+        acp_thread::AgentModelIcon::Path(path) => (IconName::ZedAgent, Some(path.clone())),
+    }
 }
 
 #[derive(Default)]
@@ -933,6 +948,25 @@ impl ConversationView {
             .map(|subagent| {
                 let subagent = subagent.read(cx);
                 let session_id = subagent.session_id().clone();
+                // The subagent's own view when it has one, else the root's:
+                // a subagent runs on its parent's agent.
+                let own_view = connected
+                    .threads
+                    .get(&session_id)
+                    .map(|view| view.read(cx))
+                    .unwrap_or(root_view);
+                let model = own_view.active_model(cx);
+                let (icon, icon_from_external_svg) = match model
+                    .as_ref()
+                    .and_then(|model| model.icon.as_ref())
+                    .filter(|_| own_view.as_native_thread(cx).is_some())
+                {
+                    Some(model_icon) => model_icon_parts(model_icon),
+                    None => (
+                        own_view.agent_icon,
+                        own_view.agent_icon_from_external_svg.clone(),
+                    ),
+                };
                 let title = subagent
                     .subagent_association()
                     .and_then(|association| association.title.clone())
@@ -957,8 +991,10 @@ impl ConversationView {
                     title,
                     status,
                     last_message_at: subagent.last_message_at(),
-                    icon: root_view.agent_icon,
-                    icon_from_external_svg: root_view.agent_icon_from_external_svg.clone(),
+                    icon,
+                    icon_from_external_svg,
+                    model: model.map(|model| model.name),
+                    thread_id: None,
                 }
             })
             .collect()

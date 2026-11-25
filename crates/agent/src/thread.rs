@@ -1,9 +1,10 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
-    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    ApplyCodeActionTool, AskUserTool, AwaitChildrenTool, CancelChildTool, ChildStatusTool,
+    CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool,
+    DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
+    FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
+    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
+    RenameTool, SandboxedTerminalTool, SendToChildTool, SpawnAgentTool, StartChildTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
@@ -2407,6 +2408,18 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
+
+        // Orchestration tools: only a root thread orchestrates. They are
+        // exposed to the model only while `agent.orchestration.enabled` is on
+        // and an agent panel hosts this session (see `Thread::enabled_tools`).
+        if self.parent_thread_id().is_none() {
+            let session_id = self.id.0.to_string();
+            self.add_tool(StartChildTool::new(session_id.clone()));
+            self.add_tool(AwaitChildrenTool::new(session_id.clone()));
+            self.add_tool(ChildStatusTool::new(session_id.clone()));
+            self.add_tool(SendToChildTool::new(session_id.clone()));
+            self.add_tool(CancelChildTool::new(session_id));
+        }
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -4615,6 +4628,10 @@ impl Thread {
                 }
             })
             .filter(|(tool_name, _)| crate::tools::tool_feature_flag_enabled(tool_name, cx))
+            .filter(|(tool_name, _)| {
+                !crate::tools::is_orchestration_tool(tool_name)
+                    || crate::tools::orchestration_available(&self.id.0, cx)
+            })
             .collect::<BTreeMap<_, _>>();
 
         let mut context_server_tools = Vec::new();
@@ -7658,6 +7675,99 @@ mod tests {
         let event_stream = ThreadEventStream::new(event_tx);
 
         (thread, event_stream, fake)
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_tools_are_gated_on_setting_and_host(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |_| {});
+        let environment: Rc<dyn ThreadEnvironment> =
+            Rc::new(crate::tests::FakeThreadEnvironment::default());
+        let session_id = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.add_default_tools(environment, cx);
+                thread.id().0.to_string()
+            })
+        });
+
+        let orchestration_tools = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                thread
+                    .read(cx)
+                    .enabled_tools(cx)
+                    .keys()
+                    .filter(|name| crate::tools::is_orchestration_tool(name))
+                    .count()
+            })
+        };
+        let set_enabled = |enabled: bool, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.orchestration.enabled = enabled;
+                AgentSettings::override_global(settings, cx);
+            })
+        };
+
+        // Setting off, no host.
+        set_enabled(false, cx);
+        assert_eq!(orchestration_tools(cx), 0);
+
+        // Setting on, still no host for this session.
+        set_enabled(true, cx);
+        assert_eq!(orchestration_tools(cx), 0);
+
+        // Setting on and a host owns the session.
+        struct SessionHost(String);
+        impl orchestration::OrchestrationHost for SessionHost {
+            fn start_child(
+                &self,
+                _: orchestration::ThreadId,
+                _: orchestration::StartChildInput,
+                _: &mut App,
+            ) -> Task<Result<orchestration::StartChildOutput>> {
+                unimplemented!()
+            }
+            fn send_to_child(
+                &self,
+                _: orchestration::ThreadId,
+                _: orchestration::SendToChildInput,
+                _: &mut App,
+            ) -> Task<Result<orchestration::SendToChildOutput>> {
+                unimplemented!()
+            }
+            fn cancel_child(
+                &self,
+                _: orchestration::ThreadId,
+                _: orchestration::CancelChildInput,
+                _: &mut App,
+            ) -> Task<Result<orchestration::CancelChildOutput>> {
+                unimplemented!()
+            }
+            fn list_available_agents(&self, _: &mut App) -> Result<orchestration::AvailableAgents> {
+                unimplemented!()
+            }
+            fn resolve_orchestrator(
+                &self,
+                session_id: &str,
+                _: &App,
+            ) -> Option<orchestration::ThreadId> {
+                (session_id == self.0).then(orchestration::ThreadId::new)
+            }
+            fn owns_thread(&self, _: orchestration::ThreadId, _: &App) -> bool {
+                false
+            }
+        }
+        cx.update(|cx| {
+            orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+                registry.register_host(Rc::new(SessionHost(session_id)));
+            });
+        });
+        assert_eq!(orchestration_tools(cx), 5);
+
+        // Setting off again hides them even with a host.
+        set_enabled(false, cx);
+        assert_eq!(orchestration_tools(cx), 0);
     }
 
     fn new_thread_for_test(project: Entity<Project>, cx: &mut App) -> Entity<Thread> {

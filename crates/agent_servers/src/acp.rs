@@ -51,12 +51,33 @@ use util::path_list::PathList;
 
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The MCP servers a new session gets: the project's context servers, plus
+/// Zed's own orchestration server when `orchestration` is given. Build that
+/// entry with `orchestration::mcp_entry_for_new_session` or
+/// `orchestration::mcp_entry_for_session`, which already apply the
+/// "orchestration enabled and local project" rule.
 fn mcp_configurations_for_project(
     project: &Entity<Project>,
+    orchestration: Option<&orchestration::OrchestrationMcpEntry>,
     cx: &App,
 ) -> Vec<(String, Arc<ContextServerConfiguration>)> {
     let store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
+    let orchestration_server = orchestration.map(|entry| {
+        (
+            entry.name.clone(),
+            Arc::new(ContextServerConfiguration::Custom {
+                command: settings::ContextServerCommand {
+                    path: entry.command.clone(),
+                    args: entry.args.clone(),
+                    env: Some(entry.env.clone().into_iter().collect()),
+                    timeout: None,
+                },
+                remote: false,
+                launcher: None,
+            }),
+        )
+    });
     store
         .configured_server_ids()
         .iter()
@@ -72,6 +93,7 @@ fn mcp_configurations_for_project(
                 _ => Some((id.0.to_string(), configuration)),
             }
         })
+        .chain(orchestration_server)
         .collect()
 }
 
