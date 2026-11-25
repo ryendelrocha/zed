@@ -167,7 +167,7 @@ mod tests {
             }
             Task::ready(Ok(StartChildOutput {
                 child_id: "child-1".into(),
-                log_path: format!("/logs/{}.jsonl", input.title),
+                log_path: format!("/logs/{}.jsonl", input.resolved_title()),
                 agent: "zed".into(),
                 warning: None,
             }))
@@ -275,6 +275,7 @@ mod tests {
                     title: "Parent".into(),
                 }),
                 children: Vec::new(),
+                hint: None,
             }
         }
 
@@ -293,6 +294,7 @@ mod tests {
                     final_message: Some("done".into()),
                     pending_messages: Vec::new(),
                     human_interventions: Vec::new(),
+                    hint: None,
                 }],
                 timed_out: false,
             }))
@@ -313,7 +315,7 @@ mod tests {
 
     fn start_input(title: &str, agent: Option<&str>) -> StartChildInput {
         StartChildInput {
-            title: title.into(),
+            title: Some(title.into()),
             prompt: "do it".into(),
             agent: agent.map(Into::into),
             model: None,
@@ -604,6 +606,42 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(OrchestrationToolOutput::Error { .. })));
+    }
+
+    #[gpui::test]
+    async fn test_start_child_works_without_a_title(cx: &mut TestAppContext) {
+        register_host(cx);
+        let mut input = start_input("unused", None);
+        input.title = None;
+        input.prompt = "\nInvestigate the flaky test\ndetails".into();
+        let started = run_tool(StartChildTool::new(SESSION.to_string()), input, cx)
+            .await
+            .ok()
+            .expect("a missing title is derived from the prompt");
+        let OrchestrationToolOutput::Success(started) = started else {
+            panic!("expected success");
+        };
+        assert_eq!(started.log_path, "/logs/Investigate the flaky test.jsonl");
+
+        let schema = serde_json::to_value(StartChildTool::input_schema()).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|field| field == "title"),
+            "{required:?}"
+        );
+    }
+
+    #[test]
+    fn test_descriptions_steer_the_model_to_reuse_children() {
+        let start_child = StartChildTool::description();
+        assert!(start_child.contains("check `whoami` or `child_status`"));
+        assert!(start_child.contains("completed, failed, cancelled or interrupted"));
+        assert!(start_child.contains("Start a new child only for new work"));
+        let send_to_child = SendToChildTool::description();
+        assert!(send_to_child.contains("any status"));
+        assert!(send_to_child.contains("full conversation"));
+        let whoami = WhoAmITool::description();
+        assert!(whoami.contains("send_to_child") && whoami.contains("interrupted"));
     }
 
     #[test]

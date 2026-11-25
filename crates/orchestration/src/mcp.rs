@@ -552,7 +552,7 @@ mod tests {
         ) -> Task<Result<StartChildOutput>> {
             self.started
                 .borrow_mut()
-                .push((orchestrator, input.title.clone()));
+                .push((orchestrator, input.resolved_title()));
             Task::ready(Ok(StartChildOutput {
                 child_id: ThreadId::new().to_key_string(),
                 log_path: "/tmp/log.jsonl".to_string(),
@@ -766,8 +766,59 @@ mod tests {
             .find(|tool| tool["name"] == "start_child")
             .unwrap();
         let required = start_child["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("title")) && required.contains(&json!("prompt")));
+        assert!(required.contains(&json!("prompt")));
+        assert!(
+            !required.contains(&json!("title")),
+            "`title` is optional: {required:?}"
+        );
         assert!(start_child["inputSchema"]["properties"]["worktree"].is_object());
+    }
+
+    #[gpui::test]
+    async fn test_descriptions_steer_the_model_to_reuse_children(cx: &mut TestAppContext) {
+        let (setup, tokens) = setup(cx);
+        let mut client = BridgeClient::connect(&setup.socket, &tokens[0]);
+        client.initialize().await;
+        let response = client.request("tools/list", json!({})).await;
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let start_child = description("start_child");
+        assert!(start_child.contains("send_to_child"), "{start_child}");
+        assert!(start_child.contains("interrupted"), "{start_child}");
+        assert!(start_child.contains("only for new work"), "{start_child}");
+        let send_to_child = description("send_to_child");
+        assert!(send_to_child.contains("any status"), "{send_to_child}");
+        assert!(
+            send_to_child.contains("full conversation"),
+            "{send_to_child}"
+        );
+        let whoami = description("whoami");
+        assert!(whoami.contains("send_to_child"), "{whoami}");
+    }
+
+    #[gpui::test]
+    async fn test_start_child_accepts_a_call_without_a_title(cx: &mut TestAppContext) {
+        let (setup, tokens) = setup(cx);
+        let mut client = BridgeClient::connect(&setup.socket, &tokens[0]);
+        client.initialize().await;
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "start_child", "arguments": {"prompt": "\n  Review the parser\nmore"}}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(
+            setup.started.borrow().clone(),
+            vec![(setup.orchestrators[0].1, "Review the parser".to_string())]
+        );
     }
 
     #[gpui::test]

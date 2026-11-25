@@ -15,11 +15,12 @@ use crate::{
     AwaitChildrenInput, AwaitChildrenOutput, ChildLog, ChildReference, ChildResult, ChildStatus,
     ChildStatusInfo, ChildStatusInput, ChildStatusOutput, DEFAULT_AWAIT_TIMEOUT_SECS,
     DEFAULT_MAX_CONCURRENT_CHILDREN, DEFAULT_MAX_SIBLING_MESSAGES,
-    DEFAULT_SIBLING_REPLY_TIMEOUT_SECS, HumanIntervention, HumanSummaryRequest, ListSiblingsOutput,
-    LogDirection, MAX_AWAIT_TIMEOUT_SECS, MessageSender, OrchestrationHost, PendingMessage,
-    SendToParentInput, SendToParentOutput, SendToSiblingInput, SendToSiblingOutput, SenderRole,
-    SiblingInfo, ThreadId, ThreadReference, ThreadRole, WhoAmIOutput, human_summary_fallback,
-    log_dir_from_setting, sibling_message_text, truncate_summary, urgent_message_prefix,
+    DEFAULT_SIBLING_REPLY_TIMEOUT_SECS, HumanIntervention, HumanSummaryRequest, INTERRUPTED_NOTE,
+    ListSiblingsOutput, LogDirection, MAX_AWAIT_TIMEOUT_SECS, MessageSender, OrchestrationHost,
+    PendingMessage, SendToParentInput, SendToParentOutput, SendToSiblingInput, SendToSiblingOutput,
+    SenderRole, SiblingInfo, ThreadId, ThreadReference, ThreadRole, WHOAMI_CHILDREN_HINT,
+    WhoAmIOutput, human_summary_fallback, log_dir_from_setting, sibling_message_text,
+    truncate_summary, urgent_message_prefix,
 };
 
 /// Default of `agent.orchestration.human_summary_max_chars`.
@@ -469,8 +470,12 @@ impl OrchestrationRegistry {
     /// false, and changes nothing, when the registry already knows the child.
     ///
     /// Nothing runs after a restart, so the child is `Completed` unless its
-    /// log says otherwise: its last logged status when that is `Failed` or
-    /// `Cancelled`, and `Failed` when it ended with a message nobody answered.
+    /// log says otherwise: its last logged status when that is terminal, and
+    /// `Interrupted` when it ended with a message nobody answered (the process
+    /// died mid-turn). A shutdown that Zed saw is already logged as
+    /// `Interrupted` by [`Self::interrupt_running_children`], which is how it
+    /// is told apart from a `Cancelled` that `cancel_child` or a human asked
+    /// for.
     /// The last final message, the turn count and the sibling counters come
     /// from the child's log; without a log (cleared with the temporary
     /// directory) the child has no final message.
@@ -496,7 +501,10 @@ impl OrchestrationRegistry {
         };
         let turns = entries
             .iter()
-            .filter(|entry| entry.direction == LogDirection::FromChild)
+            .filter(|entry| {
+                entry.direction == LogDirection::FromChild
+                    && entry.status != ChildStatus::Interrupted
+            })
             .count() as u32;
         let last_final = entries
             .iter()
@@ -509,12 +517,9 @@ impl OrchestrationRegistry {
             )
         });
         let (status, final_message) = match last_exchange {
-            Some(entry) if entry.direction == LogDirection::ToChild => (
-                ChildStatus::Failed,
-                Some(
-                    "Zed was restarted before this child answered its latest message.".to_string(),
-                ),
-            ),
+            Some(entry) if entry.direction == LogDirection::ToChild => {
+                (ChildStatus::Interrupted, Some(INTERRUPTED_NOTE.to_string()))
+            }
             Some(entry) => (
                 if entry.status.is_terminal() {
                     entry.status
@@ -597,6 +602,41 @@ impl OrchestrationRegistry {
         });
         cx.notify();
         true
+    }
+
+    /// Marks every child that is mid-turn as `Interrupted`, in the registry and
+    /// in its log. Zed calls it when the app quits or restarts, before the
+    /// threads are torn down and cancelled: the log then says "interrupted"
+    /// instead of an ambiguous `Cancelled`, and the child is restored as
+    /// `Interrupted`. Returns how many children it marked.
+    pub fn interrupt_running_children(&mut self, cx: &mut Context<Self>) -> usize {
+        let mut interrupted = Vec::new();
+        for (orchestrator, records) in &mut self.children {
+            for record in records
+                .iter_mut()
+                .filter(|record| !record.status.is_terminal())
+            {
+                log_exchange(
+                    &record.log,
+                    LogDirection::FromChild,
+                    INTERRUPTED_NOTE,
+                    ChildStatus::Interrupted,
+                );
+                record.final_message = Some(INTERRUPTED_NOTE.to_string());
+                record.apply_status(ChildStatus::Interrupted);
+                interrupted.push((*orchestrator, record.child_id));
+            }
+        }
+        for (orchestrator, child) in &interrupted {
+            cx.emit(OrchestrationRegistryEvent::ChildChanged {
+                orchestrator: *orchestrator,
+                child: *child,
+            });
+        }
+        if !interrupted.is_empty() {
+            cx.notify();
+        }
+        interrupted.len()
     }
 
     /// Sets the subagent quota of `thread` before it is registered as a child:
@@ -1021,8 +1061,11 @@ impl OrchestrationRegistry {
                 id: record.child_id.to_key_string(),
                 title: record.title.to_string(),
                 status: record.status,
+                hint: matches!(record.status, ChildStatus::Interrupted)
+                    .then(|| INTERRUPTED_NOTE.to_string()),
             })
             .collect::<Vec<_>>();
+        let hint = (!children.is_empty()).then(|| WHOAMI_CHILDREN_HINT.to_string());
         let parent = self.orchestrator_of(thread).map(|parent| {
             let live_title = self
                 .host_for_thread(parent, cx)
@@ -1048,6 +1091,7 @@ impl OrchestrationRegistry {
             role,
             parent,
             children,
+            hint,
         }
     }
 
@@ -1692,6 +1736,7 @@ impl OrchestrationRegistry {
                 subagent_quota: quota,
                 pending_messages: record.take_pending_messages(),
                 human_interventions: std::mem::take(&mut record.interventions),
+                hint: record.status.hint().map(str::to_string),
             });
         }
         infos
@@ -1810,6 +1855,7 @@ impl OrchestrationRegistry {
                             .flatten(),
                         pending_messages: record.take_pending_messages(),
                         human_interventions: std::mem::take(&mut record.interventions),
+                        hint: record.status.hint().map(str::to_string),
                     });
                 }
                 let timed_out =
@@ -3536,7 +3582,7 @@ mod tests {
                 ChildStatus::Failed
             );
             let record = registry.child(orchestrator, unanswered).unwrap();
-            assert_eq!(record.status, ChildStatus::Failed);
+            assert_eq!(record.status, ChildStatus::Interrupted);
             assert!(
                 record
                     .final_message
@@ -3580,6 +3626,263 @@ mod tests {
         assert_eq!(
             awaited.children[0].final_message.as_deref(),
             Some("all done")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_tells_an_interruption_from_a_deliberate_cancel(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let completed = ThreadId::new();
+        let cancelled = ThreadId::new();
+        let interrupted = ThreadId::new();
+        let unanswered_follow_up = ThreadId::new();
+        write_log(
+            directory.path(),
+            orchestrator,
+            completed,
+            &[
+                (LogDirection::ToChild, "task", ChildStatus::Starting, None),
+                (
+                    LogDirection::FromChild,
+                    "done",
+                    ChildStatus::Completed,
+                    None,
+                ),
+            ],
+        );
+        write_log(
+            directory.path(),
+            orchestrator,
+            cancelled,
+            &[
+                (LogDirection::ToChild, "task", ChildStatus::Starting, None),
+                (
+                    LogDirection::FromChild,
+                    "stopped",
+                    ChildStatus::Cancelled,
+                    None,
+                ),
+            ],
+        );
+        write_log(
+            directory.path(),
+            orchestrator,
+            interrupted,
+            &[
+                (LogDirection::ToChild, "task", ChildStatus::Starting, None),
+                (
+                    LogDirection::FromChild,
+                    "note",
+                    ChildStatus::Interrupted,
+                    None,
+                ),
+            ],
+        );
+        write_log(
+            directory.path(),
+            orchestrator,
+            unanswered_follow_up,
+            &[
+                (LogDirection::ToChild, "task", ChildStatus::Starting, None),
+                (
+                    LogDirection::FromChild,
+                    "first",
+                    ChildStatus::Completed,
+                    None,
+                ),
+                (LogDirection::ToChild, "more", ChildStatus::Running, None),
+            ],
+        );
+        registry.update(cx, |registry, cx| {
+            for (child, title) in [
+                (completed, "completed"),
+                (cancelled, "cancelled"),
+                (interrupted, "interrupted"),
+                (unanswered_follow_up, "follow-up"),
+            ] {
+                registry.restore_child(orchestrator, restored(directory.path(), child, title), cx);
+            }
+            let status = |child| registry.child(orchestrator, child).unwrap().status;
+            assert_eq!(status(completed), ChildStatus::Completed);
+            assert_eq!(status(cancelled), ChildStatus::Cancelled);
+            assert_eq!(status(interrupted), ChildStatus::Interrupted);
+            assert_eq!(status(unanswered_follow_up), ChildStatus::Interrupted);
+            // An interruption is not a finished turn.
+            assert_eq!(registry.child(orchestrator, interrupted).unwrap().turns, 0);
+            assert_eq!(
+                registry
+                    .child(orchestrator, unanswered_follow_up)
+                    .unwrap()
+                    .turns,
+                1
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_interrupted_child_is_terminal_and_hints_at_send_to_child(
+        cx: &mut TestAppContext,
+    ) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = ThreadId::new();
+        let finished = ThreadId::new();
+        write_log(
+            directory.path(),
+            orchestrator,
+            child,
+            &[(LogDirection::ToChild, "task", ChildStatus::Starting, None)],
+        );
+        write_log(
+            directory.path(),
+            orchestrator,
+            finished,
+            &[
+                (LogDirection::ToChild, "task", ChildStatus::Starting, None),
+                (
+                    LogDirection::FromChild,
+                    "done",
+                    ChildStatus::Completed,
+                    None,
+                ),
+            ],
+        );
+        registry.update(cx, |registry, cx| {
+            registry.restore_child(orchestrator, restored(directory.path(), child, "cut"), cx);
+            registry.restore_child(
+                orchestrator,
+                restored(directory.path(), finished, "finished"),
+                cx,
+            );
+        });
+
+        // `await_children` does not wait on an interrupted child.
+        let awaited = cx
+            .update(|cx| {
+                OrchestrationRegistry::await_children(
+                    &registry,
+                    orchestrator,
+                    AwaitChildrenInput {
+                        child_ids: vec![child.to_key_string()],
+                        timeout_secs: Some(5),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(!awaited.timed_out);
+        assert_eq!(awaited.children[0].status, ChildStatus::Interrupted);
+        let hint = awaited.children[0].hint.as_deref().unwrap();
+        assert!(
+            hint.contains("restarted") && hint.contains("send_to_child"),
+            "{hint}"
+        );
+        let json = serde_json::to_value(&awaited.children[0]).unwrap();
+        assert_eq!(json["status"], "interrupted");
+
+        let statuses = status_of(&registry, orchestrator, cx).await;
+        let hints = statuses
+            .iter()
+            .map(|info| info.hint.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(
+            hints.iter().all(|hint| hint.contains("send_to_child")),
+            "{hints:?}"
+        );
+
+        let whoami = cx.update(|cx| registry.read(cx).whoami(orchestrator, cx));
+        assert!(whoami.hint.unwrap().contains("send_to_child"));
+        let reference = |id: ThreadId| {
+            whoami
+                .children
+                .iter()
+                .find(|reference| reference.id == id.to_key_string())
+                .unwrap()
+                .clone()
+        };
+        assert!(reference(child).hint.unwrap().contains("send_to_child"));
+        assert_eq!(reference(finished).hint, None);
+
+        // A follow-up reopens it: it is running again.
+        registry.update(cx, |registry, cx| {
+            registry.record_message_to_child(orchestrator, child, "continue", cx);
+            assert_eq!(
+                registry.child(orchestrator, child).unwrap().status,
+                ChildStatus::Running
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_quit_marks_running_children_interrupted_in_the_log(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let running = ThreadId::new();
+        let done = ThreadId::new();
+        let stopped_by_orchestrator = ThreadId::new();
+        registry.update(cx, |registry, cx| {
+            for child in [running, done, stopped_by_orchestrator] {
+                registry.register_child(orchestrator, new_child_with(directory.path(), child), cx);
+            }
+            registry.set_status(orchestrator, running, ChildStatus::Running, cx);
+            registry.record_turn_finished(orchestrator, done, ChildStatus::Completed, None, cx);
+            // `cancel_child` or a human cancelled it before the quit.
+            registry.record_turn_finished(
+                orchestrator,
+                stopped_by_orchestrator,
+                ChildStatus::Cancelled,
+                None,
+                cx,
+            );
+            assert_eq!(registry.interrupt_running_children(cx), 1);
+            assert_eq!(registry.interrupt_running_children(cx), 0);
+            // The cancellation that the teardown causes does not change it.
+            registry.set_status(orchestrator, running, ChildStatus::Cancelled, cx);
+        });
+
+        // The next run sees an interruption for the one the quit cut, and
+        // keeps the deliberate states.
+        let next_run = cx.new(|_| OrchestrationRegistry::default());
+        next_run.update(cx, |registry, cx| {
+            for (child, title) in [
+                (running, "running"),
+                (done, "done"),
+                (stopped_by_orchestrator, "cancelled"),
+            ] {
+                registry.restore_child(orchestrator, restored(directory.path(), child, title), cx);
+            }
+            let status = |child| registry.child(orchestrator, child).unwrap().status;
+            assert_eq!(status(running), ChildStatus::Interrupted);
+            assert_eq!(status(done), ChildStatus::Completed);
+            assert_eq!(status(stopped_by_orchestrator), ChildStatus::Cancelled);
+        });
+    }
+
+    #[test]
+    fn test_status_hints_and_terminal_states() {
+        assert!(ChildStatus::Interrupted.is_terminal());
+        assert!(!ChildStatus::Running.is_terminal());
+        for status in [
+            ChildStatus::Completed,
+            ChildStatus::Failed,
+            ChildStatus::Cancelled,
+            ChildStatus::Interrupted,
+        ] {
+            assert!(
+                status.hint().unwrap().contains("send_to_child"),
+                "{status:?}"
+            );
+        }
+        assert_eq!(ChildStatus::Running.hint(), None);
+        assert_eq!(ChildStatus::Starting.hint(), None);
+        assert_eq!(
+            serde_json::to_string(&ChildStatus::Interrupted).unwrap(),
+            "\"interrupted\""
         );
     }
 

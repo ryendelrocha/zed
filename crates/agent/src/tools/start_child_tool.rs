@@ -17,6 +17,8 @@ How results come back:
 - The child has no access to this conversation's history. Put everything it needs in `prompt`: the goal, relevant file paths, constraints, the expected shape of the final message, and what it must NOT touch.
 - Children run in parallel, so give each child files or areas that do not overlap, or use `worktree: new` to isolate it.
 
+Before starting a new child, check `whoami` or `child_status`: to continue work with an existing child, in any status, including completed, failed, cancelled or interrupted, use `send_to_child`, which reopens it with its full conversation. Start a new child only for new work.
+
 Typical flow: call `start_child` once per piece of work (all in the same turn), then call `await_children` to collect the final messages. Prefer `await_children` over polling with `child_status`.
 
 Agent, profile and model: leave `agent`, `profile` and `model` unset to use the user's current defaults. Call `list_agents_and_models` first when you need something specific.
@@ -66,7 +68,7 @@ impl AgentTool for StartChildTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => format!("Start child: {}", input.title).into(),
+            Ok(input) => format!("Start child: {}", input.resolved_title()).into(),
             Err(value) => value
                 .get("title")
                 .and_then(|title| title.as_str())

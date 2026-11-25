@@ -12,6 +12,8 @@ Report this thread's place in an orchestration.
 
 Returns your `role` (`orchestrator` if you started child threads, `child` if an orchestrator started you, `both`, or `none`), your `parent` (id and title of the orchestrator that started you, if any) and your `children` (id, title and status of each thread you started).
 
+Each child can be reused in any status (including completed, failed, cancelled or interrupted): to continue its work, use `send_to_child`, which reopens it with its full conversation. Start a new child only for new work.
+
 Call it when you are unsure whether someone started you. If you have a parent, reach it with `send_to_parent`, not in your own chat.";
 
 pub struct WhoAmITool {

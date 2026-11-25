@@ -15653,7 +15653,7 @@ mod tests {
 
     fn start_child_input(title: &str, prompt: &str) -> orchestration::StartChildInput {
         orchestration::StartChildInput {
-            title: title.to_string(),
+            title: Some(title.to_string()),
             prompt: prompt.to_string(),
             agent: None,
             model: None,
@@ -17404,6 +17404,78 @@ mod tests {
         let (status, final_message, turns) = fixture.child_record(child);
         assert_eq!(status, ChildStatus::Completed);
         assert_eq!(final_message.as_deref(), Some("second result"));
+        assert_eq!(turns, 2);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_restores_a_child_that_a_panel_already_holds(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("held result".into()),
+            )]);
+        let child = fixture.start_child(start_child_input("Held", "task")).await;
+
+        // Simulate a restart in which the panel restored the child's
+        // conversation (it was the active thread) but nothing registered it.
+        let orchestrator = fixture.orchestrator;
+        fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx).update(cx, |registry, cx| {
+                registry.remove_orchestrator(orchestrator, cx)
+            });
+            let registry = orchestration::OrchestrationRegistry::global(cx);
+            assert!(registry.read(cx).children(orchestrator).is_empty());
+            assert!(
+                registry.read(cx).host_for_thread(child, cx).is_some(),
+                "a panel holds the child's conversation"
+            );
+            crate::orchestration_host::restore_saved_children(cx);
+            crate::orchestration_host::restore_saved_children(cx);
+        });
+        fixture.cx.run_until_parked();
+
+        let ids = fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx)
+                .read(cx)
+                .children(orchestrator)
+                .iter()
+                .map(|record| record.child_id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            ids,
+            vec![child],
+            "restored once, even though a panel holds it"
+        );
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("held result"));
+        assert_eq!(turns, 1);
+
+        // The live host observes it again, so a new turn updates the record.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("second held result".into()),
+            )]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "again".to_string(),
+                },
+                cx,
+            )
+        });
+        task.await.expect("the held child accepts a message");
+        fixture.cx.run_until_parked();
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("second held result"));
         assert_eq!(turns, 2);
     }
 

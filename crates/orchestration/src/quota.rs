@@ -293,7 +293,10 @@ In this Zed session Claude Code's own Agent and Task subagent tools are turned o
 To delegate work, use the zed-orchestration `start_child` tool: set `agent` to \"claude-acp\" \
 and `model` to a Claude model such as haiku, sonnet or opus (or pass a `profile`). \
 Every child is a full conversation that the human can open in the threads sidebar and talk to; \
-collect results with `await_children`.";
+collect results with `await_children`. \
+Before starting a child, check `whoami` or `child_status`: to continue work with an existing child, \
+in any status (completed, failed, cancelled or interrupted), use `send_to_child`, which reopens it \
+with its full conversation. Start a new child only for new work.";
 
 /// The `_meta` of a Claude Code root session when
 /// `agent.orchestration.route_agent_subagents` is on.

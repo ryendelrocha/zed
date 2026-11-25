@@ -8,13 +8,13 @@ use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow, ensure};
 use collections::HashMap;
 use futures::StreamExt as _;
-use gpui::{App, Entity, Global, Subscription, Task, WeakEntity};
+use gpui::{App, Entity, Global, Subscription, Task, TaskExt as _, WeakEntity};
 use language_model::{
     CompletionIntent, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
 };
 use orchestration::{
-    AvailableAgent, AvailableAgents, AvailableModel, CancelChildInput, CancelChildOutput,
+    AvailableAgent, AvailableAgents, AvailableModel, CancelChildInput, CancelChildOutput, ChildLog,
     ChildStatus, HumanSummaryRequest, MessageSender, NewChild, OrchestrationHost,
     OrchestrationRegistry, RestoredChild, SendToChildInput, SendToChildOutput, SenderRole,
     StartChildInput, StartChildOutput, ThreadId, WorktreeMode, child_header, human_summary_prompt,
@@ -53,6 +53,18 @@ pub(crate) fn watch_saved_children(cx: &mut App) {
     cx.defer(restore_saved_children);
     cx.observe(&store, |_store, cx| cx.defer(restore_saved_children))
         .detach();
+    // Quit observers run before the windows and their threads are torn down,
+    // and teardown cancels the running turns. Recording the interruption first
+    // keeps that cancellation from being logged as a `cancel_child`.
+    cx.on_app_quit(|cx| {
+        if let Some(registry) = OrchestrationRegistry::try_global(cx) {
+            registry.update(cx, |registry, cx| {
+                registry.interrupt_running_children(cx);
+            });
+        }
+        async {}
+    })
+    .detach();
 }
 
 pub(crate) fn restore_saved_children(cx: &mut App) {
@@ -64,22 +76,32 @@ pub(crate) fn restore_saved_children(cx: &mut App) {
     };
     let registry = OrchestrationRegistry::global_or_init(cx);
     let log_dir = orchestration_log_dir(cx);
-    let restored = {
+    let (restored, held) = {
         let store = store.read(cx);
         let registry = registry.read(cx);
-        store
+        let mut held = Vec::new();
+        let restored = store
             .entries()
             .filter(|metadata| !metadata.archived)
             .filter_map(|metadata| {
                 let parent = store.entry(metadata.parent_thread_id?)?;
-                // A thread that a panel holds is a child that is being started
-                // or that is open: its own host reports it.
                 if registry
                     .child(parent.thread_id, metadata.thread_id)
                     .is_some()
-                    || registry.host_for_thread(metadata.thread_id, cx).is_some()
                 {
                     return None;
+                }
+                // A panel that holds the conversation is either starting the
+                // child (its log does not exist until `register_child` writes
+                // the first prompt) or restored it at startup, and in that
+                // case nothing else registers it.
+                let holds_conversation = registry.host_for_thread(metadata.thread_id, cx).is_some();
+                if holds_conversation {
+                    let log = ChildLog::new(&log_dir, parent.thread_id, metadata.thread_id);
+                    if !log.path().is_file() {
+                        return None;
+                    }
+                    held.push((parent.thread_id, metadata.thread_id));
                 }
                 Some((
                     parent.thread_id,
@@ -96,7 +118,8 @@ pub(crate) fn restore_saved_children(cx: &mut App) {
                     },
                 ))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (restored, held)
     };
     if restored.is_empty() {
         return;
@@ -106,6 +129,15 @@ pub(crate) fn restore_saved_children(cx: &mut App) {
             registry.restore_child(orchestrator, child, cx);
         }
     });
+    // The restored record is only a skeleton: the host that holds the
+    // conversation has to observe it, or later turns would never update it.
+    for (orchestrator, child) in held {
+        let host = registry.read(cx).host_for_thread(child, cx);
+        if let Some(host) = host {
+            host.load_child(orchestrator, child, cx)
+                .detach_and_log_err(cx);
+        }
+    }
 }
 
 /// Reports to the orchestration registry that a message was sent in `thread`.
@@ -265,6 +297,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
         let slot_registry = registry.downgrade();
         cx.spawn(async move |cx| {
             let result: Result<StartChildOutput> = async {
+                let title = input.resolved_title();
                 let (
                     orchestrator_view,
                     selected_agent_is_native,
@@ -430,7 +463,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                     panel,
                     window,
                     ChildThreadRequest {
-                        title: input.title.clone().into(),
+                        title: title.clone().into(),
                         prompt: prompt.clone(),
                         agent_id: input.agent,
                         model: model.clone(),
@@ -466,7 +499,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                         orchestrator,
                         NewChild {
                             child_id: child.thread_id,
-                            title: input.title.into(),
+                            title: title.into(),
                             agent_id: agent_id.clone(),
                             model: registered_model,
                             log_dir,

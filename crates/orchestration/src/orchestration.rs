@@ -113,14 +113,40 @@ pub enum ChildStatus {
     Completed,
     /// The child stopped with an error or a refusal, or its connection was lost.
     Failed,
-    /// The child was cancelled.
+    /// The child was cancelled, by `cancel_child` or by a human.
     Cancelled,
+    /// A Zed restart or quit cut the child's turn. The child keeps its
+    /// conversation: `send_to_child` continues it.
+    Interrupted,
 }
 
+/// Shown for an `interrupted` child, in the registry and in the tool outputs.
+pub const INTERRUPTED_NOTE: &str = "Zed restarted during this child's turn; it keeps its \
+     conversation. Continue it with send_to_child.";
+
 impl ChildStatus {
-    /// Whether `await_children` stops waiting on a child in this state.
+    /// Whether `await_children` stops waiting on a child in this state. An
+    /// interrupted child never moves on its own, so waiting on it would only
+    /// run into the timeout.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+
+    /// What the orchestrator should know about reusing a child in this state.
+    /// A finished child is never dead: `send_to_child` reopens it with its
+    /// whole conversation, so a new `start_child` would only lose its memory.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Interrupted => Some(INTERRUPTED_NOTE),
+            Self::Completed | Self::Failed | Self::Cancelled => Some(
+                "To continue this child's work, use send_to_child: it keeps its memory. \
+                 Start a new child only for new work.",
+            ),
+            Self::Starting | Self::Running | Self::WaitingForConfirmation => None,
+        }
     }
 }
 
@@ -137,10 +163,17 @@ pub enum WorktreeMode {
 }
 
 /// Starts a child thread and returns right away, without waiting for it.
+///
+/// Before starting a new child, check `whoami` or `child_status`: to continue
+/// work with an existing child, in any status (including completed, failed,
+/// cancelled or interrupted), use `send_to_child`, which reopens it with its
+/// full conversation. Start a new child only for new work.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StartChildInput {
-    /// Short title of the child thread, shown in the threads sidebar.
-    pub title: String,
+    /// Short title of the child thread, shown in the threads sidebar. Optional:
+    /// when omitted, it is taken from the first line of `prompt`.
+    #[serde(default)]
+    pub title: Option<String>,
     /// The first message of the child. It must contain everything the child
     /// needs, because the child does not see the orchestrator's conversation.
     pub prompt: String,
@@ -184,6 +217,34 @@ pub struct StartChildInput {
     pub subagent_quota: u32,
 }
 
+/// Longest title derived from a prompt, in characters.
+const DERIVED_TITLE_MAX_CHARS: usize = 60;
+
+impl StartChildInput {
+    /// The child's title: `title` when it has text, else the first non-empty
+    /// line of `prompt`, cut to [`DERIVED_TITLE_MAX_CHARS`] characters.
+    pub fn resolved_title(&self) -> String {
+        if let Some(title) = self.title.as_deref().map(str::trim)
+            && !title.is_empty()
+        {
+            return title.to_string();
+        }
+        let line = self
+            .prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Child");
+        if line.chars().count() <= DERIVED_TITLE_MAX_CHARS {
+            return line.to_string();
+        }
+        let mut title: String = line.chars().take(DERIVED_TITLE_MAX_CHARS).collect();
+        title.truncate(title.trim_end().len());
+        title.push('\u{2026}');
+        title
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StartChildOutput {
     /// Identifier to use in the other orchestration tools.
@@ -225,7 +286,8 @@ pub struct ChildResult {
     pub title: String,
     pub status: ChildStatus,
     /// The last message the child wrote in its latest turn. It is present
-    /// only when the child finished (`completed`, `failed` or `cancelled`),
+    /// only when the child finished (`completed`, `failed`, `cancelled` or
+    /// `interrupted`),
     /// and it is never the child's transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
@@ -237,6 +299,10 @@ pub struct ChildResult {
     /// since the last summary. Each is returned once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub human_interventions: Vec<HumanIntervention>,
+    /// How to reuse the child, for a finished one: `send_to_child` continues
+    /// it with its memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// A message a child sent to its orchestrator with `send_to_parent`.
@@ -306,6 +372,10 @@ pub struct ChildStatusInfo {
     /// since the last summary. Each is returned once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub human_interventions: Vec<HumanIntervention>,
+    /// How to reuse the child, for a finished one: `send_to_child` continues
+    /// it with its memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// The subagent quota of a child (R6).
@@ -320,8 +390,12 @@ pub struct ChildStatusOutput {
     pub children: Vec<ChildStatusInfo>,
 }
 
-/// Sends a follow-up message to a child. If the child is in the middle of a
-/// turn, the message is queued and delivered when the turn ends.
+/// Sends a follow-up message to a child. It works in any status, including
+/// completed, failed, cancelled and interrupted: a child that is not loaded
+/// (after a restart) is reopened first, and it keeps its full conversation, so
+/// prefer this over `start_child` to continue earlier work. If the child is in
+/// the middle of a turn, the message is queued and delivered when the turn
+/// ends.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SendToChildInput {
     pub child_id: String,
@@ -417,7 +491,10 @@ pub struct SendToParentOutput {
     pub urgent: bool,
 }
 
-/// Reports this thread's place in an orchestration.
+/// Reports this thread's place in an orchestration, with the children it
+/// started in any status. To continue work with one of them, use
+/// `send_to_child` (it reopens the child with its conversation); start a new
+/// child only for new work.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WhoAmIInput {}
 
@@ -446,6 +523,9 @@ pub struct ChildReference {
     pub id: String,
     pub title: String,
     pub status: ChildStatus,
+    /// How to reuse the child, for a finished one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -457,7 +537,15 @@ pub struct WhoAmIOutput {
     pub parent: Option<ThreadReference>,
     /// The children this thread started.
     pub children: Vec<ChildReference>,
+    /// Present when there are children: reuse them with `send_to_child`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
+
+/// The `hint` of a `whoami` that lists children.
+pub const WHOAMI_CHILDREN_HINT: &str = "To continue work with a listed child, in any status, use \
+     send_to_child: it reopens the child with its full conversation. Start a new child only for \
+     new work.";
 
 /// What the host needs to summarize the human turns in a child.
 #[derive(Clone, Debug)]
@@ -936,6 +1024,64 @@ mod profile_tests {
         );
         // Nothing set: the user's default model applies.
         assert_eq!(resolve_child_model(None, None, None), None);
+    }
+
+    fn start_input(title: Option<&str>, prompt: &str) -> StartChildInput {
+        serde_json::from_value(serde_json::json!({
+            "title": title,
+            "prompt": prompt,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_title_is_optional_and_derived_from_the_prompt() {
+        let missing: StartChildInput =
+            serde_json::from_value(serde_json::json!({"prompt": "Fix the parser\nand tests"}))
+                .unwrap();
+        assert_eq!(missing.title, None);
+        assert_eq!(missing.resolved_title(), "Fix the parser");
+
+        assert_eq!(
+            start_input(Some("  Given title "), "ignored").resolved_title(),
+            "Given title"
+        );
+        // Blank titles and leading blank lines are skipped.
+        assert_eq!(
+            start_input(Some("   "), "\n \n  First real line \nsecond").resolved_title(),
+            "First real line"
+        );
+        assert_eq!(start_input(None, "   ").resolved_title(), "Child");
+    }
+
+    #[test]
+    fn test_derived_title_is_cut_on_a_character_boundary() {
+        let exactly = "a".repeat(DERIVED_TITLE_MAX_CHARS);
+        assert_eq!(start_input(None, &exactly).resolved_title(), exactly);
+
+        let long = "é".repeat(DERIVED_TITLE_MAX_CHARS + 10);
+        let title = start_input(None, &long).resolved_title();
+        assert_eq!(title.chars().count(), DERIVED_TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('\u{2026}'));
+        assert!(title.starts_with("éé"));
+
+        let words = format!("{} tail", "word ".repeat(20));
+        let title = start_input(None, &words).resolved_title();
+        assert!(
+            title.ends_with('\u{2026}') && !title.contains(" \u{2026}"),
+            "{title}"
+        );
+    }
+
+    #[test]
+    fn test_title_is_not_required_by_the_schema() {
+        let schema = serde_json::to_value(schemars::schema_for!(StartChildInput)).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|field| field == "prompt"));
+        assert!(
+            !required.iter().any(|field| field == "title"),
+            "{required:?}"
+        );
     }
 
     #[test]
