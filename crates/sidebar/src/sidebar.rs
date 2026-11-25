@@ -1053,8 +1053,9 @@ pub struct Sidebar {
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
     /// Threads whose subagent threads the user collapsed. Groups are expanded by default.
     collapsed_subthread_groups: HashSet<ThreadId>,
-    /// Threads whose "Load more" was used, so all their subagent threads are listed.
-    fully_loaded_subthread_groups: HashSet<ThreadId>,
+    /// How many subagent threads each group lists once its "Load more" was used.
+    /// A group not in here lists the first page. Not reset by collapsing.
+    subthread_shown_counts: HashMap<ThreadId, usize>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -1156,6 +1157,14 @@ impl Sidebar {
         })
         .detach();
 
+        // The persisted subagents of native threads come from the thread store.
+        if let Some(thread_store) = ThreadStore::try_global(cx) {
+            cx.observe(&thread_store, |this, _store, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
+
         cx.observe(
             &TerminalThreadMetadataStore::global(cx),
             |this, _store, cx| {
@@ -1209,7 +1218,7 @@ impl Sidebar {
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
             collapsed_subthread_groups: HashSet::new(),
-            fully_loaded_subthread_groups: HashSet::new(),
+            subthread_shown_counts: HashMap::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
@@ -1723,12 +1732,18 @@ impl Sidebar {
             HashMap::new()
         };
         let collapsed_subthread_groups = self.collapsed_subthread_groups.clone();
-        let fully_loaded_subthread_groups = self.fully_loaded_subthread_groups.clone();
+        let subthread_shown_counts = self.subthread_shown_counts.clone();
+        let persisted_subthreads = if orchestration.show_as_subthreads {
+            subthreads::persisted_subthreads_by_parent(cx)
+        } else {
+            HashMap::new()
+        };
         let subthread_layout = SubthreadLayout {
             groups: &subthread_groups,
             nest_children: orchestration.show_as_subthreads,
             collapsed: &collapsed_subthread_groups,
-            fully_loaded: &fully_loaded_subthread_groups,
+            persisted: &persisted_subthreads,
+            shown_counts: &subthread_shown_counts,
             visible: orchestration.subthreads_visible.max(1),
         };
         let mut subthread_counts: HashMap<ThreadId, usize> = HashMap::new();
@@ -6771,7 +6786,17 @@ impl Sidebar {
     }
 
     fn load_more_subthreads(&mut self, parent_thread_id: ThreadId, cx: &mut Context<Self>) {
-        self.fully_loaded_subthread_groups.insert(parent_thread_id);
+        // Each click reveals the next page. The count is kept across collapse
+        // and expand, and across rebuilds; it only resets with the app.
+        let page = AgentSettings::get_global(cx)
+            .orchestration
+            .subthreads_visible
+            .max(1);
+        let shown = self
+            .subthread_shown_counts
+            .entry(parent_thread_id)
+            .or_insert(page);
+        *shown += page;
         self.update_entries(cx);
     }
 
@@ -6782,20 +6807,37 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ThreadEntryWorkspace::Open(workspace) = &subthread.parent.workspace else {
-            return;
-        };
         self.selection = None;
+        let workspace = match &subthread.parent.workspace {
+            ThreadEntryWorkspace::Open(workspace) => workspace.clone(),
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                // The project is not open: open it with the parent. The
+                // subagent can be picked once the parent is showing.
+                self.open_workspace_and_activate_thread(
+                    subthread.parent.metadata.clone(),
+                    folder_paths.clone(),
+                    &project_group_key.clone(),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
         self.activate_thread(
             subthread.parent.metadata.clone(),
-            workspace,
+            &workspace,
             false,
             window,
             cx,
         );
+        // A persisted subagent is restored by its parent conversation while it
+        // loads, so it may not be there yet: the panel shows it as soon as it is.
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             agent_panel.update(cx, |agent_panel, cx| {
-                agent_panel.navigate_to_subthread(
+                agent_panel.navigate_to_subthread_when_ready(
                     &subthread.parent.metadata.thread_id,
                     subthread.info.session_id.clone(),
                     window,

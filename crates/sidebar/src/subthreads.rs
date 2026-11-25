@@ -1,9 +1,13 @@
 //! Child threads nested under their parent thread in the sidebar.
 //!
-//! Two kinds of child are listed, one level deep:
+//! Three kinds of child are listed, one level deep:
 //!
 //! - live subagents, which come from the parent's conversation while it is
-//!   loaded in the agent panel;
+//!   loaded in the agent panel (the only source for external agents such as
+//!   Claude Code, whose subagents are not persisted);
+//! - native-agent subagents persisted in the threads database with a parent
+//!   session. Only their summaries are read, so a parent that was never
+//!   opened still knows it has children;
 //! - threads of their own that the parent started (orchestrated threads),
 //!   which come from the thread metadata through `parent_thread_id`, so they
 //!   persist across restarts. They keep their ordinary thread row, indented,
@@ -16,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use agent::ThreadStore;
 use agent_ui::{AgentPanel, SubthreadInfo, ThreadId};
 use gpui::{App, Entity};
 use workspace::Workspace;
@@ -44,6 +49,34 @@ pub(crate) fn live_subthreads_by_parent(
     groups
 }
 
+/// The persisted native subagents, keyed by the session of their parent.
+/// Built from the summaries the thread store already lists: no thread is
+/// loaded.
+pub(crate) fn persisted_subthreads_by_parent(
+    cx: &App,
+) -> HashMap<agent_client_protocol::v2::schema::SessionId, Vec<SubthreadInfo>> {
+    let mut groups: HashMap<_, Vec<SubthreadInfo>> = HashMap::new();
+    let Some(thread_store) = ThreadStore::try_global(cx) else {
+        return groups;
+    };
+    for subagent in thread_store.read(cx).subagent_entries() {
+        let Some(parent) = subagent.parent_session_id.clone() else {
+            continue;
+        };
+        groups.entry(parent).or_default().push(SubthreadInfo {
+            session_id: subagent.id.clone(),
+            title: subagent.title.clone(),
+            status: ui::AgentThreadStatus::Completed,
+            last_message_at: Some(subagent.updated_at),
+            icon: ui::IconName::ZedAgent,
+            icon_from_external_svg: None,
+            model: None,
+            thread_id: None,
+        });
+    }
+    groups
+}
+
 /// A subagent thread row, listed under `parent`.
 #[derive(Clone)]
 pub(crate) struct SubthreadEntry {
@@ -58,18 +91,15 @@ pub(crate) struct VisibleSubthreads {
     pub hidden: usize,
 }
 
-/// Picks the subagent threads to list: the `visible` most recent ones, or all
-/// of them once `show_all` is set. Most recent last message first; threads
-/// that have no message yet go last.
+/// Picks the subagent threads to list: the `count` most recent ones. Most
+/// recent last message first; threads that have no message yet go last.
 pub(crate) fn select_visible_subthreads(
     mut subthreads: Vec<SubthreadInfo>,
-    visible: usize,
-    show_all: bool,
+    count: usize,
 ) -> VisibleSubthreads {
     subthreads.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
-    let limit = if show_all { subthreads.len() } else { visible };
-    let hidden = subthreads.len().saturating_sub(limit);
-    subthreads.truncate(limit);
+    let hidden = subthreads.len().saturating_sub(count);
+    subthreads.truncate(count);
     VisibleSubthreads {
         shown: subthreads,
         hidden,
@@ -84,7 +114,13 @@ pub(crate) struct SubthreadLayout<'a> {
     /// Whether threads with a `parent_thread_id` nest under their parent.
     pub nest_children: bool,
     pub collapsed: &'a HashSet<ThreadId>,
-    pub fully_loaded: &'a HashSet<ThreadId>,
+    /// The native subagents persisted for each parent session.
+    pub persisted: &'a HashMap<agent_client_protocol::v2::schema::SessionId, Vec<SubthreadInfo>>,
+    /// How many children each group shows, once "Load more" was used. A group
+    /// that is not here shows `visible`. Kept across collapse and expand.
+    pub shown_counts: &'a HashMap<ThreadId, usize>,
+    /// The page size: how many children a group shows, and how many more each
+    /// "Load more" reveals.
     pub visible: usize,
 }
 
@@ -119,7 +155,7 @@ pub(crate) fn insert_subthread_entries(
     layout: &SubthreadLayout,
     counts: &mut HashMap<ThreadId, usize>,
 ) {
-    if layout.groups.is_empty() && !layout.nest_children {
+    if layout.groups.is_empty() && layout.persisted.is_empty() && !layout.nest_children {
         return;
     }
     let group_entries = entries.split_off(start);
@@ -176,6 +212,20 @@ pub(crate) fn insert_subthread_entries(
         {
             infos.extend(live.iter().cloned());
         }
+        // Persisted native subagents, unless the loaded conversation already
+        // lists them live.
+        if let Some(parent_session_id) = parent.metadata.session_id.as_ref()
+            && let Some(persisted) = layout.persisted.get(parent_session_id)
+        {
+            let live_sessions: HashSet<_> =
+                infos.iter().map(|info| info.session_id.clone()).collect();
+            infos.extend(
+                persisted
+                    .iter()
+                    .filter(|info| !live_sessions.contains(&info.session_id))
+                    .cloned(),
+            );
+        }
         let mut child_entries: HashMap<ThreadId, Arc<ThreadEntry>> = HashMap::new();
         for mut child in children.remove(&thread_id).unwrap_or_default() {
             {
@@ -196,11 +246,12 @@ pub(crate) fn insert_subthread_entries(
         if layout.collapsed.contains(&thread_id) {
             continue;
         }
-        let VisibleSubthreads { shown, hidden } = select_visible_subthreads(
-            infos,
-            layout.visible,
-            layout.fully_loaded.contains(&thread_id),
-        );
+        let count = layout
+            .shown_counts
+            .get(&thread_id)
+            .copied()
+            .unwrap_or(layout.visible);
+        let VisibleSubthreads { shown, hidden } = select_visible_subthreads(infos, count);
         for info in shown {
             match info.thread_id.and_then(|id| child_entries.remove(&id)) {
                 Some(child) => entries.push(ListEntry::Thread(child)),

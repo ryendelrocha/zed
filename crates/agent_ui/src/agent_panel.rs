@@ -4323,6 +4323,24 @@ impl AgentPanel {
         });
     }
 
+    /// Like `navigate_to_subthread`, but when the subagent thread is not there
+    /// yet (a persisted subagent is restored while its parent loads), shows it
+    /// as soon as it is.
+    pub fn navigate_to_subthread_when_ready(
+        &mut self,
+        thread_id: &ThreadId,
+        session_id: acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.conversation_view_for_id(thread_id, cx).cloned() else {
+            return;
+        };
+        conversation_view.update(cx, |view, cx| {
+            view.navigate_to_thread_when_ready(session_id, window, cx);
+        });
+    }
+
     pub fn regenerate_thread_title(
         &mut self,
         thread_id: ThreadId,

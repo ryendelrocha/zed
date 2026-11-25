@@ -18562,6 +18562,22 @@ async fn test_subagent_threads_respect_visible_limit_and_load_more(cx: &mut Test
             "    Child 4",
             "    Child 3",
             "    Child 2",
+            "    Load more",
+        ]
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.load_more_subthreads(parent_thread_id, cx)
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Hello *",
+            "    Child 5",
+            "    Child 4",
+            "    Child 3",
+            "    Child 2",
             "    Child 1",
         ]
     );
@@ -18673,18 +18689,18 @@ fn test_select_visible_subthreads_orders_by_recency_and_limits() {
             .collect::<Vec<_>>()
     };
 
-    let limited = subthreads::select_visible_subthreads(subthreads.clone(), 2, false);
+    let limited = subthreads::select_visible_subthreads(subthreads.clone(), 2);
     assert_eq!(titles(&limited), vec!["newest", "middle"]);
     assert_eq!(limited.hidden, 2);
 
-    let everything = subthreads::select_visible_subthreads(subthreads.clone(), 2, true);
+    let everything = subthreads::select_visible_subthreads(subthreads.clone(), 4);
     assert_eq!(
         titles(&everything),
         vec!["newest", "middle", "old", "silent"]
     );
     assert_eq!(everything.hidden, 0);
 
-    let exact = subthreads::select_visible_subthreads(subthreads, 4, false);
+    let exact = subthreads::select_visible_subthreads(subthreads, 4);
     assert_eq!(exact.hidden, 0);
 }
 
@@ -19343,6 +19359,207 @@ async fn test_metadata_children_respect_limit_load_more_and_message_order(cx: &m
     );
 }
 
+fn kid_titles(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+    updated_entries(sidebar, cx)
+        .into_iter()
+        .filter(|entry| entry.starts_with("    "))
+        .map(|entry| entry.trim().to_string())
+        .collect()
+}
+
+fn kid_names(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
+    range.rev().map(|n| format!("Kid {n}")).collect()
+}
+
+#[gpui::test]
+async fn test_load_more_pages_by_visible_count_newest_first(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let (parent, _) = save_parent_with_metadata_children(&project, 12, cx);
+
+    let mut expected = kid_names(8..=12);
+    expected.push("Load more".into());
+    assert_eq!(kid_titles(&sidebar, cx), expected);
+
+    sidebar.update(cx, |sidebar, cx| sidebar.load_more_subthreads(parent, cx));
+    let mut expected = kid_names(3..=12);
+    expected.push("Load more".into());
+    assert_eq!(kid_titles(&sidebar, cx), expected);
+
+    sidebar.update(cx, |sidebar, cx| sidebar.load_more_subthreads(parent, cx));
+    assert_eq!(kid_titles(&sidebar, cx), kid_names(1..=12));
+}
+
+#[gpui::test]
+async fn test_loaded_count_survives_collapse_and_expand(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let (parent, _) = save_parent_with_metadata_children(&project, 12, cx);
+
+    sidebar.update(cx, |sidebar, cx| sidebar.load_more_subthreads(parent, cx));
+    let mut expected = kid_names(3..=12);
+    expected.push("Load more".into());
+    assert_eq!(kid_titles(&sidebar, cx), expected);
+
+    sidebar.update(cx, |sidebar, cx| sidebar.toggle_subthreads(parent, cx));
+    assert!(kid_titles(&sidebar, cx).is_empty());
+    sidebar.update(cx, |sidebar, cx| sidebar.toggle_subthreads(parent, cx));
+    assert_eq!(kid_titles(&sidebar, cx), expected);
+}
+
+#[gpui::test]
+async fn test_top_level_threads_are_not_limited_by_subthreads_visible(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 2, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    for n in 1..=12 {
+        save_orchestration_thread_metadata(
+            &format!("top-{n}"),
+            &format!("Top {n}"),
+            None,
+            minutes(n),
+            None,
+            false,
+            &project,
+            cx,
+        );
+    }
+    let entries = updated_entries(&sidebar, cx);
+    assert_eq!(entries.len(), 13, "{entries:?}");
+    assert!(entries.iter().all(|entry| entry != "    Load more"));
+}
+
+#[gpui::test]
+async fn test_unloaded_parent_shows_chevron_and_children_without_opening(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let (parent, _) = save_parent_with_metadata_children(&project, 2, cx);
+
+    assert_eq!(kid_titles(&sidebar, cx), vec!["Kid 2", "Kid 1"]);
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.contents.subthread_counts.get(&parent), Some(&2));
+    });
+    // Collapse and expand: still no conversation was opened for the parent.
+    sidebar.update(cx, |sidebar, cx| sidebar.toggle_subthreads(parent, cx));
+    sidebar.update(cx, |sidebar, cx| sidebar.toggle_subthreads(parent, cx));
+    assert_eq!(kid_titles(&sidebar, cx), vec!["Kid 2", "Kid 1"]);
+    panel.read_with(cx, |panel, cx| {
+        assert!(
+            panel
+                .conversation_views()
+                .iter()
+                .all(|view| view.read(cx).parent_id() != parent),
+            "the parent conversation must not be opened"
+        );
+    });
+}
+
+/// Saves a native subagent thread of `parent_session` in the threads database.
+async fn save_native_subagent(
+    parent_session: &str,
+    session_id: &str,
+    title: &str,
+    updated_at: DateTime<Utc>,
+    cx: &mut TestAppContext,
+) {
+    let db_thread = agent::DbThread {
+        title: title.to_string().into(),
+        messages: Vec::new(),
+        updated_at,
+        detailed_summary: None,
+        initial_project_snapshot: None,
+        cumulative_token_usage: Default::default(),
+        request_token_usage: Default::default(),
+        model: None,
+        profile: None,
+        subagent_context: Some(agent::SubagentContext {
+            parent_thread_id: acp::SessionId::new(parent_session.to_string()),
+            depth: 1,
+            outcomes: Vec::new(),
+        }),
+        speed: None,
+        thinking_enabled: false,
+        thinking_effort: None,
+        thread_only: false,
+        profile_downgraded_for_restricted_workspace: false,
+        draft_prompt: None,
+        ui_scroll_position: None,
+        sandboxed_terminal_temp_dir: None,
+        sandbox_grants: Default::default(),
+    };
+    let save = cx.update(|cx| {
+        ThreadStore::global(cx).update(cx, |store, cx| {
+            store.save_thread(
+                acp::SessionId::new(session_id.to_string()),
+                db_thread,
+                PathList::default(),
+                cx,
+            )
+        })
+    });
+    save.await.expect("saving the subagent thread");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_persisted_native_subagents_nest_under_unloaded_parent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let parent = save_orchestration_thread_metadata(
+        "native-parent",
+        "Native parent",
+        None,
+        minutes(1000),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    for n in 1..=7 {
+        save_native_subagent(
+            "native-parent",
+            &format!("native-kid-{n}"),
+            &format!("Kid {n}"),
+            minutes(n),
+            cx,
+        )
+        .await;
+    }
+
+    let mut expected = kid_names(3..=7);
+    expected.push("Load more".into());
+    assert_eq!(kid_titles(&sidebar, cx), expected);
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.contents.subthread_counts.get(&parent), Some(&7));
+    });
+    panel.read_with(cx, |panel, cx| {
+        assert!(
+            panel
+                .conversation_views()
+                .iter()
+                .all(|view| view.read(cx).parent_id() != parent),
+            "the parent conversation must not be opened"
+        );
+    });
+
+    sidebar.update(cx, |sidebar, cx| sidebar.load_more_subthreads(parent, cx));
+    assert_eq!(kid_titles(&sidebar, cx), kid_names(1..=7));
+}
+
 #[gpui::test]
 async fn test_metadata_children_are_ordinary_threads_when_setting_is_off(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
@@ -19718,7 +19935,8 @@ async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut Tes
         )),
     ];
     let groups = HashMap::new();
-    let (collapsed, fully_loaded) = (HashSet::new(), HashSet::new());
+    let collapsed = HashSet::new();
+    let (persisted, shown_counts) = (HashMap::new(), HashMap::new());
     let mut counts = HashMap::new();
     subthreads::insert_subthread_entries(
         &mut entries,
@@ -19727,7 +19945,8 @@ async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut Tes
             groups: &groups,
             nest_children: true,
             collapsed: &collapsed,
-            fully_loaded: &fully_loaded,
+            persisted: &persisted,
+            shown_counts: &shown_counts,
             visible: 5,
         },
         &mut counts,

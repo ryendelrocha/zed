@@ -864,6 +864,8 @@ pub struct ConversationView {
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
     draft_prompt_persist_task: Option<Task<()>>,
+    /// A subagent thread to show as soon as it is added to this conversation.
+    pending_navigation: Option<acp_v2::SessionId>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
@@ -1052,6 +1054,25 @@ impl ConversationView {
         }
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         cx.notify();
+    }
+
+    /// Shows the thread `session_id` now, or as soon as it is added to this
+    /// conversation (a persisted subagent is restored asynchronously).
+    pub fn navigate_to_thread_when_ready(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let present = self
+            .as_connected()
+            .is_some_and(|connected| connected.threads.contains_key(&session_id));
+        if present {
+            self.pending_navigation = None;
+            self.navigate_to_thread(session_id, window, cx);
+        } else {
+            self.pending_navigation = Some(session_id);
+        }
     }
 
     pub fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
@@ -1278,6 +1299,7 @@ impl ConversationView {
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            pending_navigation: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
             _subscriptions: subscriptions,
@@ -2858,7 +2880,11 @@ impl ConversationView {
         });
         let view = self.new_thread_view(subagent, conversation, false, None, window, cx);
         if let Some(connected) = self.as_connected_mut() {
-            connected.threads.insert(subagent_session_id, view);
+            connected.threads.insert(subagent_session_id.clone(), view);
+        }
+        if self.pending_navigation.as_ref() == Some(&subagent_session_id) {
+            self.pending_navigation = None;
+            self.navigate_to_thread(subagent_session_id, window, cx);
         }
     }
 

@@ -11,6 +11,9 @@ impl Global for GlobalThreadStore {}
 
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
+    /// Threads that have a parent session (native subagents), newest first.
+    /// Metadata only: listing them never loads a thread's blob.
+    subagents: Vec<DbThreadMetadata>,
     reload_task: Shared<Task<()>>,
 }
 
@@ -32,6 +35,7 @@ impl ThreadStore {
         let reload_task = Self::spawn_reload(cx);
         Self {
             threads: Vec::new(),
+            subagents: Vec::new(),
             reload_task,
         }
     }
@@ -114,11 +118,13 @@ impl ThreadStore {
             };
             this.update(cx, |this, cx| {
                 this.threads.clear();
+                this.subagents.clear();
                 for thread in all_threads {
                     if thread.parent_session_id.is_some() {
-                        continue;
+                        this.subagents.push(thread);
+                    } else {
+                        this.threads.push(thread);
                     }
-                    this.threads.push(thread);
                 }
                 cx.notify();
             })
@@ -133,6 +139,12 @@ impl ThreadStore {
 
     pub fn entries(&self) -> impl Iterator<Item = DbThreadMetadata> + '_ {
         self.threads.iter().cloned()
+    }
+
+    /// The persisted subagent threads, which have a parent session, newest
+    /// first. They are not part of `entries`.
+    pub fn subagent_entries(&self) -> impl Iterator<Item = &DbThreadMetadata> + '_ {
+        self.subagents.iter()
     }
 
     pub fn entry_ids(&self) -> impl Iterator<Item = acp_v2::SessionId> + '_ {
