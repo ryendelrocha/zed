@@ -396,9 +396,29 @@ impl ThreadEntry {
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
-        // A loaded thread knows its model; without one, keep what was
-        // persisted so the row does not lose it.
-        self.model = info.model.clone().or_else(|| self.model.take());
+        // A loaded thread knows its model; whatever it does not know yet
+        // (the whole model while its selector is not ready, or just the
+        // icon) stays as persisted, so the row does not lose it.
+        self.model = merge_live_thread_model(info.model.clone(), self.model.take());
+    }
+}
+
+/// The model a row shows, from what the loaded thread reports (`live`) and
+/// what its metadata persisted. A live value counts only when it is known and
+/// non-empty: a missing or empty one never blanks a persisted one.
+fn merge_live_thread_model(
+    live: Option<ThreadModel>,
+    persisted: Option<ThreadModel>,
+) -> Option<ThreadModel> {
+    match (live.filter(|live| !live.name.is_empty()), persisted) {
+        (Some(mut live), Some(persisted)) => {
+            if live.icon.is_none() {
+                live.icon = persisted.icon;
+            }
+            Some(live)
+        }
+        (Some(live), None) => Some(live),
+        (None, persisted) => persisted,
     }
 }
 
@@ -7025,7 +7045,16 @@ impl Sidebar {
         let focus_handle = self.focus_handle.clone();
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
 
-        let id = SharedString::from(format!("thread-entry-{}", ix));
+        // A child keeps its element id when the rows around it shift, so its
+        // row is not recreated when a sibling loads or unloads.
+        let id = if thread.nested {
+            SharedString::from(format!(
+                "thread-entry-child-{:?}",
+                thread.metadata.thread_id
+            ))
+        } else {
+            SharedString::from(format!("thread-entry-{}", ix))
+        };
 
         let color = cx.theme().colors();
         let sidebar_bg = color.panel_background;
@@ -8994,10 +9023,13 @@ fn all_thread_infos_for_workspace(
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
             let is_native = thread_view_ref.as_native_thread(cx).is_some();
-            let model = thread_view_ref.active_model(cx).map(|model| ThreadModel {
-                name: model.name,
-                icon: if is_native { model.icon } else { None },
-            });
+            let model = thread_view_ref
+                .active_model(cx)
+                .filter(|model| !model.name.is_empty())
+                .map(|model| ThreadModel {
+                    name: model.name,
+                    icon: if is_native { model.icon } else { None },
+                });
 
             Some(ActiveThreadInfo {
                 session_id,

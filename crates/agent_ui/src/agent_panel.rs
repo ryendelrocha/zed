@@ -5115,9 +5115,12 @@ fn persist_native_run_config(
     cx: &mut App,
 ) {
     let thread = native_thread.read(cx);
+    // A thread that has no resolved model yet (it is loading) has nothing to
+    // persist: only a real model replaces the stored one.
     let model = thread
         .model()
-        .map(|model| (model.provider_id().0, model.id().0));
+        .map(|model| (model.provider_id().0, model.id().0))
+        .filter(|(provider_id, model_id)| !provider_id.is_empty() && !model_id.is_empty());
     let profile_id = thread.profile().0.clone();
     ThreadMetadataStore::global(cx).update(cx, |store, cx| {
         store.update_run_config(
@@ -5127,7 +5130,9 @@ fn persist_native_run_config(
                     config.model_provider_id = Some(provider_id);
                     config.model_id = Some(model_id);
                 }
-                config.profile_id = Some(profile_id.to_string().into());
+                if !profile_id.is_empty() {
+                    config.profile_id = Some(profile_id.to_string().into());
+                }
             },
             cx,
         );
@@ -16272,6 +16277,41 @@ mod tests {
             Some(("fake", "fake")),
             "the default model is persisted too"
         );
+    }
+
+    #[gpui::test]
+    async fn test_changing_one_child_model_leaves_its_sibling_persisted_config(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_native_profiles(cx).await;
+        let first = fixture
+            .start(Some("fake/explicit-model"), None)
+            .await
+            .unwrap();
+        let second = fixture
+            .start(Some("fake/explicit-model"), None)
+            .await
+            .unwrap();
+        let before = fixture.persisted_run_config(second);
+
+        let fake_provider = language_model::fake_provider::FakeLanguageModelProvider::default();
+        fixture.panel.update(&mut fixture.cx, |panel, cx| {
+            let thread = panel.retained_threads[&first]
+                .read(cx)
+                .as_native_thread(cx)
+                .expect("the child is a native thread");
+            thread.update(cx, |thread, cx| {
+                thread.set_model(fake_provider.model("other"), cx)
+            });
+        });
+        fixture.cx.run_until_parked();
+
+        assert_eq!(
+            fixture.persisted_run_config(first).model(),
+            Some(("fake", "other"))
+        );
+        assert_eq!(fixture.persisted_run_config(second), before);
+        assert_eq!(before.model(), Some(("fake", "explicit-model")));
     }
 
     #[gpui::test]

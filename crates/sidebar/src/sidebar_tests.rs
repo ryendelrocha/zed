@@ -19866,6 +19866,192 @@ fn test_child_model_label_puts_the_profile_before_the_model() {
     assert_eq!(child_model_label(None, None), None);
 }
 
+fn ollama_model(name: &str, icon: bool) -> ThreadModel {
+    ThreadModel {
+        name: name.to_string().into(),
+        icon: icon.then_some(AgentModelIcon::Named(IconName::AiOllama)),
+    }
+}
+
+async fn child_entry_with_model(
+    model: Option<ThreadModel>,
+    cx: &mut TestAppContext,
+) -> ThreadEntry {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    ThreadEntry {
+        metadata: ThreadMetadata {
+            parent_thread_id: Some(ThreadId::new()),
+            run_config: Default::default(),
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new("child")),
+            agent_id: AgentId::new("zed-agent"),
+            worktree_paths: WorktreePaths::default(),
+            title: Some("t".into()),
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: None,
+            interacted_at: None,
+            archived: false,
+            remote_connection: None,
+        },
+        icon: IconName::ZedAgent,
+        icon_from_external_svg: None,
+        status: AgentThreadStatus::Completed,
+        workspace: ThreadEntryWorkspace::Open(workspace),
+        is_live: false,
+        is_background: false,
+        is_title_generating: false,
+        draft: None,
+        highlight_positions: Vec::new(),
+        worktrees: Vec::new(),
+        diff_stats: DiffStats::default(),
+        model,
+        nested: true,
+    }
+}
+
+fn active_info_with_model(model: Option<ThreadModel>) -> ActiveThreadInfo {
+    ActiveThreadInfo {
+        session_id: acp::SessionId::new("child"),
+        title: "t".into(),
+        status: AgentThreadStatus::Completed,
+        icon: IconName::ZedAgent,
+        icon_from_external_svg: None,
+        is_background: false,
+        is_title_generating: false,
+        diff_stats: DiffStats::default(),
+        model,
+    }
+}
+
+#[gpui::test]
+async fn test_loading_child_without_a_model_keeps_the_persisted_model_and_icon(
+    cx: &mut TestAppContext,
+) {
+    let persisted = ollama_model("deepseek-v4.1-flash:cloud", true);
+    let mut entry = child_entry_with_model(Some(persisted.clone()), cx).await;
+    // The view is loading: its model selector is not ready.
+    entry.apply_active_info(&active_info_with_model(None));
+    assert_eq!(entry.model, Some(persisted));
+}
+
+#[gpui::test]
+async fn test_live_model_without_an_icon_keeps_the_persisted_icon(cx: &mut TestAppContext) {
+    let mut entry =
+        child_entry_with_model(Some(ollama_model("deepseek-v4.1-flash:cloud", true)), cx).await;
+    // The provider is reconnecting: the live model has a name but no icon yet.
+    entry.apply_active_info(&active_info_with_model(Some(ollama_model(
+        "deepseek-v4.1-flash:cloud",
+        false,
+    ))));
+    assert_eq!(
+        entry.model,
+        Some(ollama_model("deepseek-v4.1-flash:cloud", true))
+    );
+}
+
+#[gpui::test]
+async fn test_live_model_with_an_empty_name_does_not_blank_the_persisted_model(
+    cx: &mut TestAppContext,
+) {
+    let persisted = ollama_model("deepseek-v4.1-flash:cloud", true);
+    let mut entry = child_entry_with_model(Some(persisted.clone()), cx).await;
+    entry.apply_active_info(&active_info_with_model(Some(ollama_model("", false))));
+    assert_eq!(entry.model, Some(persisted));
+}
+
+#[gpui::test]
+async fn test_known_live_model_replaces_the_persisted_one(cx: &mut TestAppContext) {
+    let mut entry =
+        child_entry_with_model(Some(ollama_model("deepseek-v4.1-flash:cloud", true)), cx).await;
+    let live = ThreadModel {
+        name: "Fake".into(),
+        icon: Some(AgentModelIcon::Named(IconName::ZedAgent)),
+    };
+    entry.apply_active_info(&active_info_with_model(Some(live.clone())));
+    assert_eq!(entry.model, Some(live));
+}
+
+#[gpui::test]
+async fn test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let parent = save_orchestration_thread_metadata(
+        "orchestrator",
+        "Orchestrator",
+        None,
+        minutes(1000),
+        None,
+        false,
+        &project,
+        cx,
+    );
+    let kids: Vec<ThreadId> = ["one", "two"]
+        .into_iter()
+        .enumerate()
+        .map(|(ix, session)| {
+            let kid = save_orchestration_thread_metadata(
+                session,
+                session,
+                Some(parent),
+                minutes(10 - ix as i64),
+                None,
+                false,
+                &project,
+                cx,
+            );
+            cx.update(|_window, cx| {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.update_run_config(
+                        kid,
+                        |config| {
+                            config.model_provider_id = Some("ollama".into());
+                            config.model_id = Some("deepseek-v4.1-flash:cloud".into());
+                        },
+                        cx,
+                    );
+                });
+            });
+            kid
+        })
+        .collect();
+    updated_entries(&sidebar, cx);
+
+    // Neither child is loaded (evicted, or not opened yet): both rows show
+    // the persisted model, and a rebuild does not change that.
+    for _ in 0..2 {
+        sidebar.read_with(cx, |sidebar, _| {
+            for kid in &kids {
+                let row = sidebar
+                    .contents
+                    .entries
+                    .iter()
+                    .find_map(|entry| match entry {
+                        ListEntry::Thread(thread) if thread.metadata.thread_id == *kid => {
+                            Some(thread.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("the child row is listed");
+                let model = row.model.as_ref().expect("the persisted model is shown");
+                assert_eq!(model.name.as_ref(), "deepseek-v4.1-flash:cloud");
+                assert!(row.nested);
+            }
+        });
+        sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+        cx.run_until_parked();
+    }
+}
+
 #[gpui::test]
 async fn test_nested_child_row_uses_its_own_provider_icon_and_model(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;

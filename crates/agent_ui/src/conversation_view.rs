@@ -958,7 +958,9 @@ impl ConversationView {
                     .get(&session_id)
                     .map(|view| view.read(cx))
                     .unwrap_or(root_view);
-                let model = own_view.active_model(cx);
+                let model = own_view
+                    .active_model(cx)
+                    .filter(|model| !model.name.is_empty());
                 let (icon, icon_from_external_svg) = match model
                     .as_ref()
                     .and_then(|model| model.icon.as_ref())
