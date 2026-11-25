@@ -150,15 +150,16 @@ When the setting is off, children appear as ordinary top-level threads, which is
 | `agent.orchestration.subthreads_visible` | int | `5` | Children shown before "Load more" (R9) |
 | `agent.orchestration.max_concurrent_children` | int | `6` | Global cap on running children |
 | `agent.orchestration.max_sibling_messages` | int | `20` | Cap on messages per pair of children (R3b) |
+| `agent.orchestration.human_summary_max_chars` | int | `600` | Length cap of the human-intervention summary (R16) |
 | `agent.orchestration.log_dir` | path | `$TMPDIR/zed-orchestration` | Where the R4 logs go |
 
 **Why:** each behavior that someone may reasonably want different is a setting, not hard-coded. `max_concurrent_children` is a safety cap that sits above the per-child quota of R6.
 
-### R11. Child threads are read-only to the human in V1
+### R11. The human can write in a child thread (revised)
 
-A child thread opens in full view, but it has no message editor. This is already the behavior for subagents (`render_message_editor` in `crates/agent_ui/src/conversation_view/thread_view.rs`).
+Orchestrated children are ordinary Zed threads, so they keep their message editor and the human can talk to a child directly. (Agent-owned subagents stay read-only, as upstream.) What the orchestrator learns about that conversation is defined by R16.
 
-**Why:** it removes the hardest problem from V1: what happens when the human writes to a child while the orchestrator is also talking to it. The human interacts through the orchestrator.
+**Why (revised after testing):** the original V1 made children read-only to avoid turn-taking problems. In practice, steering a child directly is useful, and R16 gives the orchestrator what it needs to continue without reading the human's messages.
 
 ### R12. Cancellation cascades
 
@@ -170,13 +171,12 @@ Cancelling the orchestrator, or closing its thread, cancels all its running chil
 
 | Item | Why it waits |
 | :-- | :-- |
-| The human writing directly in a child | Needs rules for turn-taking between human and orchestrator (planned evolution E1). |
 | Children nested more than one level in the sidebar | A child's own subagents do not appear in the sidebar. They stay as cards inside the child (D2). |
 | Proposing this upstream | Experimental. Decide after V1 works. |
 
 ## 6. Planned evolutions
 
-- **E1.** Interact with children directly: a message editor in the child, with the orchestrator notified of human messages and not interrupting them.
+- **E1.** ~~Interact with children directly.~~ Done earlier than planned: see R11 and R16.
 - **E2.** A durable log outside `$TMPDIR`, kept with the thread metadata.
 
 ## 7. Decisions
@@ -193,7 +193,37 @@ Cancelling the orchestrator, or closing its thread, cancels all its running chil
 
 When a child asks for permission (`session/request_permission`), the request appears in the orchestrator's thread, labelled with the child's title, agent and model. The human's answer goes back to the child. The child's row in the sidebar shows "waiting for confirmation" in the meantime.
 
-**Why (decision D4):** children are read-only in V1 (R11), so the request cannot be answered inside the child. Blocking silently would stall parallel work without anyone noticing. Approving automatically would remove the human from the loop.
+**Why (decision D4):** the human is usually watching the orchestrator, not each child. Blocking silently would stall parallel work without anyone noticing. Approving automatically would remove the human from the loop.
+
+### R14. A child knows it is a child
+
+When Zed starts a child, it puts a fixed header before the child's first prompt: the child is a child conversation started by the orchestrator "‹orchestrator title›"; its final message goes back to the orchestrator automatically; it can message the orchestrator during the task with `send_to_parent`. A `whoami` tool, available to every thread, returns its role (orchestrator, child or both), its parent and its children.
+
+**Why:** in testing, a child asked to talk to its orchestrator answered in its own chat, because nothing told it that it had a parent or how to reach it.
+
+### R15. Child-to-orchestrator messages through an inbox
+
+Children get a `send_to_parent(message, urgent?)` tool, both as a native tool and through the MCP server. A message:
+- goes into the orchestrator's inbox and into the child's R4 log, with `direction: to_parent`;
+- is returned to the orchestrator as `pending_messages` on its next `await_children` or `child_status` call, then marked delivered;
+- with `urgent: true`, is also added to the orchestrator's thread as a new message, but only when the orchestrator is idle. It never interrupts a running turn.
+
+**Why:** the orchestrator must hear from a child mid-task (a blocker, a question) without its context filling up, and without being interrupted (R5). The urgent path covers "I am blocked and need a decision". The same inbox later serves sibling messages (R3b).
+
+### R16. Human intervention in a child reaches the orchestrator as a summary
+
+When the human writes directly in a child (R11), the human's messages are **not** logged and **not** sent to the orchestrator. Instead, the orchestrator receives a **summary of the human intervention**: that a human intervened, what was adjusted, and why.
+- The summary is generated **on demand**: when the orchestrator next calls `await_children` or `child_status`, or when the child finishes. It covers every human-driven turn since the previous summary, so hundreds of interactions become one short summary.
+- Zed writes it with the existing `agent.thread_summary_model`, capped at `agent.orchestration.human_summary_max_chars` (default 600).
+- It is logged in the child's R4 log with `direction: human_intervention`, and returned to the orchestrator as `human_interventions` next to the child's status.
+
+**Why:** a human may steer a child through hundreds of turns. The orchestrator does not need the process, only what the human changed and why, so it can continue coherently. Generating the summary on demand means no model call when the orchestrator never asks.
+
+### R17. Task profiles pick the provider
+
+Agent profiles (`agent.profiles`, which already have a name, a tool set and a `default_model`) gain a `description`: when to use the profile. `start_child` gains an optional `profile`. `list_agents_and_models` also returns the profiles with their descriptions, so the orchestrator picks a profile by matching the task to the descriptions. The child's model is resolved in this order: an explicit `model`; the profile's `default_model`; `agent.subagent_model`; the user's default model. The profile's tool set also applies to the child. The child's model is stored in its thread metadata, so the sidebar shows the model and provider icon even when the child is not loaded.
+
+**Why:** today the user must name the model in every request. Reusing profiles adds one field and one parameter, with no new settings section or UI. Profiles cover every provider the native Zed agent supports; routing a profile to an external agent (an `agent` field) is a later step.
 
 ## 8. Expected files touched
 
