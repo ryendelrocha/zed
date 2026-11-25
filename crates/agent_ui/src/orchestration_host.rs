@@ -48,8 +48,10 @@ pub(crate) fn watch_saved_children(cx: &mut App) {
         return;
     };
     cx.set_global(SavedChildrenWatch);
-    restore_saved_children(cx);
-    cx.observe(&store, |_store, cx| restore_saved_children(cx))
+    // Deferred because the store also notifies while a panel is being created
+    // or updated, and the restore reads panels through their hosts.
+    cx.defer(restore_saved_children);
+    cx.observe(&store, |_store, cx| cx.defer(restore_saved_children))
         .detach();
 }
 
