@@ -204,6 +204,17 @@ pub struct OrchestrationSettingsContent {
     ///
     /// Default: 5
     pub subthreads_visible: Option<usize>,
+    /// Whether the orchestration tools (`start_child`, `await_children`,
+    /// `child_status`, `send_to_child`, `cancel_child`) are exposed to agents.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Directory where the per-child exchange logs (JSONL) are written, as
+    /// `<log_dir>/<orchestrator-id>/<child-id>.jsonl`. When unset, a
+    /// `zed-orchestration` folder in the system temporary directory is used.
+    ///
+    /// Default: null
+    pub log_dir: Option<String>,
 }
 
 #[with_fallible_options]

@@ -11,9 +11,7 @@ use collections::{HashMap, HashSet};
 use db::{
     kvp::KeyValueStore,
     sqlez::{
-        bindable::{Bind, Column},
-        domain::Domain,
-        statement::Statement,
+        bindable::Column, domain::Domain, statement::Statement,
         thread_safe_connection::ThreadSafeConnection,
     },
     sqlez_macros::sql,
@@ -30,32 +28,7 @@ use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ThreadId(uuid::Uuid);
-
-impl ThreadId {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-
-    /// Stable, hyphenated string form suitable for use as a key.
-    pub fn to_key_string(&self) -> String {
-        self.0.hyphenated().to_string()
-    }
-}
-
-impl Bind for ThreadId {
-    fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
-        self.0.bind(statement, start_index)
-    }
-}
-
-impl Column for ThreadId {
-    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
-        let (uuid, next) = Column::column(statement, start_index)?;
-        Ok((ThreadId(uuid), next))
-    }
-}
+pub use orchestration::ThreadId;
 
 const THREAD_REMOTE_CONNECTION_MIGRATION_KEY: &str = "thread-metadata-remote-connection-backfill";
 const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
@@ -67,13 +40,19 @@ const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
 pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
-    match connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY) {
-        Ok(mut list_thread_metadata) => list_thread_metadata(),
-        // Thread import reads the database of another release channel, whose migrations may not have added `delta_clones` yet.
-        Err(_) => connection
-            .select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY_WITHOUT_DELTA_CLONES)?(
-        ),
+    // Thread import reads the database of another release channel, whose migrations may not have
+    // added `parent_thread_id` or `delta_clones` yet.
+    if let Ok(mut list_thread_metadata) =
+        connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)
+    {
+        return list_thread_metadata();
     }
+    if let Ok(mut list_thread_metadata) =
+        connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY_WITHOUT_PARENT_THREAD_ID)
+    {
+        return list_thread_metadata();
+    }
+    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY_WITHOUT_DELTA_CLONES)?()
 }
 
 /// Run the `ThreadMetadataDb` migrations on a raw connection.
@@ -131,6 +110,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                     }
 
                     Some(ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id: ThreadId::new(),
                         session_id: Some(entry.id),
                         agent_id: ZED_AGENT_ID.clone(),
@@ -364,6 +344,8 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    /// The orchestrator thread that started this thread as a child, if any.
+    pub parent_thread_id: Option<ThreadId>,
 }
 
 impl ThreadMetadata {
@@ -486,7 +468,7 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
         let session_id = meta
             .session_id
             .clone()
-            .unwrap_or_else(|| acp::SessionId::new(meta.thread_id.0.to_string()));
+            .unwrap_or_else(|| acp::SessionId::new(meta.thread_id.as_uuid().to_string()));
         Self {
             session_id,
             work_dirs: Some(meta.folder_paths().clone()),
@@ -552,6 +534,9 @@ pub struct ThreadMetadataStore {
     reload_task: Option<Shared<Task<()>>>,
     is_loaded: bool,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    /// Parent links requested for threads whose metadata does not exist yet.
+    /// They are applied when the thread's first metadata is saved.
+    pending_parent_links: HashMap<ThreadId, ThreadId>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
@@ -748,6 +733,40 @@ impl ThreadMetadataStore {
     pub fn save(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) {
         self.save_internal(metadata);
         cx.notify();
+    }
+
+    /// Links `thread_id` to the orchestrator thread that started it. When the
+    /// thread has no metadata yet, the link is applied once it is first saved.
+    pub fn set_parent_thread_id(
+        &mut self,
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            self.pending_parent_links
+                .insert(thread_id, parent_thread_id);
+            return;
+        };
+        if existing.parent_thread_id == Some(parent_thread_id) {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            parent_thread_id: Some(parent_thread_id),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    /// The threads started by `parent_thread_id` as its children, in no
+    /// particular order.
+    pub fn child_threads(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> impl Iterator<Item = &ThreadMetadata> {
+        self.threads
+            .values()
+            .filter(move |thread| thread.parent_thread_id == Some(parent_thread_id))
     }
 
     /// Set or clear the user-supplied title for a thread.
@@ -1288,6 +1307,7 @@ impl ThreadMetadataStore {
             reload_task: None,
             is_loaded: false,
             conversation_subscriptions: HashMap::default(),
+            pending_parent_links: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
@@ -1389,7 +1409,12 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
+        let parent_thread_id = existing_thread
+            .and_then(|thread| thread.parent_thread_id)
+            .or_else(|| self.pending_parent_links.remove(&thread_id));
+
         let metadata = ThreadMetadata {
+            parent_thread_id,
             thread_id,
             session_id,
             agent_id,
@@ -1516,6 +1541,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN delta_clones TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN parent_thread_id BLOB;
+        ),
     ];
 }
 
@@ -1532,13 +1560,20 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, delta_clones \
+        main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id \
+        FROM sidebar_threads \
+        ORDER BY updated_at DESC";
+
+    const LIST_QUERY_WITHOUT_PARENT_THREAD_ID: &str = "SELECT thread_id, session_id, agent_id, \
+        title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, \
+        delta_clones, NULL \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
     const LIST_QUERY_WITHOUT_DELTA_CLONES: &str = "SELECT thread_id, session_id, agent_id, \
         title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
-        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, NULL \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, NULL, NULL \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1592,10 +1627,11 @@ impl ThreadMetadataDb {
         let delta_clones = row.worktree_paths.serialized_delta_clones();
         let thread_id = row.thread_id;
         let archived = row.archived;
+        let parent_thread_id = row.parent_thread_id;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, delta_clones) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, delta_clones, parent_thread_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1610,7 +1646,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
-                           delta_clones = excluded.delta_clones";
+                           delta_clones = excluded.delta_clones, \
+                           parent_thread_id = excluded.parent_thread_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1626,7 +1663,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
-            stmt.bind(&delta_clones, i)?;
+            i = stmt.bind(&delta_clones, i)?;
+            stmt.bind(&parent_thread_id, i)?;
             stmt.exec()
         })
         .await
@@ -1785,6 +1823,7 @@ impl Column for ThreadMetadata {
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (delta_clones, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (parent_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1817,7 +1856,7 @@ impl Column for ThreadMetadata {
             delta_clones,
         ));
 
-        let thread_id = ThreadId(thread_id_uuid);
+        let thread_id = ThreadId::from_uuid(thread_id_uuid);
 
         Ok((
             ThreadMetadata {
@@ -1838,6 +1877,7 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                parent_thread_id,
             },
             next,
         ))
@@ -1915,6 +1955,7 @@ mod tests {
         folder_paths: PathList,
     ) -> ThreadMetadata {
         ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new(session_id)),
@@ -2071,6 +2112,83 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_parent_thread_id(_cx: &mut TestAppContext) {
+        let parent = make_metadata("parent", "Parent", Utc::now(), PathList::default());
+        let mut child = make_metadata("child", "Child", Utc::now(), PathList::default());
+        child.parent_thread_id = Some(parent.thread_id);
+        let (parent_id, child_id) = (parent.thread_id, child.thread_id);
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(parent).await.unwrap();
+        db.save(child).await.unwrap();
+
+        let rows = db.list().unwrap();
+        let parent_of = |thread_id: ThreadId| {
+            rows.iter()
+                .find(|row| row.thread_id == thread_id)
+                .map(|row| row.parent_thread_id)
+        };
+        assert_eq!(parent_of(parent_id), Some(None));
+        assert_eq!(parent_of(child_id), Some(Some(parent_id)));
+    }
+
+    #[gpui::test]
+    async fn test_store_set_parent_thread_id_updates_existing_and_pending_threads(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let parent = ThreadId::new();
+
+        let existing = make_metadata("existing", "Existing", Utc::now(), PathList::default());
+        let existing_id = existing.thread_id;
+        store.update(cx, |store, cx| {
+            store.save(existing, cx);
+            store.set_parent_thread_id(existing_id, parent, cx);
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .entry(existing_id)
+                    .map(|thread| thread.parent_thread_id),
+                Some(Some(parent))
+            );
+            assert_eq!(
+                store
+                    .child_threads(parent)
+                    .map(|thread| thread.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![existing_id]
+            );
+        });
+
+        // A link requested before the thread has metadata survives later saves
+        // that rebuild the metadata from the conversation.
+        let pending_id = ThreadId::new();
+        store.update(cx, |store, cx| {
+            store.set_parent_thread_id(pending_id, parent, cx);
+            assert!(store.entry(pending_id).is_none());
+            assert_eq!(store.pending_parent_links.get(&pending_id), Some(&parent));
+            let mut pending = make_metadata("pending", "Pending", Utc::now(), PathList::default());
+            pending.thread_id = pending_id;
+            pending.parent_thread_id = store.pending_parent_links.remove(&pending_id);
+            store.save(pending, cx);
+        });
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.child_threads(parent).count(), 2);
+        });
     }
 
     #[gpui::test]
@@ -2260,6 +2378,7 @@ mod tests {
         });
 
         let moved_metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: session1_thread_id,
             session_id: Some(acp::SessionId::new("session-1")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2345,6 +2464,7 @@ mod tests {
         let now = Utc::now();
 
         let existing_metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("a-session-0")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2471,6 +2591,7 @@ mod tests {
         let existing_updated_at = Utc::now();
 
         let existing_metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("existing-session")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -3215,6 +3336,7 @@ mod tests {
             WorktreePaths::from_path_lists(main_paths.clone(), linked_paths).unwrap();
 
         let local_linked_thread = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new("local-linked")),
@@ -3229,6 +3351,7 @@ mod tests {
         };
 
         let remote_linked_thread = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             archived: false,
             session_id: Some(acp::SessionId::new("remote-linked")),
@@ -3780,7 +3903,7 @@ mod tests {
         connection
             .migrate(
                 ThreadMetadataDb::NAME,
-                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1],
+                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 2],
                 &mut |_, _, _| false,
             )
             .unwrap();
@@ -3797,13 +3920,90 @@ mod tests {
         ))
         .unwrap();
 
-        let titles = list_thread_metadata_from_connection(&connection)
-            .unwrap()
-            .into_iter()
-            .map(|thread| thread.title())
-            .collect::<Vec<_>>();
+        let threads = list_thread_metadata_from_connection(&connection).unwrap();
 
-        assert_eq!(titles, [Some("Saved by an older build".into())]);
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.title())
+                .collect::<Vec<_>>(),
+            [Some("Saved by an older build".into())]
+        );
+        assert_eq!(threads[0].parent_thread_id, None);
+    }
+
+    #[test]
+    fn test_list_reads_database_saved_before_parent_thread_id() {
+        let connection = db::sqlez::connection::Connection::open_memory(Some(
+            "test_list_reads_database_saved_before_parent_thread_id",
+        ));
+        connection
+            .migrate(
+                ThreadMetadataDb::NAME,
+                &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1],
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+        connection
+            .exec_bound::<(uuid::Uuid, &str, &str, &str)>(
+                "INSERT INTO sidebar_threads (thread_id, session_id, title, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .unwrap()((
+            uuid::Uuid::new_v4(),
+            "session",
+            "Saved before the parent link",
+            "2024-01-01T00:00:00Z",
+        ))
+        .unwrap();
+
+        let threads = list_thread_metadata_from_connection(&connection).unwrap();
+
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].parent_thread_id, None);
+    }
+
+    #[test]
+    fn test_parent_thread_id_migration_and_round_trip() {
+        let connection = db::sqlez::connection::Connection::open_memory(Some(
+            "test_parent_thread_id_migration_and_round_trip",
+        ));
+        run_thread_metadata_migrations(&connection);
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        let mut insert = connection
+            .exec_bound::<(ThreadId, &str, &str, &str, Option<ThreadId>)>(
+                "INSERT INTO sidebar_threads (thread_id, session_id, title, updated_at, parent_thread_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .unwrap();
+        insert((
+            parent,
+            "parent-session",
+            "Parent",
+            "2024-01-02T00:00:00Z",
+            None,
+        ))
+        .unwrap();
+        insert((
+            child,
+            "child-session",
+            "Child",
+            "2024-01-01T00:00:00Z",
+            Some(parent),
+        ))
+        .unwrap();
+
+        let threads = list_thread_metadata_from_connection(&connection).unwrap();
+
+        let parent_of = |thread_id: ThreadId| {
+            threads
+                .iter()
+                .find(|thread| thread.thread_id == thread_id)
+                .map(|thread| thread.parent_thread_id)
+        };
+        assert_eq!(parent_of(parent), Some(None));
+        assert_eq!(parent_of(child), Some(Some(parent)));
     }
 
     #[gpui::test]

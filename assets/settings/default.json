@@ -1210,6 +1210,12 @@
       "show_as_subthreads": true,
       // How many subagent threads to list under a parent thread before "Load more".
       "subthreads_visible": 5,
+      // Expose the orchestration tools (start_child, await_children, child_status,
+      // send_to_child, cancel_child) to agents.
+      "enabled": true,
+      // Directory for the per-child exchange logs. null uses `zed-orchestration`
+      // in the system temporary directory.
+      "log_dir": null,
     },
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.

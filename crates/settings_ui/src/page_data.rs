@@ -9102,7 +9102,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 10] {
+    fn general_section() -> [SettingsPageItem; 12] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9246,6 +9246,67 @@ fn ai_page(cx: &App) -> SettingsPage {
                     },
                 }),
                 metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Orchestration Tools",
+                description: "Whether the orchestration tools (start_child, await_children, child_status, send_to_child, cancel_child) are exposed to agents.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.enabled"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .enabled
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Orchestration Log Directory",
+                description: "Directory where the per-child orchestration logs (JSONL) are written. Leave empty to use the system temporary directory.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.log_dir"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .log_dir
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .log_dir = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("e.g. /tmp/zed-orchestration"),
+                    display_confirm_button: true,
+                    display_clear_button: true,
+                    confirm_on_focus_out: true,
+                    treat_missing_text_as_empty: true,
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SubPageLink(SubPageLink {

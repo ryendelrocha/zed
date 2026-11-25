@@ -1255,6 +1255,7 @@ fn save_thread_metadata(
             .map(|e| e.thread_id)
             .unwrap_or_else(ThreadId::new);
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id,
             session_id: Some(session_id),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -1307,6 +1308,7 @@ fn save_thread_metadata_with_worktree_paths(
             .unwrap_or_else(ThreadId::new)
     });
     let metadata = ThreadMetadata {
+        parent_thread_id: None,
         thread_id,
         session_id: Some(session_id),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -1334,6 +1336,7 @@ fn save_draft_metadata_with_main_paths(
 ) -> ThreadId {
     let thread_id = ThreadId::new();
     let metadata = ThreadMetadata {
+        parent_thread_id: None,
         thread_id,
         session_id: None,
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -2310,6 +2313,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
     let thread = |name: &str| {
         ListEntry::Thread(Arc::new(ThreadEntry {
             metadata: ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from(name))),
                 agent_id: AgentId::new("zed-agent"),
@@ -2402,6 +2406,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             },
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-1"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2429,6 +2434,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-2"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2456,6 +2462,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-3"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2484,6 +2491,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-4"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -2512,6 +2520,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: notified_thread_id,
                     session_id: Some(acp::SessionId::new(Arc::from("t-5"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -9707,6 +9716,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9788,6 +9798,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
             ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9858,6 +9869,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
             ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("unknown-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9926,6 +9938,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
             ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("no-context-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -9984,6 +9997,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
             ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10041,6 +10055,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
     sidebar.update_in(cx_a, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
             ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10120,6 +10135,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
 
     let session_id = acp::SessionId::new(Arc::from("archived-cross-window-with-sidebar"));
     let metadata = ThreadMetadata {
+        parent_thread_id: None,
         thread_id: ThreadId::new(),
         session_id: Some(session_id.clone()),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10203,6 +10219,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
 
     let session_id = acp::SessionId::new(Arc::from("archived-current-window"));
     let metadata = ThreadMetadata {
+        parent_thread_id: None,
         thread_id: ThreadId::new(),
         session_id: Some(session_id.clone()),
         agent_id: agent::ZED_AGENT_ID.clone(),
@@ -10535,6 +10552,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
     });
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new(Arc::from("remote-thread"))),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -11189,6 +11207,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
         remote::RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 99 });
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new(Arc::from("remote-wt-thread"))),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12116,6 +12135,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12210,6 +12230,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: original_thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -12437,6 +12458,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -13288,6 +13310,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 ThreadMetadata {
+                    parent_thread_id: None,
                     thread_id: original_thread_id,
                     session_id: Some(session_id.clone()),
                     agent_id: agent::ZED_AGENT_ID.clone(),
@@ -13839,6 +13862,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
     let legacy_session = acp::SessionId::new(Arc::from("legacy-main-thread"));
     cx.update(|_, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(legacy_session.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -15230,6 +15254,7 @@ mod property_test {
             .unwrap()
             + chrono::Duration::seconds(state.thread_counter as i64);
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(session_id),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -15302,6 +15327,7 @@ mod property_test {
                             .unwrap()
                             + chrono::Duration::seconds(state.thread_counter as i64);
                     let metadata = cx.update(|_, cx| ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id,
                         session_id: Some(session_id),
                         agent_id,
@@ -16166,6 +16192,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
     });
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(remote_thread_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -17248,6 +17275,7 @@ async fn test_remote_archive_thread_with_active_connection(
     let wt_thread_id = acp::SessionId::new(Arc::from("worktree-thread"));
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(wt_thread_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -17390,6 +17418,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
     let worktree_thread_id = ThreadId::new();
     cx.update(|_window, cx| {
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: worktree_thread_id,
             session_id: Some(worktree_session_id.clone()),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -18273,6 +18302,7 @@ fn set_orchestration_settings(
                 orchestration: agent_settings::OrchestrationSettings {
                     show_as_subthreads,
                     subthreads_visible,
+                    ..AgentSettings::get_global(cx).orchestration
                 },
                 ..AgentSettings::get_global(cx).clone()
             },

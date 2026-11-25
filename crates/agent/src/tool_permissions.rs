@@ -638,6 +638,7 @@ mod tests {
             orchestration: agent_settings::OrchestrationSettings {
                 show_as_subthreads: true,
                 subthreads_visible: 5,
+                enabled: true,
             },
             thinking_display: Default::default(),
         }

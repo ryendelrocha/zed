@@ -33,6 +33,37 @@ pub fn set_stub_agent_connection(connection: StubAgentConnection) -> StubAgentCo
     connection
 }
 
+thread_local! {
+    static STUB_AGENT_SERVER_CONNECTION: RefCell<Option<StubAgentConnection>> = const { RefCell::new(None) };
+}
+
+/// Clears the override installed by [`use_connection_for_stub_agent`] when dropped.
+pub struct StubAgentConnectionOverride;
+
+impl Drop for StubAgentConnectionOverride {
+    fn drop(&mut self) {
+        STUB_AGENT_SERVER_CONNECTION.with(|cell| cell.borrow_mut().take());
+    }
+}
+
+/// Makes every thread started with `Agent::Stub` use `connection`, instead of a
+/// connection that answers each prompt with a default response. This is for
+/// tests where the panel starts the thread itself, so the test cannot pass a
+/// server in.
+pub fn use_connection_for_stub_agent(
+    connection: StubAgentConnection,
+) -> StubAgentConnectionOverride {
+    STUB_AGENT_SERVER_CONNECTION.with(|cell| *cell.borrow_mut() = Some(connection));
+    StubAgentConnectionOverride
+}
+
+pub(crate) fn stub_agent_server() -> Rc<dyn AgentServer> {
+    match STUB_AGENT_SERVER_CONNECTION.with(|cell| cell.borrow().clone()) {
+        Some(connection) => Rc::new(StubAgentServer::new(connection)),
+        None => Rc::new(StubAgentServer::default_response()),
+    }
+}
+
 pub struct StubAgentServer<C> {
     connection: C,
     agent_id: AgentId,

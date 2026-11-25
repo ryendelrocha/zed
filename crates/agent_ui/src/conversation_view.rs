@@ -2092,6 +2092,31 @@ impl ConversationView {
         }
     }
 
+    /// Why the agent failed to load, if it did.
+    pub(crate) fn load_error_message(&self) -> Option<SharedString> {
+        match &self.server_state {
+            ServerState::LoadError { error } => Some(error.to_string().into()),
+            _ => None,
+        }
+    }
+
+    /// Sends a message on behalf of an orchestrator. A thread that is
+    /// generating queues it and sends it when the turn ends. Returns whether
+    /// the message was queued.
+    pub(crate) fn send_follow_up(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        let thread_view = self
+            .root_thread_view()
+            .ok_or_else(|| anyhow::anyhow!("The thread is not connected yet."))?;
+        Ok(thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_follow_up(content, window, cx)
+        }))
+    }
+
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         if let Some(active) = self.active_thread() {
             active.update(cx, |active, cx| {
@@ -8493,6 +8518,7 @@ pub(crate) mod tests {
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                     store.save(
                         ThreadMetadata {
+                            parent_thread_id: None,
                             thread_id,
                             session_id: Some(session_id.clone()),
                             agent_id: AgentId::new("Test"),
@@ -9009,6 +9035,7 @@ pub(crate) mod tests {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id: ThreadId::new(),
                         session_id: Some(resume_session_id.clone()),
                         agent_id: ProjectAgentId::new("Flaky"),

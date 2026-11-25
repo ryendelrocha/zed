@@ -263,6 +263,50 @@ Open the Settings Editor and search for “Visible Subagent Threads”. Or add t
 }
 ```
 
+### Orchestration Tools {#agent-orchestration-enabled}
+
+- Description: Whether the orchestration tools (`start_child`, `await_children`, `child_status`, `send_to_child` and `cancel_child`) are exposed to agents, so one thread can start other threads and collect their final results.
+- Setting: `agent.orchestration.enabled`
+- Default: `true`
+
+**Options**
+
+`true` or `false`.
+
+Open the Settings Editor and search for “Orchestration Tools”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "enabled": false
+    }
+  }
+}
+```
+
+### Orchestration Log Directory {#agent-orchestration-log-dir}
+
+- Description: Directory where Zed writes one JSONL log per child thread, with only the exchanges between the orchestrator and the child.
+- Setting: `agent.orchestration.log_dir`
+- Default: `null` (a `zed-orchestration` folder in the system temporary directory)
+
+**Options**
+
+A directory path, or `null`. Logs are written to `<log_dir>/<orchestrator-id>/<child-id>.jsonl`.
+
+Open the Settings Editor and search for “Orchestration Log Directory”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "log_dir": "/tmp/my-orchestration-logs"
+    }
+  }
+}
+```
+
 ## Agent UI Font Family {#agent-ui-font-family}
 
 - Description: Font family for agent responses in the Agent Panel.

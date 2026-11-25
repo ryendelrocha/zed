@@ -161,6 +161,7 @@ members = [
     "crates/open_router",
     "crates/openai_subscribed",
     "crates/opencode",
+    "crates/orchestration",
     "crates/outline",
     "crates/outline_panel",
     "crates/path",
@@ -440,6 +441,7 @@ open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
 openai_subscribed = { path = "crates/openai_subscribed" }
 opencode = { path = "crates/opencode" }
+orchestration = { path = "crates/orchestration" }
 outline = { path = "crates/outline" }
 outline_panel = { path = "crates/outline_panel" }
 path = { path = "crates/path" }

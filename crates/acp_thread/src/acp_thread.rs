@@ -4404,6 +4404,35 @@ impl AcpThread {
         &self.entries
     }
 
+    /// The text of the last assistant message written after the latest user
+    /// message, without thoughts, tool calls or earlier messages. `None` when
+    /// the assistant has not written text since the user last spoke.
+    pub fn last_assistant_message(&self, cx: &App) -> Option<String> {
+        let turn_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map_or(0, |index| index + 1);
+        self.entries[turn_start..].iter().rev().find_map(|entry| {
+            let AgentThreadEntry::AssistantMessage(message) = entry else {
+                return None;
+            };
+            if message.is_subagent_output {
+                return None;
+            }
+            let text = message
+                .chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                    AssistantMessageChunk::Thought { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.trim().is_empty()).then_some(text)
+        })
+    }
+
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
         &self.notices
     }
@@ -15777,6 +15806,51 @@ mod tests {
             assert_eq!(
                 agent_message.identity,
                 MessageIdentity::Legacy(Some("agent_user_chunk".into()))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_last_assistant_message_returns_only_the_latest_turn_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.last_assistant_message(cx), None);
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "first question".into(), cx);
+            thread.push_assistant_content_block("first answer".into(), false, cx);
+            thread.push_user_content_block(None, "second question".into(), cx);
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.last_assistant_message(cx),
+                None,
+                "an earlier turn's answer is not the latest turn's"
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block("private reasoning".into(), true, cx);
+            thread.push_assistant_content_block("final answer".into(), false, cx);
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.last_assistant_message(cx).as_deref(),
+                Some("final answer")
             );
         });
     }

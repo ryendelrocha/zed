@@ -1055,6 +1055,9 @@ pub struct CreateThreadOptions {
     /// freshly-created sibling worktree). When `None`, the thread inherits
     /// the project's default path list.
     pub work_dirs: Option<PathList>,
+    /// The orchestrator thread that starts this thread as a child. Stored in
+    /// the new thread's metadata.
+    pub parent_thread_id: Option<ThreadId>,
 }
 
 pub(crate) struct AgentThread {
@@ -1568,7 +1571,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1639,8 +1642,22 @@ impl AgentPanel {
             this.cleanup_retained_threads(cx);
         });
 
-        cx.on_release(|this, cx| {
+        let orchestration_host: Rc<dyn orchestration::OrchestrationHost> =
+            Rc::new(crate::orchestration_host::AgentPanelOrchestrationHost::new(
+                cx.weak_entity(),
+                window.window_handle(),
+            ));
+        orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+            registry.register_host(orchestration_host.clone());
+        });
+
+        cx.on_release(move |this, cx| {
             this.dismiss_all_terminal_notifications(cx);
+            if let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) {
+                registry.update(cx, |registry, _| {
+                    registry.unregister_host(&orchestration_host);
+                });
+            }
         })
         .detach();
 
@@ -3392,6 +3409,11 @@ impl AgentPanel {
             self.set_selected_agent_and_persist(original, cx);
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
+        if let Some(parent_thread_id) = options.parent_thread_id {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_parent_thread_id(thread_id, parent_thread_id, cx);
+            });
+        }
         self.insert_retained_thread(thread_id, thread.conversation_view, cx);
         thread_id
     }
@@ -3432,6 +3454,9 @@ impl AgentPanel {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
+        if let Some(registry) = orchestration::OrchestrationRegistry::try_global(cx) {
+            registry.update(cx, |registry, cx| registry.remove_orchestrator(id, cx));
+        }
 
         if self
             .draft_thread
@@ -4888,6 +4913,33 @@ impl AgentPanel {
         });
     }
 
+    pub(crate) fn selected_agent_is_native(&self) -> bool {
+        self.selected_agent.is_native()
+    }
+
+    /// The agents (and, for the native agent, models) a new thread can use.
+    pub(crate) fn available_agents(&self, cx: &App) -> agent::AvailableAgents {
+        let mut agents = vec![agent::available_native_agent(cx)];
+
+        let agent_server_store = self.project.read(cx).agent_server_store().clone();
+        let store = agent_server_store.read(cx);
+        for agent_id in store.external_agents() {
+            let display = store
+                .agent_display_name(agent_id)
+                .unwrap_or_else(|| agent_id.0.clone());
+            agents.push(agent::AvailableAgent {
+                id: agent_id.0.to_string(),
+                name: display,
+                is_native: false,
+                // External agents pick their own models dynamically; we don't
+                // try to enumerate them ahead of time.
+                models: Vec::new(),
+            });
+        }
+
+        agent::AvailableAgents { agents }
+    }
+
     fn active_thread_has_messages(&self, cx: &App) -> bool {
         self.active_agent_thread(cx)
             .is_some_and(|thread| !thread.read(cx).entries().is_empty())
@@ -4973,145 +5025,30 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
         let panel = self.panel.clone();
         let window = self.window;
         cx.spawn(async move |cx| {
-            let agent_choice = match request.agent_id.as_deref() {
-                None => None,
-                Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
-                Some(id) => {
-                    // Reject unknown agent ids up front so the model gets a
-                    // structured error pointing at `list_agents_and_models`,
-                    // rather than a thread that silently fails to launch in
-                    // the user's sidebar.
-                    let known = panel
-                        .read_with(cx, |panel, cx| {
-                            let store = panel.project.read(cx).agent_server_store().clone();
-                            store
-                                .read(cx)
-                                .external_agents()
-                                .any(|known_id| known_id.0.as_ref() == id)
-                        })
-                        .unwrap_or(false);
-                    if !known {
-                        return Err(anyhow!(
-                            "Unknown agent id {id:?}. Call `list_agents_and_models` \
-                             to see the agents available for `create_thread`."
-                        ));
-                    }
-                    Some(Agent::Custom {
-                        id: project::AgentId(id.to_string().into()),
-                    })
-                }
-            };
-
-            let initial_content = AgentInitialContent::ContentBlock {
-                blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                    request.prompt.clone(),
-                ))],
-                auto_submit: true,
-            };
-
-            let title: SharedString = request.title.clone();
-            let options = CreateThreadOptions {
-                title: Some(title.clone()),
-                initial_content: Some(initial_content),
-                agent: agent_choice.clone(),
-                model: request.model.clone(),
-                work_dirs: None,
-            };
-
-            // If the caller asked for a fresh worktree, open a new workspace
-            // backed by a linked git worktree of each git repo in the parent
-            // project — the same flow the user gets when they pick "Create
-            // worktree" from the worktree picker. The sibling thread is then
-            // created inside the new workspace's agent panel, so it lives
-            // alongside any threads the user would create there manually.
-            let mut worktree_warning: Option<String> = None;
-            let target_panel = if request.use_new_worktree {
-                let workspace = panel.read_with(cx, |panel, _cx| panel.workspace.clone())?;
-                let workspace = workspace
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("Source workspace is no longer available"))?;
-                // The branch target follows the existing UI semantics: when
-                // `base_ref` is set, treat it as the ref to base off of
-                // (resolved like `git switch --detach <ref>`); otherwise base
-                // off the current HEAD. Either way the new worktrees are in
-                // detached HEAD state — the agent can attach to a branch via
-                // git afterwards.
-                let branch_target = match request.base_ref.as_ref() {
-                    Some(ref_name) => zed_actions::NewWorktreeBranchTarget::ExistingBranch {
-                        name: ref_name.clone(),
-                    },
-                    None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
-                };
-                let action = zed_actions::CreateWorktree {
-                    worktree_name: request.worktree_name.clone(),
-                    branch_target,
-                };
-                let creation = window.update(cx, |_root, window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        git_ui_core::worktree_service::create_worktree_workspace(
-                            workspace, &action, window, None, cx,
-                        )
-                    })
-                })?;
-                let created = creation
-                    .await
-                    .context("failed to create worktree workspace")?;
-                // The creation flow tells us when the project had multiple
-                // worktrees of the same underlying repo, which it consolidates
-                // into one new worktree — flag it so the calling agent knows
-                // the result may not reflect every source worktree's state.
-                if created.consolidated_worktrees {
-                    worktree_warning = Some(
-                        "The project contained multiple worktrees backed by the same git \
-                         repository, so they were consolidated into a single new worktree. \
-                         The new thread's worktree is based on one of them and may not \
-                         reflect the exact state of the others."
-                            .to_string(),
-                    );
-                }
-                // Locate the agent panel on the new workspace. We rely on
-                // the panel having registered by the time
-                // `create_worktree_workspace` returns — `open_worktree_workspace`
-                // explicitly awaits `take_panels_task` and the initial scan.
-                created
-                    .workspace
-                    .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
-                    .ok_or_else(|| anyhow!("new workspace did not register an agent panel"))?
-                    .downgrade()
-            } else {
-                panel.clone()
-            };
-            // Both the source panel and any newly-opened worktree workspace
-            // live in the same OS window (the new workspace is a tab on the
-            // existing MultiWorkspace), so the original window handle is
-            // still the right context for the `create_thread_with_options`
-            // call regardless of which panel ends up the target.
-            let target_window = window;
-
-            // We deliberately don't wait for the new thread's session to
-            // become available here: there are currently no agent tools that
-            // operate on sibling threads by session ID, so requiring one would
-            // just introduce a race for no benefit.
-            let resolved_agent_id = target_window.update(cx, |_root, window, cx| {
-                target_panel.update(cx, |panel, cx| {
-                    panel.create_thread_with_options(
-                        options,
-                        AgentThreadSource::AgentPanel,
-                        window,
-                        cx,
-                    );
-                    let resolved_agent = agent_choice
-                        .clone()
-                        .unwrap_or_else(|| panel.selected_agent.clone());
-                    resolved_agent.id()
-                })
-            })??;
+            let title = request.title.clone();
+            let model = request.model.clone();
+            let child = create_child_thread(
+                panel,
+                window,
+                ChildThreadRequest {
+                    title: request.title,
+                    prompt: request.prompt,
+                    agent_id: request.agent_id,
+                    model: request.model,
+                    use_new_worktree: request.use_new_worktree,
+                    base_ref: request.base_ref,
+                    worktree_name: request.worktree_name,
+                    parent_thread_id: None,
+                },
+                cx,
+            )
+            .await?;
 
             Ok(agent::SiblingThreadInfo {
                 title,
-                agent_id: resolved_agent_id.0.to_string(),
-                model: request.model,
-                warning: worktree_warning,
+                agent_id: child.agent_id.0.to_string(),
+                model,
+                warning: child.warning,
             })
         })
     }
@@ -5121,28 +5058,177 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             .panel
             .upgrade()
             .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
-
-        let mut agents = vec![agent::available_native_agent(cx)];
-
-        let project = panel.read(cx).project.clone();
-        let agent_server_store = project.read(cx).agent_server_store().clone();
-        let store = agent_server_store.read(cx);
-        for agent_id in store.external_agents() {
-            let display = store
-                .agent_display_name(agent_id)
-                .unwrap_or_else(|| agent_id.0.clone());
-            agents.push(agent::AvailableAgent {
-                id: agent_id.0.to_string(),
-                name: display,
-                is_native: false,
-                // External agents pick their own models dynamically; we don't
-                // try to enumerate them ahead of time.
-                models: Vec::new(),
-            });
-        }
-
-        Ok(agent::AvailableAgents { agents })
+        Ok(panel.read(cx).available_agents(cx))
     }
+}
+
+/// What `create_child_thread` needs to start a thread on behalf of an agent.
+pub(crate) struct ChildThreadRequest {
+    pub title: SharedString,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub model: Option<String>,
+    pub use_new_worktree: bool,
+    pub base_ref: Option<String>,
+    pub worktree_name: Option<String>,
+    pub parent_thread_id: Option<ThreadId>,
+}
+
+pub(crate) struct ChildThread {
+    pub thread_id: ThreadId,
+    pub conversation_view: Entity<ConversationView>,
+    pub agent_id: AgentId,
+    pub warning: Option<String>,
+}
+
+/// Creates a thread that starts on its own from `request.prompt`, optionally
+/// in a new worktree and workspace. It does not wait for the thread's session.
+pub(crate) async fn create_child_thread(
+    panel: WeakEntity<AgentPanel>,
+    window: gpui::AnyWindowHandle,
+    request: ChildThreadRequest,
+    cx: &mut gpui::AsyncApp,
+) -> Result<ChildThread> {
+    let agent_choice = match request.agent_id.as_deref() {
+        None => None,
+        Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
+        Some(id) => {
+            // Reject unknown agent ids up front so the model gets a
+            // structured error pointing at `list_agents_and_models`,
+            // rather than a thread that silently fails to launch in
+            // the user's sidebar.
+            let known = panel
+                .read_with(cx, |panel, cx| {
+                    let store = panel.project.read(cx).agent_server_store().clone();
+                    store
+                        .read(cx)
+                        .external_agents()
+                        .any(|known_id| known_id.0.as_ref() == id)
+                })
+                .unwrap_or(false);
+            if !known {
+                return Err(anyhow!(
+                    "Unknown agent id {id:?}. Call `list_agents_and_models` \
+                     to see the available agents."
+                ));
+            }
+            Some(Agent::Custom {
+                id: project::AgentId(id.to_string().into()),
+            })
+        }
+    };
+
+    let initial_content = AgentInitialContent::ContentBlock {
+        blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+            request.prompt.clone(),
+        ))],
+        auto_submit: true,
+    };
+
+    let options = CreateThreadOptions {
+        title: Some(request.title.clone()),
+        initial_content: Some(initial_content),
+        agent: agent_choice.clone(),
+        model: request.model.clone(),
+        work_dirs: None,
+        parent_thread_id: request.parent_thread_id,
+    };
+
+    // If the caller asked for a fresh worktree, open a new workspace
+    // backed by a linked git worktree of each git repo in the parent
+    // project — the same flow the user gets when they pick "Create
+    // worktree" from the worktree picker. The new thread is then
+    // created inside the new workspace's agent panel, so it lives
+    // alongside any threads the user would create there manually.
+    let mut worktree_warning: Option<String> = None;
+    let target_panel = if request.use_new_worktree {
+        let workspace = panel.read_with(cx, |panel, _cx| panel.workspace.clone())?;
+        let workspace = workspace
+            .upgrade()
+            .ok_or_else(|| anyhow!("Source workspace is no longer available"))?;
+        // The branch target follows the existing UI semantics: when
+        // `base_ref` is set, treat it as the ref to base off of
+        // (resolved like `git switch --detach <ref>`); otherwise base
+        // off the current HEAD. Either way the new worktrees are in
+        // detached HEAD state — the agent can attach to a branch via
+        // git afterwards.
+        let branch_target = match request.base_ref.as_ref() {
+            Some(ref_name) => zed_actions::NewWorktreeBranchTarget::ExistingBranch {
+                name: ref_name.clone(),
+            },
+            None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+        };
+        let action = zed_actions::CreateWorktree {
+            worktree_name: request.worktree_name.clone(),
+            branch_target,
+        };
+        let creation = window.update(cx, |_root, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                git_ui_core::worktree_service::create_worktree_workspace(
+                    workspace, &action, window, None, cx,
+                )
+            })
+        })?;
+        let created = creation
+            .await
+            .context("failed to create worktree workspace")?;
+        // The creation flow tells us when the project had multiple
+        // worktrees of the same underlying repo, which it consolidates
+        // into one new worktree — flag it so the calling agent knows
+        // the result may not reflect every source worktree's state.
+        if created.consolidated_worktrees {
+            worktree_warning = Some(
+                "The project contained multiple worktrees backed by the same git \
+                 repository, so they were consolidated into a single new worktree. \
+                 The new thread's worktree is based on one of them and may not \
+                 reflect the exact state of the others."
+                    .to_string(),
+            );
+        }
+        // Locate the agent panel on the new workspace. We rely on
+        // the panel having registered by the time
+        // `create_worktree_workspace` returns — `open_worktree_workspace`
+        // explicitly awaits `take_panels_task` and the initial scan.
+        created
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+            .ok_or_else(|| anyhow!("new workspace did not register an agent panel"))?
+            .downgrade()
+    } else {
+        panel.clone()
+    };
+    // Both the source panel and any newly-opened worktree workspace
+    // live in the same OS window (the new workspace is a tab on the
+    // existing MultiWorkspace), so the original window handle is
+    // still the right context for the `create_thread_with_options`
+    // call regardless of which panel ends up the target.
+    let (thread_id, conversation_view, agent_id) =
+        window.update(cx, |_root, window, cx| {
+            target_panel.update(cx, |panel, cx| {
+                let resolved_agent = agent_choice
+                    .clone()
+                    .unwrap_or_else(|| panel.selected_agent.clone());
+                let thread_id = panel.create_thread_with_options(
+                    options,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                let conversation_view = panel
+                    .retained_threads
+                    .get(&thread_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("the new thread was not retained by the agent panel"))?;
+                anyhow::Ok((thread_id, conversation_view, resolved_agent.id()))
+            })
+        })???;
+
+    Ok(ChildThread {
+        thread_id,
+        conversation_view,
+        agent_id,
+        warning: worktree_warning,
+    })
 }
 
 impl Focusable for AgentPanel {
@@ -8381,6 +8467,7 @@ mod tests {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id: ThreadId::new(),
                         session_id: Some(resume_session_id.clone()),
                         agent_id: ProjectAgentId::new("Flaky"),
@@ -11862,6 +11949,7 @@ mod tests {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     crate::thread_metadata_store::ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id,
                         session_id: Some(acp_v2::SessionId::new("saved-session")),
                         agent_id: Agent::Stub.id(),
@@ -11986,6 +12074,7 @@ mod tests {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     crate::thread_metadata_store::ThreadMetadata {
+                        parent_thread_id: None,
                         thread_id: ThreadId::new(),
                         session_id: Some(source_session_id.clone()),
                         agent_id: Agent::NativeAgent.id(),
@@ -15266,5 +15355,530 @@ mod tests {
                 &session_id
             );
         });
+    }
+
+    struct OrchestrationFixture {
+        panel: Entity<AgentPanel>,
+        cx: VisualTestContext,
+        connection: StubAgentConnection,
+        orchestrator: ThreadId,
+        host: Rc<dyn orchestration::OrchestrationHost>,
+        log_dir: tempfile::TempDir,
+        _connection_override: crate::test_support::StubAgentConnectionOverride,
+    }
+
+    async fn setup_orchestration(cx: &mut TestAppContext) -> OrchestrationFixture {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        let connection_override =
+            crate::test_support::use_connection_for_stub_agent(connection.clone());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+        let orchestrator = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.create_thread_with_options(
+                CreateThreadOptions::default(),
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        let log_dir = tempfile::tempdir().unwrap();
+        cx.update(|_window, cx| {
+            let log_dir = log_dir.path().to_string_lossy().to_string();
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .orchestration
+                        .get_or_insert_default()
+                        .log_dir = Some(log_dir);
+                });
+            });
+        });
+        let host = cx
+            .update(|_window, cx| {
+                orchestration::OrchestrationRegistry::global_or_init(cx)
+                    .read(cx)
+                    .host_for_thread(orchestrator, cx)
+            })
+            .expect("the panel should register an orchestration host");
+        OrchestrationFixture {
+            panel,
+            cx,
+            connection,
+            orchestrator,
+            host,
+            log_dir,
+            _connection_override: connection_override,
+        }
+    }
+
+    fn start_child_input(title: &str, prompt: &str) -> orchestration::StartChildInput {
+        orchestration::StartChildInput {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            agent: None,
+            model: None,
+            worktree: orchestration::WorktreeMode::Shared,
+            base_ref: None,
+            worktree_name: None,
+        }
+    }
+
+    impl OrchestrationFixture {
+        async fn start_child(&mut self, input: orchestration::StartChildInput) -> ThreadId {
+            let task = self
+                .cx
+                .update(|_window, cx| self.host.start_child(self.orchestrator, input, cx));
+            let output = task.await.expect("start_child should succeed");
+            self.cx.run_until_parked();
+            ThreadId::from_key_string(&output.child_id).expect("child_id should be a thread id")
+        }
+
+        fn child_record(&mut self, child: ThreadId) -> (ChildStatus, Option<String>, u32) {
+            self.cx.update(|_window, cx| {
+                let registry = orchestration::OrchestrationRegistry::global(cx);
+                let registry = registry.read(cx);
+                let record = registry
+                    .child(self.orchestrator, child)
+                    .expect("the child should be registered");
+                (record.status, record.final_message.clone(), record.turns)
+            })
+        }
+
+        fn child_session_id(&mut self, child: ThreadId) -> acp_v2::SessionId {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                panel.retained_threads[&child]
+                    .read(cx)
+                    .root_thread(cx)
+                    .expect("the child should have a root thread")
+                    .read(cx)
+                    .session_id()
+                    .clone()
+            })
+        }
+    }
+
+    use orchestration::{ChildStatus, LogDirection};
+
+    #[gpui::test]
+    async fn test_orchestration_start_child_creates_linked_thread(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("child result".into()),
+            )]);
+
+        let child = fixture
+            .start_child(start_child_input("Research", "look into it"))
+            .await;
+
+        fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            assert!(
+                panel.retained_threads.contains_key(&child),
+                "the child is a regular retained thread"
+            );
+            assert_ne!(child, fixture.orchestrator);
+            assert!(
+                panel.retained_threads[&child]
+                    .read(cx)
+                    .root_thread(cx)
+                    .is_some()
+            );
+        });
+        let orchestrator = fixture.orchestrator;
+        fixture.cx.update(|_window, cx| {
+            let store = ThreadMetadataStore::global(cx);
+            assert_eq!(
+                store
+                    .read(cx)
+                    .entry(child)
+                    .map(|metadata| metadata.parent_thread_id),
+                Some(Some(orchestrator)),
+                "the child's metadata links to the orchestrator"
+            );
+            assert_eq!(
+                store
+                    .read(cx)
+                    .entry(orchestrator)
+                    .map(|metadata| metadata.parent_thread_id),
+                Some(None)
+            );
+        });
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("child result"));
+        assert_eq!(turns, 1);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_start_child_in_new_worktree_without_git_reports_the_error(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let mut input = start_child_input("Isolated", "work alone");
+        input.worktree = orchestration::WorktreeMode::New;
+
+        // The test project is not a git repository, so the new worktree cannot
+        // be created. The error must reach the orchestrator, and no thread or
+        // child record may be left behind.
+        let task = fixture
+            .cx
+            .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx));
+        let error = task
+            .await
+            .expect_err("a project without git has no worktree to create");
+        assert!(
+            !error.to_string().is_empty(),
+            "the failure should be explained"
+        );
+        fixture.cx.run_until_parked();
+
+        let orchestrator = fixture.orchestrator;
+        fixture.cx.update(|_window, cx| {
+            let registry = orchestration::OrchestrationRegistry::global(cx);
+            assert!(registry.read(cx).children(orchestrator).is_empty());
+        });
+        fixture.panel.read_with(&fixture.cx, |panel, _cx| {
+            assert_eq!(panel.retained_threads.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_start_child_rejects_unknown_agent(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        let mut input = start_child_input("Nope", "hello");
+        input.agent = Some("no-such-agent".to_string());
+
+        let task = fixture
+            .cx
+            .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx));
+        let error = task.await.expect_err("an unknown agent must be rejected");
+
+        assert!(error.to_string().contains("Unknown agent id"), "{error}");
+        assert!(
+            error.to_string().contains("list_agents_and_models"),
+            "{error}"
+        );
+        fixture.panel.read_with(&fixture.cx, |panel, _cx| {
+            assert_eq!(
+                panel.retained_threads.len(),
+                1,
+                "no child thread was created"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_start_child_requires_an_orchestrator_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let stranger = ThreadId::new();
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture
+                .host
+                .start_child(stranger, start_child_input("x", "y"), cx)
+        });
+        assert!(task.await.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_model_is_not_supported_for_external_agents(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let mut input = start_child_input("External", "hello");
+        input.model = Some("anthropic/claude".to_string());
+
+        // `Agent::Stub` is not the native agent, like any external agent.
+        let task = fixture
+            .cx
+            .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx));
+        let output = task.await.unwrap();
+
+        let warning = output.warning.expect("a warning about the model");
+        assert!(warning.contains("not supported yet"), "{warning}");
+        assert!(warning.contains("external agents"), "{warning}");
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_send_to_child_reaches_the_child(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        // With no scripted updates the first turn stays open until it is ended.
+        let child = fixture
+            .start_child(start_child_input("Worker", "first task"))
+            .await;
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Running);
+        let session_id = fixture.child_session_id(child);
+
+        // A busy child queues the follow-up.
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "second task".to_string(),
+                },
+                cx,
+            )
+        });
+        assert!(task.await.unwrap().queued);
+        fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            let view = panel.retained_threads[&child]
+                .read(cx)
+                .root_thread_view()
+                .unwrap();
+            assert_eq!(view.read(cx).message_queue.len(), 1);
+        });
+
+        // Once the turn ends, the queued message is delivered as a new turn.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("second result".into()),
+            )]);
+        fixture
+            .connection
+            .end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        fixture.cx.run_until_parked();
+        let user_messages = fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            panel.retained_threads[&child]
+                .read(cx)
+                .root_thread(cx)
+                .unwrap()
+                .read(cx)
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))
+                .count()
+        });
+        assert_eq!(user_messages, 2, "the follow-up reached the child");
+        let (status, final_message, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Completed);
+        assert_eq!(final_message.as_deref(), Some("second result"));
+        assert_eq!(turns, 2);
+
+        // An idle child takes the next follow-up right away and is running again.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("third result".into()),
+            )]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "third task".to_string(),
+                },
+                cx,
+            )
+        });
+        assert!(!task.await.unwrap().queued);
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Running);
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            fixture.child_record(child).1.as_deref(),
+            Some("third result")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_send_to_child_rejects_other_orchestrators_children(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "task"))
+            .await;
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                ThreadId::new(),
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "hijack".to_string(),
+                },
+                cx,
+            )
+        });
+        assert!(task.await.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_cancel_child_reaches_the_child(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "long task"))
+            .await;
+        assert_eq!(fixture.child_record(child).0, ChildStatus::Running);
+        let session_id = fixture.child_session_id(child);
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.cancel_child(
+                fixture.orchestrator,
+                orchestration::CancelChildInput {
+                    child_id: child.to_key_string(),
+                },
+                cx,
+            )
+        });
+        assert_eq!(task.await.unwrap().status, ChildStatus::Cancelled);
+        fixture.cx.run_until_parked();
+
+        assert!(
+            fixture.connection.take_cancel_calls().contains(&session_id),
+            "the cancel reached the child's session"
+        );
+        let (status, _, turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Cancelled);
+        assert_eq!(turns, 1, "the cancelled turn is counted once");
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_await_children_returns_only_final_messages(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture.connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                "private reasoning one".into(),
+            )),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                "final answer one".into(),
+            )),
+        ]);
+        let first = fixture
+            .start_child(start_child_input("First", "task one"))
+            .await;
+        fixture.connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                "private reasoning two".into(),
+            )),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                "final answer two".into(),
+            )),
+        ]);
+        let second = fixture
+            .start_child(start_child_input("Second", "task two"))
+            .await;
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.await_children(
+                fixture.orchestrator,
+                orchestration::AwaitChildrenInput {
+                    child_ids: vec![first.to_key_string(), second.to_key_string()],
+                    timeout_secs: Some(10),
+                },
+                cx,
+            )
+        });
+        let output = task.await.unwrap();
+
+        assert!(!output.timed_out);
+        assert_eq!(output.children.len(), 2);
+        assert_eq!(
+            output.children[0].final_message.as_deref(),
+            Some("final answer one")
+        );
+        assert_eq!(
+            output.children[1].final_message.as_deref(),
+            Some("final answer two")
+        );
+        let serialized = serde_json::to_string(&output).unwrap();
+        assert!(!serialized.contains("private reasoning"));
+        assert!(!serialized.contains("task one"));
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_log_contains_only_orchestrator_child_lines(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture.connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                "private reasoning".into(),
+            )),
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new("call-1", "Read a file")),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("the answer".into())),
+        ]);
+        let child = fixture
+            .start_child(start_child_input("Worker", "the question"))
+            .await;
+
+        let log = orchestration::ChildLog::new(fixture.log_dir.path(), fixture.orchestrator, child);
+        let lines = log
+            .read()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.direction, entry.text))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            vec![
+                (LogDirection::ToChild, "the question".to_string()),
+                (LogDirection::FromChild, "the answer".to_string()),
+            ]
+        );
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!raw.contains("private reasoning"));
+        assert!(!raw.contains("Read a file"));
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_host_resolves_orchestrators_by_session(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture.cx.run_until_parked();
+        let session_id = fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            panel.retained_threads[&fixture.orchestrator]
+                .read(cx)
+                .root_thread(cx)
+                .unwrap()
+                .read(cx)
+                .session_id()
+                .0
+                .to_string()
+        });
+
+        fixture.cx.update(|_window, cx| {
+            let registry = orchestration::OrchestrationRegistry::global(cx);
+            let (thread, _host) = registry
+                .read(cx)
+                .host_for_session(&session_id, cx)
+                .expect("a registered host owns the session");
+            assert_eq!(thread, fixture.orchestrator);
+            assert!(registry.read(cx).host_for_session("unknown", cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_tools_are_refused_when_disabled(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        fixture.cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .orchestration
+                        .get_or_insert_default()
+                        .enabled = Some(false);
+                });
+            });
+        });
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture
+                .host
+                .start_child(fixture.orchestrator, start_child_input("x", "y"), cx)
+        });
+        let error = task.await.expect_err("orchestration is disabled");
+        assert!(error.to_string().contains("agent.orchestration.enabled"));
     }
 }

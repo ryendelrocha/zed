@@ -2042,6 +2042,7 @@ mod tests {
         cx.update(ThreadMetadataStore::init_global);
         cx.run_until_parked();
         let metadata = ThreadMetadata {
+            parent_thread_id: None,
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("session")),
             agent_id: agent::ZED_AGENT_ID.clone(),

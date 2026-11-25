@@ -2596,6 +2596,28 @@ impl ThreadView {
         .detach();
     }
 
+    /// Sends `content` as a user message, or queues it when the thread is
+    /// generating. Returns whether it was queued.
+    pub(crate) fn send_follow_up(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            self.add_to_queue(content, Vec::new(), window, cx);
+            return true;
+        }
+        self.message_queue.resume();
+        self.send_content(
+            Task::ready(Ok(Some((content, Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+        false
+    }
+
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(

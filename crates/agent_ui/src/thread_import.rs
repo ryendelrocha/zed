@@ -871,6 +871,7 @@ fn collect_importable_threads(
                 continue;
             };
             to_insert.push(ThreadMetadata {
+                parent_thread_id: None,
                 thread_id: ThreadId::new(),
                 session_id: Some(session.session_id),
                 agent_id: agent_id.clone(),

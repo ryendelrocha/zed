@@ -21,6 +21,7 @@ mod mode_selector;
 mod model_search;
 mod model_selector;
 mod model_selector_popover;
+mod orchestration_host;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
@@ -578,7 +579,7 @@ impl Agent {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }
             #[cfg(any(test, feature = "test-support"))]
-            Self::Stub => Rc::new(crate::test_support::StubAgentServer::default_response()),
+            Self::Stub => crate::test_support::stub_agent_server(),
         }
     }
 }
@@ -1222,6 +1223,7 @@ mod tests {
             orchestration: agent_settings::OrchestrationSettings {
                 show_as_subthreads: true,
                 subthreads_visible: 5,
+                enabled: true,
             },
             thinking_display: Default::default(),
         };
