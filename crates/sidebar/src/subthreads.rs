@@ -59,11 +59,27 @@ pub(crate) fn merge_known_subthreads(
 ) -> HashMap<ThreadId, Vec<SubthreadInfo>> {
     for (parent, infos) in live {
         let entry = known.entry(*parent).or_default();
-        entry.retain(|earlier| !infos.iter().any(|info| info.session_id == earlier.session_id));
+        let mut merged = Vec::with_capacity(infos.len());
+        for info in infos {
+            let mut info = info.clone();
+            // A child's time only moves forward, so a load that has not replayed
+            // a message yet does not blank or rewind the one seen before.
+            let earlier = entry
+                .iter()
+                .find(|earlier| earlier.session_id == info.session_id)
+                .and_then(|earlier| earlier.last_message_at);
+            info.last_message_at = info.last_message_at.max(earlier);
+            merged.push(info);
+        }
+        entry.retain(|earlier| {
+            !infos
+                .iter()
+                .any(|info| info.session_id == earlier.session_id)
+        });
         for earlier in entry.iter_mut() {
             *earlier = settled(earlier.clone());
         }
-        entry.extend(infos.iter().cloned());
+        entry.extend(merged);
     }
     known
         .iter()

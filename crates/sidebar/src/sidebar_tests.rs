@@ -18776,7 +18776,11 @@ async fn test_clicking_parent_row_opens_parent_without_toggling_children(cx: &mu
     });
     cx.run_until_parked();
     sidebar.read_with(cx, |sidebar, _| {
-        assert!(sidebar.expanded_subthread_groups.contains(&parent_thread_id));
+        assert!(
+            sidebar
+                .expanded_subthread_groups
+                .contains(&parent_thread_id)
+        );
     });
 
     // View the child, then click the parent: the parent's own thread comes back.
@@ -18842,7 +18846,7 @@ async fn test_rapid_switching_between_threads_and_subthreads(cx: &mut TestAppCon
 
     // parent -> child -> other -> parent -> child -> other, with no settling in between.
     for _ in 0..2 {
-    expand_all_subthreads(&sidebar, cx);
+        expand_all_subthreads(&sidebar, cx);
         sidebar.update_in(cx, |sidebar, window, cx| {
             sidebar.activate_thread(parent_metadata.clone(), &workspace, false, window, cx);
         });
@@ -19197,7 +19201,7 @@ async fn test_replaying_a_subagent_history_does_not_reorder_its_siblings(cx: &mu
     let (_parent_thread_id, _, children) =
         setup_parent_with_subagents(&project, &panel, 3, cx).await;
     let titles = |sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext| {
-    expand_all_subthreads(&sidebar, cx);
+        expand_all_subthreads(&sidebar, cx);
         visible_entries_as_strings(sidebar, cx)
     };
     let before = titles(&sidebar, cx);
@@ -19224,6 +19228,85 @@ async fn test_replaying_a_subagent_history_does_not_reorder_its_siblings(cx: &mu
             "    Child 2",
         ]
     );
+}
+
+#[gpui::test]
+async fn test_a_childs_time_ignores_its_parent_siblings_and_session_info(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    set_orchestration_settings(true, 5, cx);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let (_parent_thread_id, parent_thread, children) =
+        setup_parent_with_subagents(&project, &panel, 2, cx).await;
+    let live_times = |multi_workspace: &Entity<MultiWorkspace>,
+                      cx: &mut gpui::VisualTestContext| {
+        let workspaces: Vec<_> =
+            multi_workspace.read_with(cx, |mw, _| mw.workspaces().cloned().collect());
+        cx.update(|_, cx| {
+            let mut times: Vec<_> = subthreads::live_subthreads_by_parent(&workspaces, cx)
+                .into_values()
+                .flatten()
+                .map(|info| (info.title.to_string(), info.last_message_at))
+                .collect();
+            times.sort();
+            times
+        })
+    };
+    let before = live_times(&multi_workspace, cx);
+    assert!(before.iter().all(|(_, time)| time.is_some()));
+
+    // A new child that has not spoken yet, then the parent speaking, and the
+    // agent re-stamping the session time of an old child: none of it is a
+    // message of the old children.
+    let silent = add_subagent_without_message(&parent_thread, "child-3", "Child 3", cx).await;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    parent_thread.update(cx, |parent, cx| {
+        parent.push_assistant_content_block("parent speaks".into(), false, cx);
+    });
+    children[0].update(cx, |child, cx| {
+        child.update_session_info(
+            acp_v2::SessionInfoUpdate::new().updated_at(Utc::now().to_rfc3339()),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let after = live_times(&multi_workspace, cx);
+    assert_eq!(&after[..2], &before[..]);
+    assert_eq!(after[2], ("Child 3".to_string(), None));
+    drop(silent);
+    drop(sidebar);
+}
+
+async fn add_subagent_without_message(
+    parent: &Entity<AcpThread>,
+    session_id: &str,
+    title: &str,
+    cx: &mut gpui::VisualTestContext,
+) -> Entity<AcpThread> {
+    let subagent = cx
+        .update(|_, cx| {
+            let parent = parent.read(cx);
+            parent.connection().clone().load_session(
+                acp::SessionId::new(session_id),
+                parent.project().clone(),
+                PathList::default(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("subagent session");
+    subagent.update(cx, |subagent, cx| {
+        subagent.set_title(title.to_string().into(), cx).detach();
+    });
+    parent.update(cx, |parent, cx| {
+        parent.register_subagent(subagent.clone(), cx)
+    });
+    cx.run_until_parked();
+    subagent
 }
 
 fn save_orchestration_thread_metadata(
@@ -20444,7 +20527,8 @@ async fn test_children_start_collapsed_even_for_the_active_parent(cx: &mut TestA
 #[gpui::test]
 async fn test_child_row_icon_is_the_agent_icon_before_and_after_loading(cx: &mut TestAppContext) {
     // Not loaded: the persisted model carries the provider's icon.
-    let persisted = child_entry_with_model(Some(ollama_model("DeepSeek 4.1 Flash", true)), cx).await;
+    let persisted =
+        child_entry_with_model(Some(ollama_model("DeepSeek 4.1 Flash", true)), cx).await;
     assert_eq!(subthreads::child_info(&persisted).icon, IconName::ZedAgent);
 
     // Loaded: the live model reports the provider's icon too.

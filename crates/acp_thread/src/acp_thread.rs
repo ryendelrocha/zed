@@ -4348,6 +4348,14 @@ impl AcpThread {
         self.last_message_at.or(self.session_info.updated_at)
     }
 
+    /// When a message was last added to this thread while it was live. Unlike
+    /// `last_message_at`, it ignores the time the agent reports for the session:
+    /// agents re-stamp that on load and on unrelated updates, so it is not a
+    /// message time.
+    pub fn last_own_message_at(&self) -> Option<DateTime<Utc>> {
+        self.last_message_at
+    }
+
     /// Marks the entries that follow as history being replayed rather than new
     /// messages, so they do not count as activity at the time of the load.
     pub fn set_replaying_history(&mut self, replaying: bool) {

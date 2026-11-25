@@ -996,11 +996,10 @@ impl ConversationView {
                     session_id,
                     title,
                     status,
-                    // A subagent that has not spoken yet is as recent as its
-                    // parent's last message.
-                    last_message_at: subagent
-                        .last_message_at()
-                        .or_else(|| root_view.thread.read(cx).last_message_at()),
+                    // Only the subagent's own messages count: borrowing the
+                    // parent's time would make every silent child show the same
+                    // time, and move it whenever the parent speaks.
+                    last_message_at: subagent.last_own_message_at(),
                     icon,
                     icon_from_external_svg,
                     model: model.map(|model| crate::friendly_model_name(&model.name)),

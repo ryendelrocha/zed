@@ -1475,7 +1475,13 @@ impl ThreadMetadataStore {
         // A child is not driven by the user typing in it, so its time follows
         // its last message instead. Replaying its history does not count as
         // one, so loading it never moves the time.
-        let interacted_at = match (parent_thread_id, interacted_at, thread_ref.last_message_at()) {
+        // The time an agent reports for its session is not a message time: it is
+        // re-stamped on load, so only a message seen live counts.
+        let interacted_at = match (
+            parent_thread_id,
+            interacted_at,
+            thread_ref.last_own_message_at(),
+        ) {
             (Some(_), Some(saved), Some(last_message_at)) => Some(saved.max(last_message_at)),
             (_, interacted_at, _) => interacted_at,
         };
