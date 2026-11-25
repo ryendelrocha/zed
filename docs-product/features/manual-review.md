@@ -2,13 +2,14 @@
 
 This file lists every file changed for orchestrated threads, so a human reviewer can review each one individually before anything is proposed upstream to Zed. A checkmark in the "Manual review" column means a human reviewed that file; an empty cell means it has not been reviewed yet. The fork owner fills this column, nobody else.
 
-Base commit: `0be6d59`. Last commit covered: `bd64c7b` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
+Base commit: `0be6d59`. Last commit covered: `4fc06ea` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
 
 ## Files
 
 | File | Change | Requirements | Manual review |
 | :-- | :-- | :-- | :-- |
 | [assets/settings/default.json](../../assets/settings/default.json) | Adds the `agent.orchestration` defaults (incl. `human_summary_max_chars`), profile descriptions and the new tools in `write`. | R9, R10, R16, R17 | |
+| [crates/agent/src/thread_store.rs](../../crates/agent/src/thread_store.rs) | Lists persisted native subagents (threads with a parent session) apart from top-level threads, via `subagent_entries`. | R9 | |
 | [crates/agent/src/tool_permissions.rs](../../crates/agent/src/tool_permissions.rs) | Adds the new `orchestration` field (with `human_summary_max_chars`) to a test `AgentSettings` literal so it compiles. | R10, R16 | |
 | [crates/agent_settings/src/agent_settings.rs](../../crates/agent_settings/src/agent_settings.rs) | Adds `OrchestrationSettings` (incl. `human_summary_max_chars`) to `AgentSettings` and fills it from the settings content. | R10, R16 | |
 | [crates/agent_ui/src/agent_ui.rs](../../crates/agent_ui/src/agent_ui.rs) | Re-exports `SubthreadInfo` and `model_icon_parts`, declares `orchestration_host`, updates test settings and the stub hook. | R9, R10 | |
@@ -112,6 +113,8 @@ Changed again in `b1c2733`: the module now also lists children that exist only i
   - A child whose parent is archived or not in the group stays top-level (`test_metadata_child_of_archived_parent_stays_top_level`).
   - Live and metadata children share one ordering and one visible limit.
 
+Changed again in `4fc06ea` (R9): `persisted_subthreads_by_parent` builds `SubthreadInfo` rows from `ThreadStore::subagent_entries` (status always `Completed`, time = `updated_at`, no model, no thread id) keyed by the parent's session id; `SubthreadLayout` replaces `fully_loaded` with `persisted` and `shown_counts` (children shown per group, default `visible`); `insert_subthread_entries` adds persisted rows unless the loaded conversation already lists that session live, and no longer returns early when only persisted groups exist; `select_visible_subthreads(subthreads, count)` loses its `show_all` argument. Why: children of a parent that was never opened still show, and each "Load more" reveals the next N (R9).
+
 #### [`crates/sidebar/src/sidebar.rs`](../../crates/sidebar/src/sidebar.rs)
 
 - Scope: the sidebar list itself: new row kinds, state, rendering, input handling.
@@ -132,6 +135,8 @@ Changed again in `10530cf` (R17): `persisted_thread_model` rebuilds the model na
   - A provider missing from the registry falls back to the model id and no icon.
   - The profile name falls back to the profile id when the profile no longer exists.
 
+Changed again in `4fc06ea` (R9): `fully_loaded_subthread_groups` becomes `subthread_shown_counts` (children shown per group, not reset by collapsing); `load_more_subthreads` adds `subthreads_visible` to the count (starting from one page) instead of showing everything; the sidebar observes the `ThreadStore` and rebuilds when it changes; `persisted_subthreads_by_parent` feeds the layout when `show_as_subthreads` is on; clicking a child of a parent whose project is closed opens the project with the parent (`open_workspace_and_activate_thread`), and otherwise the panel shows the subagent through `navigate_to_subthread_when_ready`. Why: R9 paging by N and children of unloaded parents.
+
 #### [`crates/sidebar/src/sidebar_tests.rs`](../../crates/sidebar/src/sidebar_tests.rs)
 
 - Scope: test coverage for R9 behavior and the stable-order rule.
@@ -144,6 +149,8 @@ Changed again in `10530cf` (R17): `persisted_thread_model` rebuilds the model na
 Changed again in `b1c2733` and `10530cf`: new helpers `save_orchestration_thread_metadata`, `minutes`, `save_parent_with_metadata_children`, and tests for metadata children nesting and leaving the top level, limit, load more and message order, setting off, archived parent, renaming a metadata child and a live subagent, the model on a live subagent row, the persisted model and icon of an unloaded child, `test_child_model_label_puts_the_profile_before_the_model` and the child's own provider icon and model.
 - Review focus:
   - The assertions describe visible behavior (rows, labels, order), not entry-list internals.
+
+Changed again in `4fc06ea` (R9): `select_visible_subthreads` calls lose `show_all`; the limit test also asserts a second "Load more" click; new helpers `kid_titles`, `kid_names` and `save_native_subagent` (saves a native subagent with a parent session in the threads database); new tests `test_load_more_pages_by_visible_count_newest_first`, `test_loaded_count_survives_collapse_and_expand`, `test_top_level_threads_are_not_limited_by_subthreads_visible`, `test_unloaded_parent_shows_chevron_and_children_without_opening` and `test_persisted_native_subagents_nest_under_unloaded_parent`. Mostly additive.
 
 #### [`crates/sidebar/Cargo.toml`](../../crates/sidebar/Cargo.toml)
 
@@ -167,6 +174,8 @@ Changed again in `b1c2733`: `SubthreadInfo` gains `model` and `thread_id` (`None
   - The provider icon applies only when the thread is a native one; external agents keep the agent icon.
 
 Changed again in `cbf577d`: declares the `orchestrated_permissions` module. In `bd64c7b`: `stage_session_quota` before and `clear_staged_session_quota` after `new_session`, so the grant reaches only that session.
+
+Changed again in `4fc06ea` (R9): new field `pending_navigation` and `navigate_to_thread_when_ready(session_id)`, which shows a subagent thread now or, when it is not in the conversation yet, as soon as it is added (a persisted subagent is restored asynchronously while its parent loads). Why: clicking a child of an unloaded parent must land on the child.
 
 #### [`crates/agent_ui/src/agent_ui.rs`](../../crates/agent_ui/src/agent_ui.rs)
 
@@ -400,6 +409,8 @@ Changed again in `d303f89`: only tests were added (`OrchestrationFixture` helper
 
 Changed again in `cbf577d`: archiving a thread cancels its running descendants; `watch_saved_children` is installed with the host; `load_thread_in_background` opens a saved thread without activating it; `remove_thread_internal` cancels descendants, revokes the thread's session tokens and removes the orchestrator from the registry; new tests for the cascade, the concurrency cap, sibling messages, the restart rebuild and the permission cards. In `bd64c7b`: `ChildSubagentQuota` and `ChildThreadRequest.subagent_quota`, and `create_child_thread` stores the grant (`set_subagent_quota`) before returning, because the session starts in the background; tests for the header, `child_status` and quota-limited starts.
 
+Changed again in `4fc06ea` (R9): `navigate_to_subthread_when_ready` finds the parent's conversation view and calls `navigate_to_thread_when_ready` on it; `navigate_to_subthread` is unchanged. Why: the sidebar uses it when the parent was not loaded.
+
 #### [`crates/agent_ui/src/conversation_view/thread_view.rs`](../../crates/agent_ui/src/conversation_view/thread_view.rs)
 
 - Scope: R3 follow-ups from the orchestrator to a child.
@@ -560,6 +571,19 @@ Changed again in `cbf577d` and `bd64c7b`: the server registers `list_siblings` a
   - Confirm that exempting these tools matches R13 (children's permission requests surface in the orchestrator).
 
 Changed again in `cbf577d`: the test list of tools without permission settings also holds `list_siblings` and `send_to_sibling`.
+
+### R9: children of unloaded parents (`4fc06ea`)
+
+Commit `4fc06ea`. Native subagents saved in the threads database with a parent session now nest under their parent without opening it, next to orchestrated children from metadata; "Load more" reveals the next `subthreads_visible` children and the count per group survives collapse and expand. Code changes are in the "Changed again in `4fc06ea`" paragraphs of `subthreads.rs`, `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`; the new entry is below.
+
+#### [`crates/agent/src/thread_store.rs`](../../crates/agent/src/thread_store.rs)
+
+- Scope: `ThreadStore`, the list of saved thread summaries.
+- What changed: a second list `subagents` next to `threads`. When the store reloads, a thread with a `parent_session_id` goes to `subagents` instead of being skipped; `entries` still returns only top-level threads; the new `subagent_entries` returns the subagents, newest first. Only metadata is held, no thread blob is loaded.
+- Why: the sidebar needs the parent links of native subagents to nest them under a parent that was never opened (R9).
+- Review focus:
+  - `entries` and `entry_ids` still exclude subagents, so the history and the other users of the store are unchanged.
+  - Grandchildren are listed too, but the sidebar groups by the direct parent session and nests one level.
 
 ### R9: metadata children, rename and provider icons
 
@@ -785,6 +809,8 @@ Changed again in `cbf577d` (R3b, R12, R10 and AC10 edited) and in the documentat
   - The status of each acceptance criterion comes from the tests present; the update did not run them.
   - Section 12 lists only limitations that the code, a comment, a test or a commit message supports.
 
+Changed again in the documentation update after `4fc06ea`: R9 now states discovery of children without loading the parent (by source), top-level threads not limited, paging by N and the per-group count; the R9 status row adds `4fc06ea`; AC6 evidence and new AC27 to AC31; three new limitations in section 12 (persisted subagent row status and time, grandchildren, external agent subagents).
+
 #### [`docs-product/features/orchestrated-threads-r1-plan.md`](orchestrated-threads-r1-plan.md)
 
 - Scope: implementation plan for the R1 to R5 slice.
@@ -814,9 +840,11 @@ Changed again in the documentation update after `bd64c7b`: the token is also use
 #### [`docs-product/features/manual-review.md`](manual-review.md)
 
 - Scope: this checklist.
-- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf` and then up to `bd64c7b`.
+- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`, then up to `bd64c7b`, then up to `4fc06ea`.
 - Why: lets the fork owner review every file individually before anything goes upstream.
 - Review focus:
   - Only the "Manual review" column is edited by the fork owner; a "🔁" marks a file reviewed before and changed since.
 
 Changed again in the update that extends the list from `10530cf` to `bd64c7b`: four new rows (`list_siblings_tool.rs`, `send_to_sibling_tool.rs`, `orchestrated_permissions.rs`, `quota.rs`), "Changed again" paragraphs for the files touched by `cbf577d` and `bd64c7b`, and the sections "R3b, R12, caps and restart", "R13: permission cards" and "R6: subagent quota". No row was marked reviewed by this update.
+
+Changed again in the update that extends the list from `bd64c7b` to `4fc06ea`: one new row (`thread_store.rs`), "Changed again in `4fc06ea`" paragraphs for `subthreads.rs`, `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`, and the section "R9: children of unloaded parents (`4fc06ea`)". No row was marked reviewed by this update.

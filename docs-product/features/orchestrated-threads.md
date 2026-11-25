@@ -5,7 +5,7 @@
 
 ## Implementation status
 
-Status of each requirement at `bd64c7b`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`.
+Status of each requirement at `bd64c7b`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`; children of unloaded parents and paging of "Load more" by N are `4fc06ea` (R9 is described at `4fc06ea`, the rest at `bd64c7b`).
 
 | ID | Status | Commits |
 | :-- | :-- | :-- |
@@ -18,7 +18,7 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | R6 Subagent quota | Partial | `bd64c7b` |
 | R7 Shared or separate worktree | Done | `36ead50`, `b1c2733` |
 | R8 Parallel execution | Done | `b1c2733` |
-| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf` |
+| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf`, `4fc06ea` |
 | R10 Settings | Done | `36ead50`, `d303f89`, `cbf577d` |
 | R11 The human can write in a child | Done | `d303f89` (message origins); spec revised in `1fcdad9` |
 | R12 Cancellation cascades | Done | `cbf577d` |
@@ -184,13 +184,15 @@ Children run concurrently. `start_child` returns right away, and `await_children
 When `agent.orchestration.show_as_subthreads` is on:
 - each child appears in the sidebar under its orchestrator thread, with a disclosure arrow;
 - the group is **expanded by default**, and the user can collapse it with the chevron;
-- an expanded group shows the **N most recent children** (N = `agent.orchestration.subthreads_visible`, default 5), followed by a **"Load more"** row;
+- children are **discovered without loading the parent**: orchestrated children come from the metadata parent links (`parent_thread_id`), and native Zed subagents come from the parent links persisted in the threads database (only their summaries are read, no thread is loaded). External agent-owned subagents (for example a Claude Code `Task`) are listed only once the parent is loaded in the agent panel, because they are not persisted;
+- top-level threads are **not limited**; the limit applies to the children of a group only. An expanded group shows the **N most recent children** (N = `agent.orchestration.subthreads_visible`, default 5), followed by a **"Load more"** row; each click on "Load more" reveals the **next N** children;
+- the number of children loaded in each group **survives collapse and expand and rebuilds of the list**, and resets only when the app restarts;
 - children are **sorted by the time of their last message, most recent first**;
 - each child row reuses the thread row's status icons (running, waiting for confirmation, error, done).
 
 When the setting is off, children appear as ordinary top-level threads, which is today's `create_thread` behavior.
 
-**Why:** this is the governance view. You can see at a glance what was delegated, to which model and in what state, and open any child's transcript. Collapsing and the visible limit keep a large orchestration from flooding the sidebar. Recency sorting puts active work on top.
+**Why:** this is the governance view. You can see at a glance what was delegated, to which model and in what state, and open any child's transcript. Collapsing and the visible limit keep a large orchestration from flooding the sidebar. Recency sorting puts active work on top. Discovering children without loading the parent means a parent that was never opened in this session still shows that it has children.
 
 ### R10. Settings
 
@@ -305,7 +307,7 @@ This table is the original plan. The files actually changed are listed one by on
 
 ## 9. Acceptance criteria
 
-Status column: **Met (tests)** means a test in the code asserts the behavior; **Not verified** means no test or manual check covers the full criterion. The status was taken from the tests present at `bd64c7b`; the doc update did not run them. Real Claude Code, Codex or Ollama sessions were not exercised by any test, so criteria that name them are not verified end to end.
+Status column: **Met (tests)** means a test in the code asserts the behavior; **Not verified** means no test or manual check covers the full criterion. The status was taken from the tests present at `bd64c7b`, and for AC6 and AC27 to AC31 from the tests added in `4fc06ea`; the doc update did not run them. Real Claude Code, Codex or Ollama sessions were not exercised by any test, so criteria that name them are not verified end to end.
 
 | ID | Criterion | Status | Evidence |
 | :-- | :-- | :-- | :-- |
@@ -314,7 +316,7 @@ Status column: **Met (tests)** means a test in the code asserts the behavior; **
 | AC3 | `await_children` on two children returns two final messages, and no transcript content beyond them. | Met (tests) | `test_orchestration_await_children_returns_only_final_messages` |
 | AC4 | `<child-id>.jsonl` contains one line per orchestrator-child exchange, with nothing from the child's internal tool calls. | Met (tests) | `test_orchestration_log_contains_only_orchestrator_child_lines` |
 | AC5 | A child started with `subagent_quota: 1` gets an error on its second spawn through Zed's tools. | Met (tests) | `test_orchestration_child_starts_children_only_within_its_quota`, `test_native_spawns_are_counted_against_the_subagent_quota` |
-| AC6 | With `subthreads_visible: 5` and 7 children, the expanded group shows the 5 with the most recent messages, newest first, plus "Load more". "Load more" reveals the other 2. | Met (tests) | `test_subagent_threads_respect_visible_limit_and_load_more`, `test_metadata_children_respect_limit_load_more_and_message_order` |
+| AC6 | With `subthreads_visible: 5` and 7 children, the expanded group shows the 5 with the most recent messages, newest first, plus "Load more". "Load more" reveals the other 2. | Met (tests) | `test_subagent_threads_respect_visible_limit_and_load_more` (since `4fc06ea` it also asserts a second "Load more" click), `test_metadata_children_respect_limit_load_more_and_message_order` |
 | AC7 | The group is expanded when the orchestrator thread is first shown, and a group the user collapsed with the chevron stays collapsed across rebuilds and thread switches. | Met (tests) | `test_subagent_threads_nest_under_parent_expanded_by_default`, `test_collapsed_subagent_group_stays_collapsed_across_thread_switches` |
 | AC8 | With `show_as_subthreads: false`, the children appear as top-level threads. | Met (tests) | `test_metadata_children_are_ordinary_threads_when_setting_is_off` |
 | AC9 | Two children with `worktree: new` run at the same time in separate worktrees, and one with `worktree: shared` runs in the orchestrator's worktree. | Not verified | Only the failure of `worktree: new` outside a git repository is tested (`test_orchestration_start_child_in_new_worktree_without_git_reports_the_error`). |
@@ -335,6 +337,11 @@ Status column: **Met (tests)** means a test in the code asserts the behavior; **
 | AC24 | R14 and R15: a child gets the header and `whoami`; `send_to_parent` reaches the inbox, comes back once as `pending_messages`, and an urgent message is delivered as a new message only when the orchestrator is idle and wakes a pending `await_children`. | Met (tests) | `test_orchestration_child_gets_a_header_before_its_first_prompt`, `test_orchestration_whoami_and_send_to_parent_through_the_host`, `test_orchestration_urgent_message_waits_for_an_idle_orchestrator`, `test_urgent_message_wakes_await_children` |
 | AC25 | R16: a human's messages in a child are neither logged nor forwarded; the orchestrator gets one summary on demand, capped at `human_summary_max_chars`, with a minimal note when no model is set. | Met (tests) | `test_orchestration_human_message_is_neither_logged_nor_forwarded`, `test_orchestration_human_turns_become_one_summary_on_demand`, `test_orchestration_summary_respects_the_char_cap`, `test_orchestration_summary_without_a_model_is_a_minimal_note` |
 | AC26 | R17: the child's model resolves as explicit `model`, profile `default_model`, `agent.subagent_model`, user default; the profile's tool set applies; an unknown profile lists the valid ids; a profile is ignored with a warning for an external agent. | Met (tests) | `test_orchestration_child_model_resolution_order`, `test_orchestration_child_gets_the_profile_and_its_tool_set`, `test_orchestration_unknown_profile_lists_the_available_ids`, `test_orchestration_external_agent_ignores_the_profile_with_a_warning` |
+| AC27 | R9: a parent that was never opened shows its chevron and its children. Orchestrated children come from metadata, and native subagents saved in the threads database with a parent session nest under that parent; no conversation is opened for the parent. | Met (tests) | `test_unloaded_parent_shows_chevron_and_children_without_opening`, `test_persisted_native_subagents_nest_under_unloaded_parent` |
+| AC28 | R9: with `subthreads_visible: 5` and 12 children, the group shows 5, then 10 after one "Load more", then all 12 after a second one (the next N each time), newest first. | Met (tests) | `test_load_more_pages_by_visible_count_newest_first` |
+| AC29 | R9: the number of children loaded in a group is kept when the group is collapsed and expanded again. | Met (tests) | `test_loaded_count_survives_collapse_and_expand` |
+| AC30 | R9: top-level threads are not limited by `subthreads_visible`; 12 top-level threads with `subthreads_visible: 2` are all listed, with no "Load more". | Met (tests) | `test_top_level_threads_are_not_limited_by_subthreads_visible` |
+| AC31 | R9: clicking a child of an unloaded parent opens the parent (and its project, if closed) and then shows the subagent as soon as the parent conversation has restored it. | Not verified | No test covers the click. The code path is `navigate_to_subthread_when_ready` and `open_workspace_and_activate_thread` (`4fc06ea`). That the count survives an app restart is also untested: the count is in memory only. |
 
 ## 10. Risks
 
@@ -380,7 +387,7 @@ Source: `CONTRIBUTING.md` and `docs/src/development/feature-process.md` in the Z
 
 ## 12. Known limitations
 
-Open issues of the implementation at `bd64c7b`. Each one is stated in the code, in a code comment, in a test or in a commit message, or follows directly from the code path named.
+Open issues of the implementation at `bd64c7b` (R9 at `4fc06ea`). Each one is stated in the code, in a code comment, in a test or in a commit message, or follows directly from the code path named.
 
 | Limitation | Where it comes from |
 | :-- | :-- |
@@ -395,3 +402,6 @@ Open issues of the implementation at `bd64c7b`. Each one is stated in the code, 
 | Claude Code may ask the human for permission on each `mcp__zed-orchestration__*` call. | Plan, "Risks": accepted in V1. |
 | The session token sits in the environment of the bridge process. A model with shell access on the same machine could read it (for example with `ps eww`). It only lets that caller act on its own orchestrator's children. | `orchestrated-threads-how-it-works.md`, and `bridge.rs`. |
 | Orchestrated children nest one level in the sidebar (D2). | Section 5. |
+| A persisted native subagent row of a parent that is not loaded shows `Completed` even while it runs, and its time is the last save of the thread, not the last message. | `persisted_subthreads_by_parent` in `crates/sidebar/src/subthreads.rs` builds each row with `AgentThreadStatus::Completed` and `updated_at` from the thread summary (`4fc06ea`). Once the parent is loaded, the live subagent replaces the persisted row. |
+| Grandchildren persisted under a native subagent are not shown. | `persisted_subthreads_by_parent` groups by the direct parent session and the sidebar nests one level (D2). |
+| External agent-owned subagents (for example a Claude Code `Task`) are listed only while their parent is loaded in the agent panel. | They are not persisted; see the module comment of `crates/sidebar/src/subthreads.rs`. |
