@@ -1468,10 +1468,17 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
-        let existing_parent_thread_id = existing_thread.and_then(|thread| thread.parent_thread_id);
         let existing_run_config = existing_thread.map(|thread| thread.run_config.clone());
+        let existing_parent_thread_id = existing_thread.and_then(|thread| thread.parent_thread_id);
         let parent_thread_id =
             existing_parent_thread_id.or_else(|| self.pending_parent_links.remove(&thread_id));
+        // A child is not driven by the user typing in it, so its time follows
+        // its last message instead. Replaying its history does not count as
+        // one, so loading it never moves the time.
+        let interacted_at = match (parent_thread_id, interacted_at, thread_ref.last_message_at()) {
+            (Some(_), Some(saved), Some(last_message_at)) => Some(saved.max(last_message_at)),
+            (_, interacted_at, _) => interacted_at,
+        };
         let run_config = existing_run_config.unwrap_or_else(|| {
             self.pending_run_configs
                 .remove(&thread_id)

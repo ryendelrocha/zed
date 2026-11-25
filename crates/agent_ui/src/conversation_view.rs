@@ -309,8 +309,8 @@ pub struct SubthreadInfo {
     pub title: SharedString,
     pub status: AgentThreadStatus,
     pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The icon of the agent, or for a native agent the provider of the model,
-    /// that runs this thread itself, not the one of its parent.
+    /// The icon of the agent that runs this thread itself, not the one of its
+    /// parent. Never the icon of a model provider.
     pub icon: IconName,
     pub icon_from_external_svg: Option<SharedString>,
     /// The model this thread runs on, when known.
@@ -320,14 +320,6 @@ pub struct SubthreadInfo {
     /// Set for a thread that is a conversation of its own, listed under its
     /// parent through the thread metadata. `None` for a live subagent.
     pub thread_id: Option<ThreadId>,
-}
-
-/// The icon to show for a model: its provider's icon.
-pub fn model_icon_parts(icon: &acp_thread::AgentModelIcon) -> (IconName, Option<SharedString>) {
-    match icon {
-        acp_thread::AgentModelIcon::Named(name) => (*name, None),
-        acp_thread::AgentModelIcon::Path(path) => (IconName::ZedAgent, Some(path.clone())),
-    }
 }
 
 #[derive(Default)]
@@ -975,17 +967,12 @@ impl ConversationView {
                     })
                     .and_then(|view| view.active_model(cx))
                     .filter(|model| !model.name.is_empty());
-                let (icon, icon_from_external_svg) = match model
-                    .as_ref()
-                    .and_then(|model| model.icon.as_ref())
-                    .filter(|_| own_view.as_native_thread(cx).is_some())
-                {
-                    Some(model_icon) => model_icon_parts(model_icon),
-                    None => (
-                        own_view.agent_icon,
-                        own_view.agent_icon_from_external_svg.clone(),
-                    ),
-                };
+                // The icon is the agent's, whatever model it runs on, so the
+                // row looks the same before and after the thread is loaded.
+                let (icon, icon_from_external_svg) = (
+                    own_view.agent_icon,
+                    own_view.agent_icon_from_external_svg.clone(),
+                );
                 let title = subagent
                     .subagent_association()
                     .and_then(|association| association.title.clone())

@@ -49,6 +49,48 @@ pub(crate) fn live_subthreads_by_parent(
     groups
 }
 
+/// Remembers the live subagents of the parents whose conversation is loaded,
+/// and returns what to list for every parent known so far: the live ones, plus
+/// those seen earlier that the live list does not have (yet). A parent whose
+/// conversation was unloaded keeps its last rows, as finished threads.
+pub(crate) fn merge_known_subthreads(
+    known: &mut HashMap<ThreadId, Vec<SubthreadInfo>>,
+    live: &HashMap<ThreadId, Vec<SubthreadInfo>>,
+) -> HashMap<ThreadId, Vec<SubthreadInfo>> {
+    for (parent, infos) in live {
+        let entry = known.entry(*parent).or_default();
+        entry.retain(|earlier| !infos.iter().any(|info| info.session_id == earlier.session_id));
+        for earlier in entry.iter_mut() {
+            *earlier = settled(earlier.clone());
+        }
+        entry.extend(infos.iter().cloned());
+    }
+    known
+        .iter()
+        .map(|(parent, infos)| {
+            let infos = if live.contains_key(parent) {
+                infos.clone()
+            } else {
+                infos.iter().cloned().map(settled).collect()
+            };
+            (*parent, infos)
+        })
+        .collect()
+}
+
+/// A subagent that is not live cannot be running or waiting for input.
+fn settled(mut info: SubthreadInfo) -> SubthreadInfo {
+    if matches!(
+        info.status,
+        ui::AgentThreadStatus::Running
+            | ui::AgentThreadStatus::WaitingForConfirmation
+            | ui::AgentThreadStatus::Unconfirmed
+    ) {
+        info.status = ui::AgentThreadStatus::Completed;
+    }
+    info
+}
+
 /// The persisted native subagents, keyed by the session of their parent.
 /// Built from the summaries the thread store already lists: no thread is
 /// loaded.
@@ -110,11 +152,13 @@ pub(crate) fn select_visible_subthreads(
 /// What the sidebar remembers about child groups, and the settings they are
 /// laid out with.
 pub(crate) struct SubthreadLayout<'a> {
-    /// The live subagents of each loaded conversation.
+    /// The live subagents of each parent: those of its loaded conversation,
+    /// and the last ones seen while it was loaded.
     pub groups: &'a HashMap<ThreadId, Vec<SubthreadInfo>>,
     /// Whether threads with a `parent_thread_id` nest under their parent.
     pub nest_children: bool,
-    pub collapsed: &'a HashSet<ThreadId>,
+    /// The groups the user opened. A group starts collapsed.
+    pub expanded: &'a HashSet<ThreadId>,
     /// The native subagents persisted for each parent session.
     pub persisted: &'a HashMap<agent_client_protocol::v2::schema::SessionId, Vec<SubthreadInfo>>,
     /// How many children each group shows, once "Load more" was used. A group
@@ -127,10 +171,6 @@ pub(crate) struct SubthreadLayout<'a> {
 
 /// The row data of a thread that is a child in its own right.
 pub(crate) fn child_info(child: &ThreadEntry) -> SubthreadInfo {
-    let (icon, icon_from_external_svg) = match child.model.as_ref().and_then(|m| m.icon.as_ref()) {
-        Some(model_icon) => agent_ui::model_icon_parts(model_icon),
-        None => (child.icon, child.icon_from_external_svg.clone()),
-    };
     SubthreadInfo {
         session_id: child
             .metadata
@@ -139,9 +179,16 @@ pub(crate) fn child_info(child: &ThreadEntry) -> SubthreadInfo {
             .unwrap_or_else(|| agent_client_protocol::v2::schema::SessionId::new("")),
         title: child.metadata.display_title(),
         status: child.status,
-        last_message_at: Some(child.metadata.updated_at),
-        icon,
-        icon_from_external_svg,
+        // `updated_at` is re-stamped by every save of the metadata, such as the
+        // one a load causes, so it cannot be the time the row shows.
+        last_message_at: Some(
+            child
+                .metadata
+                .interacted_at
+                .unwrap_or(child.metadata.updated_at),
+        ),
+        icon: child.icon,
+        icon_from_external_svg: child.icon_from_external_svg.clone(),
         model: child.model.as_ref().map(|model| model.name.clone()),
         diff_stats: child.diff_stats,
         thread_id: Some(child.metadata.thread_id),
@@ -221,22 +268,25 @@ pub(crate) fn insert_subthread_entries(
         {
             let live_sessions: HashSet<_> =
                 infos.iter().map(|info| info.session_id.clone()).collect();
+            // A persisted subagent runs on its parent's model, so its row says
+            // the same before and after it is loaded.
+            let parent_model = parent.model.as_ref().map(|model| model.name.clone());
             infos.extend(
                 persisted
                     .iter()
                     .filter(|info| !live_sessions.contains(&info.session_id))
-                    .cloned(),
+                    .cloned()
+                    .map(|mut info| {
+                        if info.model.is_none() {
+                            info.model = parent_model.clone();
+                        }
+                        info
+                    }),
             );
         }
         let mut child_entries: HashMap<ThreadId, Arc<ThreadEntry>> = HashMap::new();
         for mut child in children.remove(&thread_id).unwrap_or_default() {
-            {
-                let nested = Arc::make_mut(&mut child);
-                nested.nested = true;
-                let info = child_info(nested);
-                nested.icon = info.icon;
-                nested.icon_from_external_svg = info.icon_from_external_svg.clone();
-            }
+            Arc::make_mut(&mut child).nested = true;
             infos.push(child_info(&child));
             child_entries.insert(child.metadata.thread_id, child);
         }
@@ -245,7 +295,7 @@ pub(crate) fn insert_subthread_entries(
         }
 
         counts.insert(thread_id, infos.len());
-        if layout.collapsed.contains(&thread_id) {
+        if !layout.expanded.contains(&thread_id) {
             continue;
         }
         let count = layout

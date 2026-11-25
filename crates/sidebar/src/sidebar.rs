@@ -23,7 +23,7 @@ use agent_ui::{
     NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
-use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
+use agent_ui::{MessageEditorEvent, StateChange, SubthreadInfo, thread_worktree_archive};
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use feature_flags::{
@@ -1079,8 +1079,12 @@ pub struct Sidebar {
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
-    /// Threads whose subagent threads the user collapsed. Groups are expanded by default.
-    collapsed_subthread_groups: HashSet<ThreadId>,
+    /// Threads whose child threads the user expanded. Groups are collapsed by
+    /// default, and so after a restart, since this is not persisted.
+    expanded_subthread_groups: HashSet<ThreadId>,
+    /// The live subagents last seen for each parent, so its rows do not change
+    /// when its conversation is unloaded because another thread was opened.
+    known_live_subthreads: HashMap<ThreadId, Vec<SubthreadInfo>>,
     /// How many subagent threads each group lists once its "Load more" was used.
     /// A group not in here lists the first page. Not reset by collapsing.
     subthread_shown_counts: HashMap<ThreadId, usize>,
@@ -1245,7 +1249,8 @@ impl Sidebar {
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
-            collapsed_subthread_groups: HashSet::new(),
+            expanded_subthread_groups: HashSet::new(),
+            known_live_subthreads: HashMap::new(),
             subthread_shown_counts: HashMap::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
@@ -1755,11 +1760,12 @@ impl Sidebar {
         let groups = mw.project_groups(cx);
         let orchestration = AgentSettings::get_global(cx).orchestration;
         let subthread_groups = if orchestration.show_as_subthreads {
-            subthreads::live_subthreads_by_parent(&workspaces, cx)
+            let live = subthreads::live_subthreads_by_parent(&workspaces, cx);
+            subthreads::merge_known_subthreads(&mut self.known_live_subthreads, &live)
         } else {
             HashMap::new()
         };
-        let collapsed_subthread_groups = self.collapsed_subthread_groups.clone();
+        let expanded_subthread_groups = self.expanded_subthread_groups.clone();
         let subthread_shown_counts = self.subthread_shown_counts.clone();
         let persisted_subthreads = if orchestration.show_as_subthreads {
             subthreads::persisted_subthreads_by_parent(cx)
@@ -1769,7 +1775,7 @@ impl Sidebar {
         let subthread_layout = SubthreadLayout {
             groups: &subthread_groups,
             nest_children: orchestration.show_as_subthreads,
-            collapsed: &collapsed_subthread_groups,
+            expanded: &expanded_subthread_groups,
             persisted: &persisted_subthreads,
             shown_counts: &subthread_shown_counts,
             visible: orchestration.subthreads_visible.max(1),
@@ -6807,8 +6813,8 @@ impl Sidebar {
     }
 
     fn toggle_subthreads(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        if !self.collapsed_subthread_groups.remove(&thread_id) {
-            self.collapsed_subthread_groups.insert(thread_id);
+        if !self.expanded_subthread_groups.remove(&thread_id) {
+            self.expanded_subthread_groups.insert(thread_id);
         }
         self.update_entries(cx);
     }
@@ -7085,8 +7091,9 @@ impl Sidebar {
         let timestamp: SharedString = if is_empty_draft {
             SharedString::default()
         } else if thread.nested {
-            // A child is ordered by its last message, not by interaction.
-            format_history_entry_timestamp(thread.metadata.updated_at).into()
+            // `updated_at` moves with every save, so a child shows the time of
+            // its last message, as the store keeps it in `interacted_at`.
+            format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
         } else {
             format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
         };
@@ -7113,8 +7120,7 @@ impl Sidebar {
             .subthread_counts
             .contains_key(&thread.metadata.thread_id)
             .then(|| {
-                !self
-                    .collapsed_subthread_groups
+                self.expanded_subthread_groups
                     .contains(&thread.metadata.thread_id)
             });
 
