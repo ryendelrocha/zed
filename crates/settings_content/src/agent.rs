@@ -204,6 +204,11 @@ pub struct OrchestrationSettingsContent {
     ///
     /// Default: 5
     pub subthreads_visible: Option<usize>,
+    /// Whether a child row in the threads sidebar shows the model the child
+    /// runs on. The icon, the lines edited and the time stay either way.
+    ///
+    /// Default: true
+    pub show_child_model: Option<bool>,
     /// Whether the orchestration tools (`start_child`, `await_children`,
     /// `child_status`, `send_to_child`, `cancel_child`, `send_to_parent`,
     /// `list_siblings`, `send_to_sibling`, `whoami`) are exposed to agents.
@@ -227,6 +232,15 @@ pub struct OrchestrationSettingsContent {
     ///
     /// Default: 20
     pub max_sibling_messages: Option<usize>,
+    /// Whether Claude Code's own `Agent` and `Task` subagent tools are turned
+    /// off in the Claude Code sessions you open, and the session is told to
+    /// delegate with the orchestration `start_child` tool instead. Claude
+    /// Code's own subagents cannot be opened or talked to from Zed; children
+    /// started with `start_child` are full conversations you can. Sessions
+    /// that an orchestrator starts keep their own subagent quota.
+    ///
+    /// Default: true
+    pub route_agent_subagents: Option<bool>,
     /// Directory where the per-child exchange logs (JSONL) are written, as
     /// `<log_dir>/<orchestrator-id>/<child-id>.jsonl`. When unset, a
     /// `zed-orchestration` folder in the system temporary directory is used.

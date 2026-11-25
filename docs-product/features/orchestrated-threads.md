@@ -10,7 +10,7 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | ID | Status | Commits |
 | :-- | :-- | :-- |
 | R1 Orchestration tools for every agent | Done | `36ead50`, `b1c2733` (the tools added later are in R3b, R14, R15) |
-| R2 Children on any agent, provider and model | Partial | `b1c2733`, `10530cf` |
+| R2 Children on any agent, provider and model | Done | `b1c2733`, `10530cf`; model of an external agent child: not yet committed |
 | R3 Parent-child link and results back | Done | `36ead50`, `b1c2733`; restart rebuild, opening unloaded children and queueing while connecting in `cbf577d` |
 | R3b Children talk to each other directly | Done | `cbf577d` |
 | R4 Exchange log per child | Done | `36ead50`; new directions in `d303f89`, `cbf577d`, `bd64c7b` |
@@ -30,10 +30,9 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | E1 Interact with children directly | Done | `d303f89` (see R11, R16) |
 | E2 Durable log outside `$TMPDIR` | Not started | none |
 
-Counts for R1 to R17 and R3b (18 requirements): 16 Done, 2 Partial, 0 Not started.
+Counts for R1 to R17 and R3b (18 requirements): 17 Done, 1 Partial, 0 Not started.
 
 What is partial:
-- **R2:** any agent can be a child, but `model` is applied only to the native Zed agent. For an external agent child, `start_child` ignores `model` and returns a warning.
 - **R6:** all five layers exist. L2 and L3 apply only to Claude Code children and only to a session Zed creates (not one it later loads), L1 and L4 count only the child's own root session, and no layer was run against a real Claude Code session (see R6, "Verification status", and section 12).
 
 ## 1. Summary
@@ -94,7 +93,7 @@ Tools added by later requirements: `send_to_parent` (R15), `list_siblings` and `
 
 `start_child` accepts any agent and model that `list_agents_and_models` reports, native or external.
 
-Deviation in the code: `model` (and `profile`, R17) is applied only when the child runs on the native Zed agent. For an external agent child, `start_child` still starts the child but ignores `model` and `profile` and returns a `warning` saying so: the child uses the agent's own configuration. A `model` that is not `provider/model-id` is also ignored with a warning. An unknown agent, or an unknown `profile`, is an error.
+For an external agent child, `model` is one of that agent's own models (for Claude Code `haiku`, `sonnet`, `opus`, optionally as `claude-acp/haiku`). Zed sets it through the agent's model config option (`session/set_config_option`, the path of the model selector) when the child's session connects, and sends the child's first prompt only after that (the prompt is parked, and `send_to_child` messages wait behind it). If the agent does not answer in 15 seconds, the prompt is sent anyway and a warning is logged. A profile whose `default_model` is `<agent-id>/<model>` supplies the model when `model` is not given; the rest of the profile is ignored with a `warning`. A model the agent does not offer is an error that lists the agent's models: `start_child` returns it when the agent's models are already known (from an open session or an earlier child), and otherwise the child starts and fails before any prompt, with the same message in `child_status`. An agent with no model option fails the child the same way. The resolved model is stored in the child's `run_config` (provider is the agent id) and registered as `<agent-id>/<model>`. `list_agents_and_models` lists an external agent's models from an open session of that agent, else from the last list the agent reported in this Zed run, with a `models_note` that says which; an agent that has not connected yet lists none. An unknown agent, or an unknown `profile`, is an error.
 
 **Why:** this is the core goal, multi-model work. Mixing models lets cheap or local models (Ollama) take bulk work, while stronger models take judgment work.
 
@@ -205,9 +204,10 @@ When the setting is off, children appear as ordinary top-level threads, which is
 | `agent.orchestration.max_concurrent_children` | int | `6` | Global cap on running children, across every orchestrator in the app. A child counts from its start until its turn finishes, fails or is cancelled. `start_child` beyond it fails with an error that states the count |
 | `agent.orchestration.max_sibling_messages` | int | `20` | Cap on messages per pair of children (R3b) |
 | `agent.orchestration.human_summary_max_chars` | int | `600` | Length cap of the human-intervention summary (R16) |
+| `agent.orchestration.route_agent_subagents` | bool | `true` | In the Claude Code sessions the human opens, turn off Claude Code's own `Agent` and `Task` tools and tell the session to delegate with `start_child`, because the Claude adapter refuses client requests to its own subagent sessions (`restrictedChild` in `claude-agent-acp`, `src/acp-subagents.ts`). Sessions of orchestrated children keep their quota rules. Other agents are not affected |
 | `agent.orchestration.log_dir` | path | `null` (uses `zed-orchestration` in the system temporary directory) | Where the R4 logs and the R6 quota tickets go |
 
-All seven keys exist in `assets/settings/default.json` with these defaults, and each has an item in the Settings UI (`crates/settings_ui/src/page_data.rs`).
+All eight keys exist in `assets/settings/default.json` with these defaults, and each has an item in the Settings UI (`crates/settings_ui/src/page_data.rs`).
 
 **Why:** each behavior that someone may reasonably want different is a setting, not hard-coded. `max_concurrent_children` is a safety cap that sits above the per-child quota of R6.
 
@@ -344,6 +344,10 @@ Status column: **Met (tests)** means a test in the code asserts the behavior; **
 | AC30 | R9: top-level threads are not limited by `subthreads_visible`; 12 top-level threads with `subthreads_visible: 2` are all listed, with no "Load more". | Met (tests) | `test_top_level_threads_are_not_limited_by_subthreads_visible` |
 | AC31 | R9: clicking a child of an unloaded parent opens the parent (and its project, if closed) and then shows the subagent as soon as the parent conversation has restored it. | Not verified | No test covers the click. The code path is `navigate_to_subthread_when_ready` and `open_workspace_and_activate_thread` (`4fc06ea`). That the count survives an app restart is also untested: the count is in memory only. |
 | AC32 | R9, R17: a child row keeps its persisted model and icon when its live model is missing, has no icon or has an empty name, and when another child is selected, loaded or evicted; a complete live model replaces the persisted one. | Met (tests) | `test_loading_child_without_a_model_keeps_the_persisted_model_and_icon`, `test_live_model_without_an_icon_keeps_the_persisted_icon`, `test_live_model_with_an_empty_name_does_not_blank_the_persisted_model`, `test_known_live_model_replaces_the_persisted_one`, `test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted`, `test_changing_one_child_model_leaves_its_sibling_persisted_config` |
+| AC33 | R2: an external agent child started with `model` gets it through the agent's model option before its first prompt; the model is stored in its `run_config` with the agent id as provider. | Met (tests) | `test_orchestration_external_child_gets_its_model_before_the_first_prompt`, `test_orchestration_external_child_uses_the_profile_model_of_its_agent` |
+| AC34 | R2: an unknown model lists the agent's models; when the agent never answers, the prompt is sent anyway after the timeout. | Met (tests) | `test_orchestration_unknown_external_model_fails_the_child_and_lists_the_models`, `test_orchestration_external_model_timeout_sends_the_prompt_anyway` |
+| AC35 | R2: `list_agents_and_models` lists an external agent's models from an open session or the last reported list. | Met (test) | `test_orchestration_list_shows_the_models_of_an_open_external_session` |
+| AC36 | R10: with `route_agent_subagents` on, a Claude Code root session starts with `Agent` and `Task` disallowed and the `start_child` instruction; off, other agents and children are unchanged. | Met (tests) | `route_on_gives_a_claude_root_session_the_options_and_the_instruction`, `route_off_or_no_orchestration_tools_leave_the_session_unchanged`, `other_agents_are_never_routed`, `a_child_keeps_its_quota_meta_and_is_not_routed` |
 
 ## 10. Risks
 
@@ -399,7 +403,9 @@ Open issues of the implementation at `bd64c7b` (R9 at `4fc06ea`). Each one is st
 | A Claude Code child that is resumed or loaded later does not get the quota `_meta` again (L2 and L3), because it is sent only in `session/new`. | `quota_session_meta` is called only from the `new_session` paths in `crates/agent_servers/src/acp/v1.rs` and `v2.rs`. |
 | L1 and L4 count only the child's own root session. Subagents of a subagent are not counted by L4, and L1 counts the calls of the child's own root session only. | `enforce_subagent_quota` and `count_toward_subagent_quota` resolve the owning child from the root session id. |
 | The ACP v1 path of L4 has no test, and none of L2 to L4 was run against a real Claude Code session (R6, "Verification status"). | Tests in `crates/agent_servers/src/acp/v2.rs` and `crates/orchestration/src/quota.rs` only. |
-| `model` is not supported for an external agent child, and `profile` is ignored for one (R2, R17). Both return a warning. | `crates/agent_ui/src/orchestration_host.rs` and its tests. |
+| `profile` is ignored for an external agent child except for its default model (R2, R17), and returns a warning. | `crates/agent_ui/src/orchestration_host.rs` and its tests. |
+| A root Claude Code session that is loaded or resumed does not get the `route_agent_subagents` `_meta` again, because it is sent only in `session/new`. Its own `Agent` tool keeps working. | `quota_session_meta` in `crates/agent_servers/src/acp.rs`. |
+| `route_agent_subagents` and the model option were not run against a real Claude Code session. | Tests use the stub connection and unit tests only. |
 | The stdio bridge exists only on Unix (`#[cfg(unix)]` in `crates/orchestration/src/bridge.rs`). | `bridge.rs`. |
 | Claude Code may ask the human for permission on each `mcp__zed-orchestration__*` call. | Plan, "Risks": accepted in V1. |
 | The session token sits in the environment of the bridge process. A model with shell access on the same machine could read it (for example with `ps eww`). It only lets that caller act on its own orchestrator's children. | `orchestrated-threads-how-it-works.md`, and `bridge.rs`. |

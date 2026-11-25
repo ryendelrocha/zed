@@ -638,10 +638,12 @@ mod tests {
             orchestration: agent_settings::OrchestrationSettings {
                 show_as_subthreads: true,
                 subthreads_visible: 5,
+                show_child_model: true,
                 enabled: true,
                 human_summary_max_chars: 600,
                 max_concurrent_children: 6,
                 max_sibling_messages: 20,
+                route_agent_subagents: true,
             },
             thinking_display: Default::default(),
         }

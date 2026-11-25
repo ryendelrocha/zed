@@ -780,6 +780,9 @@ pub struct ThreadView {
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
+    /// Entries whose model-only context (the R14 header, how to answer a
+    /// sibling) is shown in full.
+    expanded_delivery_context: collections::HashSet<usize>,
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
@@ -1330,6 +1333,7 @@ impl ThreadView {
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
+            expanded_delivery_context: Default::default(),
             new_server_version_available: None,
             elicitation_form_states: HashMap::default(),
             _cancel_task: None,
@@ -2553,7 +2557,18 @@ impl ThreadView {
 
             let turn_start_time = Instant::now();
             let first_entry = thread.read_with(cx, |thread, _cx| thread.entries().len())?;
+            let attribution = cx.update(|_window, cx| {
+                crate::orchestration_attribution::message_attribution(
+                    root_thread_id,
+                    origin,
+                    is_first_message,
+                    cx,
+                )
+            })?;
             let send = thread.update(cx, |thread, cx| {
+                if let Some(attribution) = attribution {
+                    thread.attribute_next_user_message(attribution);
+                }
                 thread.action_log().update(cx, |action_log, cx| {
                     for buffer in tracked_buffers {
                         action_log.buffer_read(buffer, cx)
@@ -2595,6 +2610,9 @@ impl ThreadView {
             });
 
             let res = send.await;
+            thread
+                .update(cx, |thread, _| thread.clear_pending_user_attribution())
+                .ok();
             let turn_time_ms = turn_start_time.elapsed().as_millis();
             drop(_stop_turn);
             if !uses_reported_activity {
@@ -2651,24 +2669,20 @@ impl ThreadView {
     pub(crate) fn send_follow_up(
         &mut self,
         content: Vec<acp_v2::ContentBlock>,
+        from: orchestration::MessageSender,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let origin = MessageOrigin::Orchestration(Some(from));
         if self.thread.read(cx).status() == ThreadStatus::Generating {
-            self.add_to_queue_with_origin(
-                content,
-                Vec::new(),
-                MessageOrigin::Orchestration,
-                window,
-                cx,
-            );
+            self.add_to_queue_with_origin(content, Vec::new(), origin, window, cx);
             return true;
         }
         self.message_queue.resume();
         self.send_content_with_origin(
             Task::ready(Ok(Some((content, Vec::new())))),
             false,
-            MessageOrigin::Orchestration,
+            origin,
             window,
             cx,
         );
@@ -7743,46 +7757,89 @@ impl ThreadView {
 
         let mut assistant_message_is_blank = false;
 
-        let primary = match &entry {
-            AgentThreadEntry::UserMessage(message) => {
-                if message.content.source_blocks().is_empty() {
-                    return Empty.into_any_element();
-                }
-                let Some(editor) = self
-                    .entry_view_state
+        let entry_attribution = self.entry_attribution(entry_ix, cx);
+        let attributed_entry = match (entry, &entry_attribution) {
+            (AgentThreadEntry::UserMessage(message), Some(attribution))
+                if !message.content.source_blocks().is_empty() =>
+            {
+                self.entry_view_state
                     .read(cx)
                     .entry(entry_ix)
                     .and_then(|entry| entry.message_editor())
-                    .cloned()
-                else {
-                    return Empty.into_any_element();
-                };
+                    .map(|editor| {
+                        self.render_attributed_user_message(
+                            entry_ix,
+                            attribution,
+                            crate::orchestration_attribution::context_text(message),
+                            editor.clone().into_any_element(),
+                            cx,
+                        )
+                    })
+            }
+            (AgentThreadEntry::ToolCall(tool_call), Some(attribution)) => {
+                crate::orchestration_attribution::outgoing_message(
+                    tool_call,
+                    self.root_thread_id,
+                    cx,
+                )
+                .map(|outgoing| {
+                    self.render_attribution_block(
+                        entry_ix,
+                        attribution,
+                        Label::new(outgoing.text)
+                            .size(LabelSize::Small)
+                            .into_any_element(),
+                        cx,
+                    )
+                    .into_any_element()
+                })
+            }
+            _ => None,
+        };
 
-                let editing = self.editing_message == Some(entry_ix);
-                let editor_focus = editor.focus_handle(cx).is_focused(window);
-                let focus_border = cx.theme().colors().border_focused;
-                // Drop shadows render as a dark halo on transparent windows.
-                let opaque_window = cx.theme().window_background_appearance()
-                    == gpui::WindowBackgroundAppearance::Opaque;
+        let primary = if let Some(attributed_entry) = attributed_entry {
+            attributed_entry
+        } else {
+            match &entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    if message.content.source_blocks().is_empty() {
+                        return Empty.into_any_element();
+                    }
+                    let Some(editor) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.message_editor())
+                        .cloned()
+                    else {
+                        return Empty.into_any_element();
+                    };
 
-                let is_subagent = self.is_subagent();
-                let can_rewind = self
-                    .thread
-                    .read(cx)
-                    .can_rewind_to(message.client_id.as_ref(), cx);
-                let source_is_representable = message
-                    .content
-                    .source_blocks()
-                    .iter()
-                    .all(acp_thread::content::can_convert_to_v1);
-                let is_editable = can_rewind && source_is_representable;
-                let agent_name = if is_subagent {
-                    "subagents".into()
-                } else {
-                    self.agent_id.clone()
-                };
+                    let editing = self.editing_message == Some(entry_ix);
+                    let editor_focus = editor.focus_handle(cx).is_focused(window);
+                    let focus_border = cx.theme().colors().border_focused;
+                    // Drop shadows render as a dark halo on transparent windows.
+                    let opaque_window = cx.theme().window_background_appearance()
+                        == gpui::WindowBackgroundAppearance::Opaque;
 
-                v_flex()
+                    let is_subagent = self.is_subagent();
+                    let can_rewind = self
+                        .thread
+                        .read(cx)
+                        .can_rewind_to(message.client_id.as_ref(), cx);
+                    let source_is_representable = message
+                        .content
+                        .source_blocks()
+                        .iter()
+                        .all(acp_thread::content::can_convert_to_v1);
+                    let is_editable = can_rewind && source_is_representable;
+                    let agent_name = if is_subagent {
+                        "subagents".into()
+                    } else {
+                        self.agent_id.clone()
+                    };
+
+                    v_flex()
                     .id(("user_message", entry_ix))
                     .map(|this| {
                         if is_first_indented {
@@ -7916,124 +7973,116 @@ impl ThreadView {
                             }),
                     )
                     .into_any()
-            }
-            AgentThreadEntry::AssistantMessage(AssistantMessage {
-                chunks,
-                indented: _,
-                is_subagent_output: _,
-            }) => {
-                let mut is_blank = true;
-
-                let message_body = v_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(chunks.iter().enumerate().filter_map(
-                        |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block, .. } => {
-                                let this_is_blank = !block.visible_content(cx);
-                                is_blank = is_blank && this_is_blank;
-                                (!this_is_blank).then(|| {
-                                    div()
-                                        .id(("assistant-message-chunk", chunk_ix))
-                                        .child(self.render_message_content(
-                                            entry_ix, chunk_ix, block, window, cx,
-                                        ))
-                                        .into_any_element()
-                                })
-                            }
-                            AssistantMessageChunk::Thought { block, .. } => {
-                                let this_is_blank = !block.visible_content(cx);
-                                is_blank = is_blank && this_is_blank;
-                                (!this_is_blank).then(|| {
-                                    self.render_thinking_block(
-                                        entry_ix, chunk_ix, block, window, cx,
-                                    )
-                                    .into_any_element()
-                                })
-                            }
-                        },
-                    ))
-                    .into_any();
-
-                assistant_message_is_blank = is_blank;
-
-                if is_blank {
-                    Empty.into_any()
-                } else {
-                    v_flex()
-                        .px_5()
-                        .py_1p5()
-                        .when(is_thread_bottom, |this| this.pb_4())
-                        .w_full()
-                        .text_ui(cx)
-                        .child(message_body)
-                        .when_some(
-                            self.entry_view_state
-                                .read(cx)
-                                .entry(entry_ix)
-                                .and_then(|entry| entry.focus_handle(cx)),
-                            |this, handle| this.track_focus(&handle),
-                        )
-                        .into_any()
                 }
-            }
-            AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
+                AgentThreadEntry::AssistantMessage(AssistantMessage {
+                    chunks,
+                    indented: _,
+                    is_subagent_output: _,
+                }) => {
+                    let mut is_blank = true;
+
+                    let message_body = v_flex()
+                        .w_full()
+                        .gap_3()
+                        .children(chunks.iter().enumerate().filter_map(|(chunk_ix, chunk)| {
+                            match chunk {
+                                AssistantMessageChunk::Message { block, .. } => {
+                                    let this_is_blank = !block.visible_content(cx);
+                                    is_blank = is_blank && this_is_blank;
+                                    (!this_is_blank).then(|| {
+                                        div()
+                                            .id(("assistant-message-chunk", chunk_ix))
+                                            .child(self.render_message_content(
+                                                entry_ix, chunk_ix, block, window, cx,
+                                            ))
+                                            .into_any_element()
                                     })
+                                }
+                                AssistantMessageChunk::Thought { block, .. } => {
+                                    let this_is_blank = !block.visible_content(cx);
+                                    is_blank = is_blank && this_is_blank;
+                                    (!this_is_blank).then(|| {
+                                        self.render_thinking_block(
+                                            entry_ix, chunk_ix, block, window, cx,
+                                        )
+                                        .into_any_element()
+                                    })
+                                }
                             }
-                            ToolCallContent::SessionReference(_) => true,
-                            ToolCallContent::Text { markdown, .. }
-                            | ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
+                        }))
+                        .into_any();
+
+                    assistant_message_is_blank = is_blank;
+
+                    if is_blank {
+                        Empty.into_any()
+                    } else {
+                        v_flex()
+                            .px_5()
+                            .py_1p5()
+                            .when(is_thread_bottom, |this| this.pb_4())
+                            .w_full()
+                            .text_ui(cx)
+                            .child(match &entry_attribution {
+                                Some(attribution) => self
+                                    .render_attribution_block(
+                                        entry_ix,
+                                        attribution,
+                                        message_body,
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                None => message_body,
+                            })
+                            .when_some(
+                                self.entry_view_state
+                                    .read(cx)
+                                    .entry(entry_ix)
+                                    .and_then(|entry| entry.focus_handle(cx)),
+                                |this, handle| this.track_focus(&handle),
+                            )
+                            .into_any()
                     }
                 }
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    // A canceled tool call that produced visible output is still worth
+                    // showing, but one that was canceled before producing anything just
+                    // renders as a useless "Canceled" card — hide those entirely.
+                    if matches!(tool_call.status(), ToolCallStatus::Canceled) {
+                        let has_visible_content =
+                            tool_call.content().iter().any(|content| match content {
+                                ToolCallContent::ContentBlock { block, .. } => {
+                                    block.visible_content(cx)
+                                }
+                                ToolCallContent::Diff(_)
+                                | ToolCallContent::LegacyDiff { .. }
+                                | ToolCallContent::Terminal { .. } => true,
+                                ToolCallContent::DiffPatch { render, .. } => {
+                                    !render.files.is_empty()
+                                        || render.fallback.as_ref().is_some_and(|markdown| {
+                                            !markdown.read(cx).source().is_empty()
+                                        })
+                                }
+                                ToolCallContent::SessionReference(_) => true,
+                                ToolCallContent::Text { markdown, .. }
+                                | ToolCallContent::Other { markdown, .. } => {
+                                    !markdown.read(cx).source().is_empty()
+                                }
+                            });
+                        if !has_visible_content {
+                            return Empty.into_any();
+                        }
+                    }
 
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
-                }
-            }
-            AgentThreadEntry::Elicitation(elicitation_id) => {
-                let thread = self.thread.read(cx);
-                if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
-                    && should_render_elicitation(elicitation)
-                {
-                    let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
+                    let tool_call = self.render_any_tool_call(
+                        self.thread.read(cx).session_id(),
+                        entry_ix,
+                        tool_call,
+                        &self.focus_handle(cx),
+                        ToolCallLayout::Standalone,
+                        window,
+                        cx,
+                    );
 
                     if let Some(handle) = self
                         .entry_view_state
@@ -8041,32 +8090,54 @@ impl ThreadView {
                         .entry(entry_ix)
                         .and_then(|entry| entry.focus_handle(cx))
                     {
-                        elicitation.track_focus(&handle).into_any()
+                        tool_call.track_focus(&handle).into_any()
                     } else {
-                        elicitation.into_any()
+                        tool_call.into_any()
                     }
-                } else {
-                    Empty.into_any()
                 }
-            }
-            AgentThreadEntry::ContextCompaction(compaction) => {
-                self.render_context_compaction(entry_ix, compaction, window, cx)
-            }
-            AgentThreadEntry::SessionMessage(message) => {
-                let session_message =
-                    match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
-                        Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
-                        None => self.render_session_message(entry_ix, message, window, cx),
-                    };
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    session_message.track_focus(&handle).into_any()
-                } else {
-                    session_message.into_any()
+                AgentThreadEntry::Elicitation(elicitation_id) => {
+                    let thread = self.thread.read(cx);
+                    if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
+                        && should_render_elicitation(elicitation)
+                    {
+                        let elicitation =
+                            self.render_elicitation(entry_ix, elicitation, window, cx);
+
+                        if let Some(handle) = self
+                            .entry_view_state
+                            .read(cx)
+                            .entry(entry_ix)
+                            .and_then(|entry| entry.focus_handle(cx))
+                        {
+                            elicitation.track_focus(&handle).into_any()
+                        } else {
+                            elicitation.into_any()
+                        }
+                    } else {
+                        Empty.into_any()
+                    }
+                }
+                AgentThreadEntry::ContextCompaction(compaction) => {
+                    self.render_context_compaction(entry_ix, compaction, window, cx)
+                }
+                AgentThreadEntry::SessionMessage(message) => {
+                    let session_message =
+                        match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
+                            Some(card) => {
+                                self.render_acp_subagent_card(entry_ix, &card, window, cx)
+                            }
+                            None => self.render_session_message(entry_ix, message, window, cx),
+                        };
+                    if let Some(handle) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.focus_handle(cx))
+                    {
+                        session_message.track_focus(&handle).into_any()
+                    } else {
+                        session_message.into_any()
+                    }
                 }
             }
         };
@@ -9422,6 +9493,138 @@ impl ThreadView {
         }
 
         has_running_terminal_call
+    }
+
+    /// The `From`/`To` header of the entry at `entry_ix`, when another thread
+    /// wrote it or it is addressed to another thread. Orchestrated threads only.
+    pub(crate) fn entry_attribution(
+        &self,
+        entry_ix: usize,
+        cx: &App,
+    ) -> Option<crate::orchestration_attribution::EntryAttribution> {
+        if self.is_subagent() {
+            return None;
+        }
+        let thread = self.thread.read(cx);
+        crate::orchestration_attribution::entry_attribution(
+            thread.entries(),
+            entry_ix,
+            thread.status() == ThreadStatus::Generating,
+            self.root_thread_id,
+            cx,
+        )
+    }
+
+    /// The header of a message between threads, in the layout of the messages
+    /// between an agent and its own subagents: an icon, `From` or `To`, and the
+    /// other thread's title.
+    fn render_attribution_header(
+        entry_ix: usize,
+        attribution: &crate::orchestration_attribution::EntryAttribution,
+    ) -> impl IntoElement {
+        use crate::orchestration_attribution::AttributionDirection;
+        let (icon, direction) = match attribution.direction {
+            AttributionDirection::From => (IconName::Envelope, "From"),
+            AttributionDirection::To => (IconName::Send, "To"),
+        };
+        let title = attribution.title.clone();
+        h_flex()
+            .gap_1p5()
+            .debug_selector(move || format!("attribution-header-{entry_ix}"))
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(
+                Label::new(direction)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(title).size(LabelSize::Small))
+    }
+
+    /// `body` under the header of a message between threads.
+    fn render_attribution_block(
+        &self,
+        entry_ix: usize,
+        attribution: &crate::orchestration_attribution::EntryAttribution,
+        body: AnyElement,
+        cx: &Context<Self>,
+    ) -> Div {
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            .child(Self::render_attribution_header(entry_ix, attribution))
+            .child(
+                div()
+                    .pl_3()
+                    .border_l_2()
+                    .border_color(cx.theme().colors().border)
+                    .child(body),
+            )
+    }
+
+    /// A user message that another thread wrote, such as the orchestrator's
+    /// prompt. `context` is what only the model needs (the R14 header): it
+    /// stays collapsed in the same block.
+    fn render_attributed_user_message(
+        &self,
+        entry_ix: usize,
+        attribution: &crate::orchestration_attribution::EntryAttribution,
+        context: Option<String>,
+        body: AnyElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let expanded = self.expanded_delivery_context.contains(&entry_ix);
+        let context = context.map(|context| {
+            v_flex()
+                .gap_0p5()
+                .child(
+                    Button::new(
+                        ("delivery-context-toggle", entry_ix),
+                        "Instructions for the agent",
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.expanded_delivery_context.remove(&entry_ix) {
+                            this.expanded_delivery_context.insert(entry_ix);
+                        }
+                        cx.notify();
+                    })),
+                )
+                .when(expanded, |this| {
+                    this.child(
+                        Label::new(context)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+        });
+        v_flex()
+            .id(("user_message", entry_ix))
+            .px_5()
+            .pt_2()
+            .pb_3()
+            .gap_1p5()
+            .w_full()
+            .child(Self::render_attribution_header(entry_ix, attribution))
+            .children(context)
+            .child(
+                div()
+                    .pl_3()
+                    .border_l_2()
+                    .border_color(cx.theme().colors().border)
+                    .text_xs()
+                    .child(body),
+            )
+            .into_any_element()
     }
 
     fn render_session_message(
@@ -15130,6 +15333,7 @@ mod tests {
                 meta: None,
                 client_id: None,
                 is_optimistic: false,
+                attribution: None,
                 content: MessageContent::new(
                     acp_v2::ContentBlock::Text(acp_v2::TextContent::new("next prompt")),
                     &language_registry,

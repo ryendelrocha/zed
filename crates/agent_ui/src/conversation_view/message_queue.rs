@@ -12,9 +12,10 @@ pub struct QueueEntryId(usize);
 pub enum MessageOrigin {
     #[default]
     Human,
-    /// Sent by the orchestration tools: `send_to_child`, or an urgent message
-    /// from a child.
-    Orchestration,
+    /// Sent by the orchestration tools: `send_to_child`, a sibling message, or
+    /// an urgent message from a child. The thread that wrote it, when known,
+    /// is what the view shows as `From <title>`.
+    Orchestration(Option<orchestration::MessageSender>),
 }
 
 pub struct QueueEntry {

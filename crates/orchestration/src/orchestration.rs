@@ -148,17 +148,22 @@ pub struct StartChildInput {
     /// Defaults to the agent selected in the agent panel.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Model of the child, as `provider/model-id`. Only the native Zed agent
-    /// supports it for now: for an external agent it is ignored and the
-    /// output carries a warning. Prefer `profile` over naming a model.
+    /// Model of the child. For the native Zed agent, `provider/model-id`. For
+    /// an external agent, one of that agent's models from
+    /// `list_agents_and_models` (for example `haiku`, `sonnet` or `opus` for
+    /// `claude-acp`), optionally as `agent/model`: Zed sets it through the
+    /// agent's model option before the child's first prompt, and an unknown
+    /// model is an error that lists the agent's models. Prefer `profile` over
+    /// naming a model.
     #[serde(default)]
     pub model: Option<String>,
     /// Profile of the child, as an `id` from the `profiles` of
     /// `list_agents_and_models`. Pick it by matching the task to the profile
     /// descriptions. The child gets the profile's tools and, unless `model`
-    /// is set, the profile's default model. Only the native Zed agent
-    /// supports it for now: for an external agent it is ignored and the
-    /// output carries a warning. An unknown profile is an error.
+    /// is set, the profile's default model. For an external agent only the
+    /// profile's default model is used, and only when it names that agent
+    /// (`agent/model`); the rest of the profile is ignored with a warning. An
+    /// unknown profile is an error.
     #[serde(default)]
     pub profile: Option<String>,
     /// Whether the child shares the orchestrator's worktree or gets its own.
@@ -469,6 +474,87 @@ pub struct HumanSummaryRequest {
     pub max_chars: usize,
 }
 
+/// How the child header (R14) starts, up to the orchestrator's title.
+pub const CHILD_HEADER_MARKER: &str =
+    "You are a child conversation started by the orchestrator thread ";
+
+/// Separates the child header from the task in a child's first message.
+const CHILD_HEADER_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Who wrote a message that the orchestration tools deliver to a thread, and
+/// the thread it came from. The receiving thread's view shows it as
+/// `From <title>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageSender {
+    pub role: SenderRole,
+    pub thread: ThreadId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SenderRole {
+    /// The orchestrator of the receiving child: its first prompt or a
+    /// `send_to_child` follow-up.
+    Orchestrator,
+    /// Another child of the same orchestrator, through `send_to_sibling`.
+    Sibling,
+    /// A child of the receiving orchestrator, through an urgent `send_to_parent`.
+    Child,
+}
+
+/// A delivered message split for display: the part the model needs but a
+/// reader does not (the R14 header, how to answer a sibling) and the message.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveredText<'a> {
+    pub context: Option<&'a str>,
+    pub body: &'a str,
+}
+
+/// Splits the text that the orchestration tools deliver: the child's first
+/// message (header, then task), a sibling message (prefix, message, how to
+/// answer) or an urgent child message (prefix, message). Any other text is
+/// returned whole.
+pub fn split_delivered_text(text: &str) -> DeliveredText<'_> {
+    if text.starts_with(CHILD_HEADER_MARKER) {
+        if let Some((header, task)) = text.split_once(CHILD_HEADER_SEPARATOR) {
+            return DeliveredText {
+                context: Some(header),
+                body: task,
+            };
+        }
+        return DeliveredText {
+            context: None,
+            body: text,
+        };
+    }
+    let is_sibling = text.starts_with("[from sibling ");
+    if !is_sibling && !text.starts_with("[from child ") {
+        return DeliveredText {
+            context: None,
+            body: text,
+        };
+    }
+    let Some((_, rest)) = text.split_once("] ") else {
+        return DeliveredText {
+            context: None,
+            body: text,
+        };
+    };
+    if is_sibling
+        && let Some(footer_start) = rest.rfind("\n\n(")
+        && rest.ends_with(')')
+        && rest[footer_start..].contains("`send_to_sibling`")
+    {
+        return DeliveredText {
+            context: Some(rest[footer_start + 2..].trim()),
+            body: &rest[..footer_start],
+        };
+    }
+    DeliveredText {
+        context: None,
+        body: rest,
+    }
+}
+
 /// Prefix of a child's first prompt: it tells the child that it is a child,
 /// who its orchestrator is and how to reach it.
 pub fn child_header(orchestrator_title: &str, subagent_quota: u32) -> String {
@@ -488,14 +574,14 @@ pub fn child_header(orchestrator_title: &str, subagent_quota: u32) -> String {
         ),
     };
     format!(
-        "You are a child conversation started by the orchestrator thread \"{orchestrator_title}\". \
+        "{CHILD_HEADER_MARKER}\"{orchestrator_title}\". \
          When you finish, your final message goes back to the orchestrator automatically, so you do \
          not need to send it. If you need to reach the orchestrator during the task (a blocker, a \
          question, a decision), use the `send_to_parent` tool. Do not write it in your own chat: the \
          orchestrator cannot read your chat. Use `whoami` to see your role, your orchestrator and \
          your own children. Other children of the same orchestrator may be working at the same \
          time: `list_siblings` shows them, and `send_to_sibling` asks one a quick question \
-         directly, without going through the orchestrator. {quota}\n\n---\n\n"
+         directly, without going through the orchestrator. {quota}{CHILD_HEADER_SEPARATOR}"
     )
 }
 
@@ -647,6 +733,10 @@ pub struct AvailableAgent {
     pub is_native: bool,
     /// May be empty for agents that choose their own models.
     pub models: Vec<AvailableModel>,
+    /// Where `models` came from and how `start_child` uses them. Set for
+    /// external agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -729,7 +819,13 @@ pub trait OrchestrationHost {
 
     /// Adds `text` to the thread as a new user message that starts a turn. It
     /// must never cancel a running turn.
-    fn deliver_message(&self, _thread: ThreadId, _text: String, _cx: &mut App) -> Task<Result<()>> {
+    fn deliver_message(
+        &self,
+        _thread: ThreadId,
+        _from: MessageSender,
+        _text: String,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
             "This host cannot deliver messages to threads."
         )))

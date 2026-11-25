@@ -286,6 +286,52 @@ pub fn claude_code_quota_meta(grant: &SessionQuotaGrant) -> Result<Map<String, V
     Ok(meta)
 }
 
+/// What a Claude Code root session is told when its own subagent tools are
+/// turned off by `agent.orchestration.route_agent_subagents`.
+pub const ROUTE_SUBAGENTS_INSTRUCTION: &str = "\
+In this Zed session Claude Code's own Agent and Task subagent tools are turned off. \
+To delegate work, use the zed-orchestration `start_child` tool: set `agent` to \"claude-acp\" \
+and `model` to a Claude model such as haiku, sonnet or opus (or pass a `profile`). \
+Every child is a full conversation that the human can open in the threads sidebar and talk to; \
+collect results with `await_children`.";
+
+/// The `_meta` of a Claude Code root session when
+/// `agent.orchestration.route_agent_subagents` is on.
+///
+/// - `claudeCode.options.disallowedTools` removes the subagent tools. The
+///   adapter merges it with its own list (`claude-agent-acp`,
+///   `src/v1/acp-agent.ts` `disallowedTools: [...userProvidedOptions.disallowedTools, ...]`
+///   and `src/v2/agent.ts`).
+/// - `systemPrompt.append` is the adapter's `_meta.systemPrompt` extension
+///   (`src/client-system-prompt.ts` `sessionSystemPrompt`): an object of
+///   preset options whose `append` is added to the Claude Code preset.
+pub fn claude_code_route_meta() -> Map<String, Value> {
+    let mut meta = Map::new();
+    meta.insert(
+        "claudeCode".to_string(),
+        json!({ "options": { "disallowedTools": CLAUDE_CODE_SUBAGENT_TOOLS } }),
+    );
+    meta.insert(
+        "systemPrompt".to_string(),
+        json!({ "append": ROUTE_SUBAGENTS_INSTRUCTION }),
+    );
+    meta
+}
+
+/// The `_meta` of a Claude Code `session/new`. An orchestrated child (it has a
+/// `grant`) keeps its own quota rules and is never routed. A root session is
+/// routed when `route` is on. No `_meta` otherwise.
+pub fn claude_code_session_meta(
+    grant: Option<&SessionQuotaGrant>,
+    route: bool,
+) -> Result<Option<Map<String, Value>>> {
+    match grant {
+        Some(grant) => claude_code_quota_meta(grant).map(Some),
+        None if route => Ok(Some(claude_code_route_meta())),
+        None => Ok(None),
+    }
+}
+
 fn write_tickets(directory: &Path, count: u32) -> Result<()> {
     fs::create_dir_all(directory)
         .with_context(|| format!("creating quota directory {}", directory.display()))?;
@@ -424,6 +470,62 @@ mod tests {
         let options = &meta["claudeCode"]["options"];
         assert_eq!(options["disallowedTools"], json!(["Agent", "Task"]));
         assert!(options.get("settings").is_none());
+    }
+
+    #[test]
+    fn test_route_meta_disallows_the_subagent_tools_and_appends_the_instruction() {
+        let meta = claude_code_route_meta();
+        assert_eq!(
+            meta["claudeCode"]["options"]["disallowedTools"],
+            json!(["Agent", "Task"])
+        );
+        let append = meta["systemPrompt"]["append"].as_str().unwrap();
+        assert!(append.contains("start_child"), "{append}");
+        assert!(append.contains("claude-acp"), "{append}");
+        assert!(append.contains("haiku, sonnet or opus"), "{append}");
+        assert!(append.contains("talk to"), "{append}");
+        // The adapter forces the preset itself: only `append` is sent.
+        assert_eq!(meta["systemPrompt"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_session_meta_routes_roots_only_when_the_setting_is_on() {
+        let root_on = claude_code_session_meta(None, true).unwrap().unwrap();
+        assert_eq!(root_on, claude_code_route_meta());
+        assert_eq!(claude_code_session_meta(None, false).unwrap(), None);
+    }
+
+    #[test]
+    fn test_session_meta_of_a_child_keeps_its_quota_rules_whatever_the_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let grant = SessionQuotaGrant {
+            granted: 2,
+            tickets_dir: directory.path().join("child.quota"),
+        };
+        for route in [true, false] {
+            let meta = claude_code_session_meta(Some(&grant), route)
+                .unwrap()
+                .unwrap();
+            let options = &meta["claudeCode"]["options"];
+            assert!(options.get("disallowedTools").is_none(), "route {route}");
+            assert_eq!(
+                options["settings"]["hooks"]["PreToolUse"][0]["matcher"],
+                "Agent|Task"
+            );
+            assert!(meta.get("systemPrompt").is_none(), "route {route}");
+        }
+        let none = SessionQuotaGrant {
+            granted: 0,
+            tickets_dir: directory.path().join("zero.quota"),
+        };
+        let meta = claude_code_session_meta(Some(&none), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meta["claudeCode"]["options"]["disallowedTools"],
+            json!(["Agent", "Task"])
+        );
+        assert!(meta.get("systemPrompt").is_none());
     }
 
     #[test]

@@ -904,6 +904,10 @@ pub struct AvailableAgent {
     /// Models available for this agent. May be empty if models are not
     /// enumerated up front (e.g., external agents that choose their own).
     pub models: Vec<AvailableModel>,
+    /// Where `models` came from and how `start_child` uses them. Set for
+    /// external agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

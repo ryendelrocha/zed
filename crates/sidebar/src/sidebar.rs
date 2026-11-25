@@ -433,7 +433,15 @@ fn profile_display_name(profile_id: &SharedString, cx: &App) -> SharedString {
 
 /// The secondary text of a child row: `Profile · model`. The row truncates it
 /// at its end, so a narrow sidebar cuts the model first.
-fn child_model_label(profile: Option<&str>, model: Option<&str>) -> Option<SharedString> {
+///
+/// `show_model` is the `show_child_model` setting: when off, the model is left
+/// out and only the profile, if any, remains.
+fn child_model_label(
+    profile: Option<&str>,
+    model: Option<&str>,
+    show_model: bool,
+) -> Option<SharedString> {
+    let model = model.filter(|_| show_model);
     match (profile, model) {
         (Some(profile), Some(model)) => Some(format!("{profile} \u{00b7} {model}").into()),
         (Some(profile), None) => Some(profile.to_string().into()),
@@ -462,8 +470,8 @@ fn persisted_thread_model(run_config: &ThreadRunConfig, cx: &App) -> Option<Thre
                 .into_iter()
                 .find(|model| model.id().0.as_ref() == model_id)
         })
-        .map(|model| model.name().0)
-        .unwrap_or_else(|| SharedString::from(model_id.to_string()));
+        .map(|model| agent_ui::friendly_model_name(&model.name().0))
+        .unwrap_or_else(|| agent_ui::prettify_model_id(model_id));
     Some(ThreadModel { name, icon })
 }
 
@@ -6902,9 +6910,22 @@ impl Sidebar {
         .when_some(info.icon_from_external_svg.clone(), |this, svg| {
             this.custom_icon_from_external_svg(svg)
         })
-        .when_some(info.model.clone(), |this, model| this.model(model))
+        .when_some(
+            child_model_label(
+                None,
+                info.model.as_deref(),
+                AgentSettings::get_global(cx).orchestration.show_child_model,
+            ),
+            |this, model| this.model(model),
+        )
         .status(info.status)
         .timestamp(timestamp)
+        .when(info.diff_stats.lines_added > 0, |this| {
+            this.added(info.diff_stats.lines_added as usize)
+        })
+        .when(info.diff_stats.lines_removed > 0, |this| {
+            this.removed(info.diff_stats.lines_removed as usize)
+        })
         .indented(true)
         .selected(is_active)
         .focused(is_focused)
@@ -7109,6 +7130,7 @@ impl Sidebar {
                 child_model_label(
                     profile_name.as_deref(),
                     thread.model.as_ref().map(|model| model.name.as_ref()),
+                    AgentSettings::get_global(cx).orchestration.show_child_model,
                 )
             })
             .flatten();
@@ -9027,7 +9049,7 @@ fn all_thread_infos_for_workspace(
                 .active_model(cx)
                 .filter(|model| !model.name.is_empty())
                 .map(|model| ThreadModel {
-                    name: model.name,
+                    name: agent_ui::friendly_model_name(&model.name),
                     icon: if is_native { model.icon } else { None },
                 });
 

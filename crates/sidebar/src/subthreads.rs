@@ -71,6 +71,7 @@ pub(crate) fn persisted_subthreads_by_parent(
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             model: None,
+            diff_stats: Default::default(),
             thread_id: None,
         });
     }
@@ -125,7 +126,7 @@ pub(crate) struct SubthreadLayout<'a> {
 }
 
 /// The row data of a thread that is a child in its own right.
-fn child_info(child: &ThreadEntry) -> SubthreadInfo {
+pub(crate) fn child_info(child: &ThreadEntry) -> SubthreadInfo {
     let (icon, icon_from_external_svg) = match child.model.as_ref().and_then(|m| m.icon.as_ref()) {
         Some(model_icon) => agent_ui::model_icon_parts(model_icon),
         None => (child.icon, child.icon_from_external_svg.clone()),
@@ -142,6 +143,7 @@ fn child_info(child: &ThreadEntry) -> SubthreadInfo {
         icon,
         icon_from_external_svg,
         model: child.model.as_ref().map(|model| model.name.clone()),
+        diff_stats: child.diff_stats,
         thread_id: Some(child.metadata.thread_id),
     }
 }

@@ -1409,7 +1409,7 @@ impl AgentConnection for AcpConnection {
         let orchestration =
             orchestration::mcp_entry_for_new_session(project.read(cx).is_local(), cx);
         let mcp_servers = mcp_servers_for_project(&project, orchestration.as_ref(), cx);
-        let quota_meta = match quota_session_meta(&self.id, cx) {
+        let quota_meta = match quota_session_meta(&self.id, orchestration.is_some(), cx) {
             Ok(meta) => meta,
             Err(error) => return Task::ready(Err(error)),
         };

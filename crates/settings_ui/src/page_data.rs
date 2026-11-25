@@ -9102,7 +9102,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 15] {
+    fn general_section() -> [SettingsPageItem; 17] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9249,6 +9249,33 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Child Model In Sidebar",
+                description: "Whether a child thread row in the Threads Sidebar shows the model the child runs on.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.show_child_model"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .show_child_model
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .show_child_model = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Orchestration Tools",
                 description: "Whether the orchestration tools (start_child, await_children, child_status, send_to_child, cancel_child) are exposed to agents.",
                 field: Box::new(SettingField {
@@ -9351,6 +9378,33 @@ fn ai_page(cx: &App) -> SettingsPage {
                             .orchestration
                             .get_or_insert_default()
                             .max_sibling_messages = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Route Claude Code Subagents To Child Threads",
+                description: "Turn off Claude Code's own Agent and Task subagent tools in the Claude Code sessions you open, and tell the session to delegate with start_child, whose children are full conversations you can open and talk to.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.route_agent_subagents"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .route_agent_subagents
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .route_agent_subagents = value;
                     },
                 }),
                 metadata: None,

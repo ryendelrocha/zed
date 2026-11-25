@@ -18673,6 +18673,7 @@ fn test_select_visible_subthreads_orders_by_recency_and_limits() {
         icon: IconName::ZedAgent,
         icon_from_external_svg: None,
         model: None,
+        diff_stats: Default::default(),
         thread_id: None,
     };
     let subthreads = vec![
@@ -19756,6 +19757,7 @@ async fn test_live_subagent_row_shows_its_model(cx: &mut TestAppContext) {
             })
             .expect("a live subagent row");
         assert_eq!(info.model.as_deref(), Some("Visual Test Model"));
+        assert!(info.last_message_at.is_some(), "the row has a time");
     });
 }
 
@@ -19809,6 +19811,14 @@ async fn test_unloaded_child_row_shows_the_persisted_model_and_icon(cx: &mut Tes
     let known = kid("known", "Known", 2, "fake", "fake");
     // The model is gone from the registry: its id is shown, with no icon.
     let gone = kid("gone", "Gone", 1, "removed-provider", "old-model");
+    // Only an id is known: it is turned into a readable name.
+    let prettified = kid(
+        "ds",
+        "Prettified",
+        3,
+        "removed-provider",
+        "deepseek-v4.1-flash:cloud",
+    );
     // A child nobody configured shows no model, as before.
     let plain = save_orchestration_thread_metadata(
         "plain",
@@ -19843,8 +19853,11 @@ async fn test_unloaded_child_row_shows_the_persisted_model_and_icon(cx: &mut Tes
         assert!(model.icon.is_some(), "the provider's icon is known");
         let gone = thread(gone);
         let model = gone.model.as_ref().expect("the id is still shown");
-        assert_eq!(model.name.as_ref(), "old-model");
+        assert_eq!(model.name.as_ref(), "Old Model");
         assert_eq!(model.icon, None);
+        let prettified = thread(prettified);
+        let model = prettified.model.as_ref().expect("the id is prettified");
+        assert_eq!(model.name.as_ref(), "DeepSeek 4.1 Flash");
         assert_eq!(thread(plain).model, None);
     });
 }
@@ -19852,18 +19865,44 @@ async fn test_unloaded_child_row_shows_the_persisted_model_and_icon(cx: &mut Tes
 #[test]
 fn test_child_model_label_puts_the_profile_before_the_model() {
     assert_eq!(
-        child_model_label(Some("Reviewer"), Some("gpt-5")).as_deref(),
+        child_model_label(Some("Reviewer"), Some("gpt-5"), true).as_deref(),
         Some("Reviewer \u{00b7} gpt-5")
     );
     assert_eq!(
-        child_model_label(None, Some("gpt-5")).as_deref(),
+        child_model_label(None, Some("gpt-5"), true).as_deref(),
         Some("gpt-5")
     );
     assert_eq!(
-        child_model_label(Some("Reviewer"), None).as_deref(),
+        child_model_label(Some("Reviewer"), None, true).as_deref(),
         Some("Reviewer")
     );
-    assert_eq!(child_model_label(None, None), None);
+    assert_eq!(child_model_label(None, None, true), None);
+}
+
+#[test]
+fn test_child_model_label_omits_the_model_when_the_setting_is_off() {
+    assert_eq!(child_model_label(None, Some("gpt-5"), false), None);
+    assert_eq!(
+        child_model_label(Some("Reviewer"), Some("gpt-5"), false).as_deref(),
+        Some("Reviewer")
+    );
+}
+
+#[gpui::test]
+async fn test_every_child_kind_carries_model_diff_and_time(cx: &mut TestAppContext) {
+    let stats = DiffStats {
+        lines_added: 12,
+        lines_removed: 3,
+    };
+    // An orchestrated child, from its thread entry.
+    let mut child =
+        child_entry_with_model(Some(ollama_model("DeepSeek 4.1 Flash", true)), cx).await;
+    child.diff_stats = stats;
+    let orchestrated = subthreads::child_info(&child);
+    assert_eq!(orchestrated.model.as_deref(), Some("DeepSeek 4.1 Flash"));
+    assert_eq!(orchestrated.diff_stats, stats);
+    assert!(orchestrated.last_message_at.is_some());
+    assert!(orchestrated.thread_id.is_some());
 }
 
 fn ollama_model(name: &str, icon: bool) -> ThreadModel {
@@ -20043,7 +20082,7 @@ async fn test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted(
                     })
                     .expect("the child row is listed");
                 let model = row.model.as_ref().expect("the persisted model is shown");
-                assert_eq!(model.name.as_ref(), "deepseek-v4.1-flash:cloud");
+                assert_eq!(model.name.as_ref(), "DeepSeek 4.1 Flash");
                 assert!(row.nested);
             }
         });

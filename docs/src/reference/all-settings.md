@@ -241,6 +241,30 @@ Open the Settings Editor and search for “Show Subagent Threads In Sidebar”. 
 }
 ```
 
+### Show Child Model In Sidebar {#agent-orchestration-show-child-model}
+
+- Description: Whether a child thread row in the [Threads Sidebar](../ai/parallel-agents.md#threads-sidebar) shows the model the child runs on.
+- Setting: `agent.orchestration.show_child_model`
+- Default: `true`
+
+**Options**
+
+`true` or `false`.
+
+Every child row, whether an orchestrated thread, a native subagent or a subagent an external agent runs, shows its model, the lines it edited and the time of its last message. The model is the name the provider or the agent reports ("Haiku 5.5"); when only an id is known, it is turned into a readable name ("deepseek-v4.1-flash:cloud" shows as "DeepSeek 4.1 Flash"). With `false`, the row omits the model and keeps the icon, the lines edited and the time.
+
+Open the Settings Editor and search for “Show Child Model In Sidebar”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "show_child_model": false
+    }
+  }
+}
+```
+
 ### Visible Subagent Threads {#agent-orchestration-subthreads-visible}
 
 - Description: How many subagent threads are listed under a parent thread in the [Threads Sidebar](../ai/parallel-agents.md#threads-sidebar) before a "Load more" row.
@@ -352,6 +376,30 @@ Open the Settings Editor and search for “Maximum Sibling Messages”. Or add t
   "agent": {
     "orchestration": {
       "max_sibling_messages": 10
+    }
+  }
+}
+```
+
+### Route Claude Code Subagents To Child Threads {#agent-orchestration-route-agent-subagents}
+
+- Description: Claude Code's own `Agent` and `Task` subagents cannot be opened or talked to from Zed: the Claude adapter refuses every client request to a subagent session except cancel. When this is on, the Claude Code sessions you open start with those two tools disallowed and with an instruction to delegate with the orchestration `start_child` tool instead (agent `claude-acp`, a model such as Haiku, Sonnet or Opus, or a profile). The children are full conversations that you can open in the threads sidebar and talk to.
+- Setting: `agent.orchestration.route_agent_subagents`
+- Default: `true`
+
+**Options**
+
+`true` or `false`.
+
+The setting applies to new Claude Code sessions with orchestration enabled. Sessions that an orchestrator starts keep their own subagent quota (`subagent_quota` in `start_child`). Other agents are not affected. When `false`, Claude Code keeps its own subagent tools.
+
+Open the Settings Editor and search for “Route Claude Code Subagents”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "route_agent_subagents": false
     }
   }
 }

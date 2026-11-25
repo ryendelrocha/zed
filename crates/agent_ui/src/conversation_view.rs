@@ -315,6 +315,8 @@ pub struct SubthreadInfo {
     pub icon_from_external_svg: Option<SharedString>,
     /// The model this thread runs on, when known.
     pub model: Option<SharedString>,
+    /// Lines the thread edited, as the rows of top-level threads show them.
+    pub diff_stats: action_log::DiffStats,
     /// Set for a thread that is a conversation of its own, listed under its
     /// parent through the thread metadata. `None` for a live subagent.
     pub thread_id: Option<ThreadId>,
@@ -958,8 +960,20 @@ impl ConversationView {
                     .get(&session_id)
                     .map(|view| view.read(cx))
                     .unwrap_or(root_view);
-                let model = own_view
-                    .active_model(cx)
+                // A subagent the agent owns reports its own model; without a
+                // view of its own, only a native subagent, which runs on its
+                // parent's model, falls back to the root's.
+                let model = connected
+                    .threads
+                    .get(&session_id)
+                    .map(|view| view.read(cx))
+                    .or_else(|| {
+                        root_view
+                            .as_native_thread(cx)
+                            .is_some()
+                            .then_some(root_view)
+                    })
+                    .and_then(|view| view.active_model(cx))
                     .filter(|model| !model.name.is_empty());
                 let (icon, icon_from_external_svg) = match model
                     .as_ref()
@@ -995,10 +1009,15 @@ impl ConversationView {
                     session_id,
                     title,
                     status,
-                    last_message_at: subagent.last_message_at(),
+                    // A subagent that has not spoken yet is as recent as its
+                    // parent's last message.
+                    last_message_at: subagent
+                        .last_message_at()
+                        .or_else(|| root_view.thread.read(cx).last_message_at()),
                     icon,
                     icon_from_external_svg,
-                    model: model.map(|model| model.name),
+                    model: model.map(|model| crate::friendly_model_name(&model.name)),
+                    diff_stats: subagent.action_log().read(cx).diff_stats(cx),
                     thread_id: None,
                 }
             })
@@ -2176,6 +2195,7 @@ impl ConversationView {
     pub(crate) fn send_follow_up(
         &mut self,
         content: Vec<acp_v2::ContentBlock>,
+        from: orchestration::MessageSender,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<bool> {
@@ -2183,7 +2203,7 @@ impl ConversationView {
             .root_thread_view()
             .ok_or_else(|| anyhow::anyhow!("The thread is not connected yet."))?;
         Ok(thread_view.update(cx, |thread_view, cx| {
-            thread_view.send_follow_up(content, window, cx)
+            thread_view.send_follow_up(content, from, window, cx)
         }))
     }
 
@@ -22539,5 +22559,327 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    fn save_thread_title(thread_id: ThreadId, title: &str, cx: &mut VisualTestContext) {
+        use crate::thread_metadata_store::ThreadMetadata;
+        use chrono::Utc;
+        use project::WorktreePaths;
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(
+                    ThreadMetadata {
+                        parent_thread_id: None,
+                        run_config: Default::default(),
+                        thread_id,
+                        session_id: None,
+                        agent_id: AgentId::new("Test"),
+                        title: Some(title.to_string().into()),
+                        title_override: None,
+                        updated_at: Utc::now(),
+                        created_at: Some(Utc::now()),
+                        interacted_at: None,
+                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                        remote_connection: None,
+                        archived: false,
+                    },
+                    cx,
+                );
+            });
+        });
+    }
+
+    fn text_block(text: &str) -> Vec<acp_v2::ContentBlock> {
+        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text))]
+    }
+
+    /// `(direction, title)` of the attribution header of each entry.
+    fn attribution_headers(
+        conversation_view: &Entity<ConversationView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<
+        Option<(
+            crate::orchestration_attribution::AttributionDirection,
+            String,
+        )>,
+    > {
+        let thread_view = active_thread(conversation_view, cx);
+        thread_view.read_with(cx, |view, cx| {
+            (0..view.thread.read(cx).entries().len())
+                .map(|ix| {
+                    view.entry_attribution(ix, cx)
+                        .map(|attribution| (attribution.direction, attribution.title.to_string()))
+                })
+                .collect()
+        })
+    }
+
+    async fn deliver(
+        conversation_view: &Entity<ConversationView>,
+        text: &str,
+        from: orchestration::MessageSender,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|window, cx| {
+            conversation_view.update(cx, |view, cx| {
+                view.send_follow_up(text_block(text), from, window, cx)
+                    .expect("connected thread");
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_child_thread_shows_who_wrote_and_who_receives_each_message(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::orchestration_attribution::AttributionDirection::{From, To};
+        use orchestration::{MessageSender, SenderRole};
+
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let child = conversation_view.read_with(cx, |view, _| view.parent_id());
+        let (orchestrator, sibling) = (ThreadId::new(), ThreadId::new());
+        save_thread_title(orchestrator, "Boss", cx);
+        save_thread_title(sibling, "Peer", cx);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_parent_thread_id(child, orchestrator, cx)
+            })
+        });
+        let from_orchestrator = MessageSender {
+            role: SenderRole::Orchestrator,
+            thread: orchestrator,
+        };
+        let from_sibling = MessageSender {
+            role: SenderRole::Sibling,
+            thread: sibling,
+        };
+        let reply = |text: &str| {
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into()))
+        };
+
+        // The prompt the orchestrator started the child with goes through the
+        // same path as a typed message, but it is the orchestrator's.
+        connection.set_next_prompt_updates(vec![reply("Done with the task")]);
+        let thread_view = active_thread(&conversation_view, cx);
+        let prompt = format!("{}build the thing", orchestration::child_header("Boss", 0));
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_content(
+                Task::ready(Ok(Some((text_block(&prompt), Vec::new())))),
+                false,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            attribution_headers(&conversation_view, cx),
+            vec![Some((From, "Boss".into())), Some((To, "Boss".into()))],
+            "the prompt is from the orchestrator and the final message goes back to it"
+        );
+        thread_view.read_with(cx, |view, cx| {
+            let AgentThreadEntry::UserMessage(message) = &view.thread.read(cx).entries()[0] else {
+                panic!("expected the prompt");
+            };
+            assert!(message.attribution.is_some());
+            let blocks = crate::orchestration_attribution::display_blocks(message);
+            assert!(matches!(&blocks[0], acp_v2::ContentBlock::Text(text) if text.text == "build the thing"));
+            assert!(
+                crate::orchestration_attribution::context_text(message)
+                    .unwrap()
+                    .starts_with(orchestration::CHILD_HEADER_MARKER),
+                "the R14 header stays in the block as de-emphasized context"
+            );
+        });
+
+        // A follow-up from the orchestrator, answered with send_to_parent and a
+        // final message.
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("parent", "send_to_parent")
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .raw_input(serde_json::json!({"message": "need a decision"}))
+                    .meta(acp_thread::meta_with_tool_name("mcp__zed__send_to_parent")),
+            ),
+            reply("Continuing"),
+        ]);
+        deliver(
+            &conversation_view,
+            "use the second option",
+            from_orchestrator,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            attribution_headers(&conversation_view, cx)[2..],
+            [
+                Some((From, "Boss".into())),
+                Some((To, "Boss".into())),
+                Some((To, "Boss".into())),
+            ]
+        );
+
+        // A sibling's message is from the sibling; the child answers it with
+        // send_to_sibling, and its final message goes to nobody in particular.
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("sibling", "send_to_sibling")
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .raw_input(serde_json::json!({
+                        "child_id": sibling.to_key_string(),
+                        "message": "src/lib.rs"
+                    }))
+                    .meta(acp_thread::meta_with_tool_name("send_to_sibling")),
+            ),
+            reply("Answered"),
+        ]);
+        deliver(
+            &conversation_view,
+            &orchestration::sibling_message_text(
+                "Peer",
+                &sibling.to_key_string(),
+                "which file?",
+                false,
+            ),
+            from_sibling,
+            cx,
+        )
+        .await;
+        let headers = attribution_headers(&conversation_view, cx);
+        assert_eq!(
+            headers[5..],
+            [Some((From, "Peer".into())), Some((To, "Peer".into())), None]
+        );
+        thread_view.read_with(cx, |view, cx| {
+            let AgentThreadEntry::UserMessage(message) = &view.thread.read(cx).entries()[5] else {
+                panic!("expected the sibling message");
+            };
+            let blocks = crate::orchestration_attribution::display_blocks(message);
+            assert!(
+                matches!(&blocks[0], acp_v2::ContentBlock::Text(text) if text.text == "which file?")
+            );
+        });
+
+        // What a person types in the child has no block, and the final message
+        // of that turn is not sent to the orchestrator.
+        connection.set_next_prompt_updates(vec![reply("Sure")]);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_content(
+                Task::ready(Ok(Some((text_block("also add tests"), Vec::new())))),
+                false,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let headers = attribution_headers(&conversation_view, cx);
+        assert_eq!(headers[8..], [None, None]);
+
+        // Renaming a thread changes its label without sending anything.
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_title_override(orchestrator, "Lead".into(), cx)
+            })
+        });
+        let headers = attribution_headers(&conversation_view, cx);
+        assert_eq!(headers[0], Some((From, "Lead".into())));
+        assert_eq!(headers[1], Some((To, "Lead".into())));
+        assert_eq!(headers[3], Some((To, "Lead".into())));
+        assert_eq!(headers[5], Some((From, "Peer".into())));
+    }
+
+    #[gpui::test]
+    async fn test_orchestrator_thread_shows_urgent_child_messages_from_the_child(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::orchestration_attribution::AttributionDirection::From;
+        use orchestration::{MessageSender, SenderRole};
+
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let child = ThreadId::new();
+        save_thread_title(child, "worker", cx);
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Looking".into()),
+        )]);
+        deliver(
+            &conversation_view,
+            "[from child worker] blocked: need the API key",
+            MessageSender {
+                role: SenderRole::Child,
+                thread: child,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(
+            attribution_headers(&conversation_view, cx),
+            vec![Some((From, "worker".into())), None],
+            "the orchestrator's reply is not addressed to anyone"
+        );
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            let AgentThreadEntry::UserMessage(message) = &view.thread.read(cx).entries()[0] else {
+                panic!("expected the urgent message");
+            };
+            let blocks = crate::orchestration_attribution::display_blocks(message);
+            assert!(
+                matches!(&blocks[0], acp_v2::ContentBlock::Text(text) if text.text == "blocked: need the API key"),
+                "the header already says who wrote it, so the text prefix is hidden"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restored_child_prompt_is_still_from_the_orchestrator(cx: &mut TestAppContext) {
+        use crate::orchestration_attribution::AttributionDirection::From;
+
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let child = conversation_view.read_with(cx, |view, _| view.parent_id());
+        let orchestrator = ThreadId::new();
+        save_thread_title(orchestrator, "Boss", cx);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_parent_thread_id(child, orchestrator, cx)
+            })
+        });
+        // A transcript loaded from disk has no stored attribution.
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        // Each entry arrives in its own update, as when a transcript loads.
+        for step in 0..3 {
+            thread.update(cx, |thread, cx| match step {
+                0 => thread.push_user_content_block(
+                    None,
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new(format!(
+                        "{}task",
+                        orchestration::child_header("Boss", 1)
+                    ))),
+                    cx,
+                ),
+                1 => thread.push_assistant_content_block(
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new("ok")),
+                    false,
+                    cx,
+                ),
+                _ => thread.push_user_content_block(
+                    Some(acp_thread::ClientUserMessageId::new()),
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new("typed by a person")),
+                    cx,
+                ),
+            });
+            cx.run_until_parked();
+        }
+        cx.run_until_parked();
+        let headers = attribution_headers(&conversation_view, cx);
+        assert_eq!(headers[0], Some((From, "Boss".into())));
+        assert_eq!(headers.get(2), Some(&None));
     }
 }

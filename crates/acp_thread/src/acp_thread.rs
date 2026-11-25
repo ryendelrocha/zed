@@ -335,6 +335,27 @@ pub struct UserMessage {
     pub is_optimistic: bool,
     pub content: MessageContent,
     pub indented: bool,
+    /// Set when another thread wrote this message (the orchestration tools
+    /// delivered it) rather than the person using this thread. In memory only:
+    /// it is not part of any agent's saved transcript.
+    pub attribution: Option<MessageAttribution>,
+}
+
+/// What the thread that wrote a message is to the thread that received it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributionRole {
+    Orchestrator,
+    Sibling,
+    Child,
+}
+
+/// The thread that wrote a user message of this thread. The key is the
+/// counterpart's thread id, so its title is looked up when the message is
+/// drawn and stays right after a rename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageAttribution {
+    pub role: AttributionRole,
+    pub thread_key: SharedString,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3880,6 +3901,7 @@ pub struct AcpThread {
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     usage_meta: Option<acp_v2::Meta>,
+    pending_user_attribution: Option<MessageAttribution>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
@@ -4231,6 +4253,7 @@ impl AcpThread {
             connection,
             token_usage: None,
             usage_meta: None,
+            pending_user_attribution: None,
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
@@ -5775,6 +5798,7 @@ impl AcpThread {
                         is_optimistic: false,
                         content: MessageContent::default(),
                         indented: false,
+                        attribution: self.pending_user_attribution.take(),
                     }));
                 Ok(MessageLocation::User { entry_index })
             }
@@ -5939,6 +5963,7 @@ impl AcpThread {
                     is_optimistic,
                     content,
                     indented,
+                    attribution: None,
                 }),
                 cx,
             );
@@ -6217,9 +6242,14 @@ impl AcpThread {
         })
     }
 
-    fn push_entry(&mut self, entry: AgentThreadEntry, cx: &mut Context<Self>) {
+    fn push_entry(&mut self, mut entry: AgentThreadEntry, cx: &mut Context<Self>) {
         self.flush_streaming_text(cx);
         self.stamp_last_message();
+        if let AgentThreadEntry::UserMessage(message) = &mut entry
+            && message.attribution.is_none()
+        {
+            message.attribution = self.pending_user_attribution.take();
+        }
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
     }
@@ -7693,12 +7723,27 @@ impl AcpThread {
         };
         message.client_id = Some(id);
         message.is_optimistic = false;
+        if message.attribution.is_none() {
+            message.attribution = self.pending_user_attribution.take();
+        }
         message
             .content
             .replace_prompt(content, &language_registry, path_style, cx);
         self.emit_message_update(location, previous_entry_count, cx);
         cx.notify();
         Ok(())
+    }
+
+    /// Marks the next user message this thread records as written by another
+    /// thread. Call it just before sending that message, and
+    /// [`AcpThread::clear_pending_user_attribution`] once the send settled, so
+    /// a later message typed by a person is never marked by mistake.
+    pub fn attribute_next_user_message(&mut self, attribution: MessageAttribution) {
+        self.pending_user_attribution = Some(attribution);
+    }
+
+    pub fn clear_pending_user_attribution(&mut self) {
+        self.pending_user_attribution = None;
     }
 
     pub fn finish_local_turn(&mut self, reason: acp_v2::StopReason, cx: &mut Context<Self>) {
@@ -7743,6 +7788,7 @@ impl AcpThread {
                             is_optimistic: true,
                             content: block,
                             indented: false,
+                            attribution: None,
                         }),
                         cx,
                     );

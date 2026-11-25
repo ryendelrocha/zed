@@ -949,19 +949,24 @@ fn enforce_subagent_quota(
 /// quota of an orchestrated child. Only Claude Code, whose adapter merges
 /// `_meta.claudeCode.options` into the Claude Code options, gets one. Always
 /// takes the staged grant, so that it cannot reach another session.
+///
+/// A Claude Code root session (no grant) gets its own subagent tools turned
+/// off and the instruction to delegate with `start_child` when
+/// `agent.orchestration.route_agent_subagents` is on and the session gets the
+/// orchestration tools (`orchestration_available`), because the adapter does
+/// not let the client talk to Claude Code's own subagents.
 fn quota_session_meta(
     agent_id: &AgentId,
+    orchestration_available: bool,
     cx: &mut App,
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
-    let Some(grant) = orchestration::take_staged_session_quota(cx) else {
-        return Ok(None);
-    };
+    let grant = orchestration::take_staged_session_quota(cx);
     if agent_id.as_ref() != crate::custom::CLAUDE_AGENT_ID {
         return Ok(None);
     }
-    orchestration::claude_code_quota_meta(&grant)
-        .context("preparing the subagent quota of the child session")
-        .map(Some)
+    let route = orchestration_available && orchestration::route_agent_subagents(cx);
+    orchestration::claude_code_session_meta(grant.as_ref(), route)
+        .context("preparing the subagent options of the Claude Code session")
 }
 
 fn apply_subagent_update(
@@ -1818,5 +1823,99 @@ done
             drop(connection);
             cx.run_until_parked();
         }
+    }
+}
+
+#[cfg(test)]
+mod route_subagents_tests {
+    use super::*;
+    use gpui::{TestAppContext, UpdateGlobal as _};
+    use serde_json::json;
+
+    fn set_route(route: Option<bool>, cx: &mut App) {
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .orchestration
+                    .get_or_insert_default()
+                    .route_agent_subagents = route;
+            });
+        });
+    }
+
+    fn meta_for(
+        agent_id: &str,
+        orchestration_available: bool,
+        cx: &mut App,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        quota_session_meta(&AgentId::new(agent_id), orchestration_available, cx).unwrap()
+    }
+
+    #[gpui::test]
+    fn route_on_gives_a_claude_root_session_the_options_and_the_instruction(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            set_route(Some(true), cx);
+            let meta =
+                meta_for("claude-acp", true, cx).expect("a root claude-acp session is routed");
+            assert_eq!(
+                meta["claudeCode"]["options"]["disallowedTools"],
+                json!(["Agent", "Task"])
+            );
+            let append = meta["systemPrompt"]["append"].as_str().unwrap();
+            assert!(append.contains("start_child") && append.contains("claude-acp"));
+        });
+    }
+
+    #[gpui::test]
+    fn route_off_or_no_orchestration_tools_leave_the_session_unchanged(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            set_route(Some(false), cx);
+            assert_eq!(meta_for("claude-acp", true, cx), None);
+            set_route(Some(true), cx);
+            // Without the orchestration MCP server the session would have no
+            // `start_child`: its own subagent tools stay.
+            assert_eq!(meta_for("claude-acp", false, cx), None);
+        });
+    }
+
+    #[gpui::test]
+    fn other_agents_are_never_routed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            set_route(Some(true), cx);
+            for agent_id in ["codex-acp", "gemini", "session-test"] {
+                assert_eq!(meta_for(agent_id, true, cx), None, "{agent_id}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_child_keeps_its_quota_meta_and_is_not_routed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            set_route(Some(true), cx);
+            let directory = tempfile::tempdir().unwrap();
+            let child = orchestration::ThreadId::new();
+            orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
+                registry.set_subagent_quota(child, 0, directory.path().join("child.quota"));
+            });
+            orchestration::stage_session_quota(child, cx);
+            let meta = meta_for("claude-acp", true, cx).expect("a child has quota options");
+            assert_eq!(
+                meta["claudeCode"]["options"]["disallowedTools"],
+                json!(["Agent", "Task"])
+            );
+            assert!(meta.get("systemPrompt").is_none(), "{meta:?}");
+        });
     }
 }

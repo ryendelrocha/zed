@@ -18,10 +18,13 @@ mod inline_prompt_editor;
 mod mention_set;
 mod message_editor;
 mod mode_selector;
+mod model_display_name;
 mod model_search;
 mod model_selector;
 mod model_selector_popover;
+mod orchestration_attribution;
 mod orchestration_host;
+mod orchestration_models;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
@@ -84,6 +87,7 @@ pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange, SubthreadInfo, model_icon_parts};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
+pub use model_display_name::{friendly_model_name, prettify_model_id};
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
 pub use thread_import::{
@@ -1223,10 +1227,12 @@ mod tests {
             orchestration: agent_settings::OrchestrationSettings {
                 show_as_subthreads: true,
                 subthreads_visible: 5,
+                show_child_model: true,
                 enabled: true,
                 human_summary_max_chars: 600,
                 max_concurrent_children: 6,
                 max_sibling_messages: 20,
+                route_agent_subagents: true,
             },
             thinking_display: Default::default(),
         };

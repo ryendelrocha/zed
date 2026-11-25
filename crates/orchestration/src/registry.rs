@@ -16,10 +16,10 @@ use crate::{
     ChildStatusInfo, ChildStatusInput, ChildStatusOutput, DEFAULT_AWAIT_TIMEOUT_SECS,
     DEFAULT_MAX_CONCURRENT_CHILDREN, DEFAULT_MAX_SIBLING_MESSAGES,
     DEFAULT_SIBLING_REPLY_TIMEOUT_SECS, HumanIntervention, HumanSummaryRequest, ListSiblingsOutput,
-    LogDirection, MAX_AWAIT_TIMEOUT_SECS, OrchestrationHost, PendingMessage, SendToParentInput,
-    SendToParentOutput, SendToSiblingInput, SendToSiblingOutput, SiblingInfo, ThreadId,
-    ThreadReference, ThreadRole, WhoAmIOutput, human_summary_fallback, log_dir_from_setting,
-    sibling_message_text, truncate_summary, urgent_message_prefix,
+    LogDirection, MAX_AWAIT_TIMEOUT_SECS, MessageSender, OrchestrationHost, PendingMessage,
+    SendToParentInput, SendToParentOutput, SendToSiblingInput, SendToSiblingOutput, SenderRole,
+    SiblingInfo, ThreadId, ThreadReference, ThreadRole, WhoAmIOutput, human_summary_fallback,
+    log_dir_from_setting, sibling_message_text, truncate_summary, urgent_message_prefix,
 };
 
 /// Default of `agent.orchestration.human_summary_max_chars`.
@@ -1387,49 +1387,67 @@ impl OrchestrationRegistry {
         if !host.is_thread_idle(recipient, cx) {
             return;
         }
-        let (text, delivered_ids) = registry.update(cx, |registry, _| {
-            let mut parts = Vec::new();
-            let mut ids = Vec::new();
+        // One message per sender, so each shows as `From <sibling>` in the
+        // receiving thread.
+        let deliveries = registry.update(cx, |registry, _| {
+            let mut deliveries: Vec<(ThreadId, Vec<String>, Vec<u64>)> = Vec::new();
             for message in registry
                 .sibling_inbox
                 .iter_mut()
                 .filter(|message| message.to == recipient && !message.delivered)
             {
                 message.delivered = true;
-                ids.push(message.id);
-                parts.push(sibling_message_text(
+                let index = match deliveries
+                    .iter()
+                    .position(|(from, _, _)| *from == message.from)
+                {
+                    Some(index) => index,
+                    None => {
+                        deliveries.push((message.from, Vec::new(), Vec::new()));
+                        deliveries.len() - 1
+                    }
+                };
+                deliveries[index].2.push(message.id);
+                deliveries[index].1.push(sibling_message_text(
                     &message.from_title,
                     &message.from.to_key_string(),
                     &message.text,
                     message.awaiting_reply,
                 ));
             }
-            (parts.join("\n\n"), ids)
+            deliveries
         });
-        if delivered_ids.is_empty() {
-            return;
-        }
-        let delivery = host.deliver_message(recipient, text, cx);
-        let registry = registry.downgrade();
-        cx.spawn(async move |cx| {
-            let outcome = delivery.await;
-            registry
-                .update(cx, |registry, _| match outcome {
-                    Ok(()) => registry
-                        .sibling_inbox
-                        .retain(|message| !delivered_ids.contains(&message.id)),
-                    Err(error) => {
-                        log::error!("failed to deliver a sibling message: {error:#}");
-                        for message in &mut registry.sibling_inbox {
-                            if delivered_ids.contains(&message.id) {
-                                message.delivered = false;
+        for (from, parts, delivered_ids) in deliveries {
+            let delivery = host.deliver_message(
+                recipient,
+                MessageSender {
+                    role: SenderRole::Sibling,
+                    thread: from,
+                },
+                parts.join("\n\n"),
+                cx,
+            );
+            let registry = registry.downgrade();
+            cx.spawn(async move |cx| {
+                let outcome = delivery.await;
+                registry
+                    .update(cx, |registry, _| match outcome {
+                        Ok(()) => registry
+                            .sibling_inbox
+                            .retain(|message| !delivered_ids.contains(&message.id)),
+                        Err(error) => {
+                            log::error!("failed to deliver a sibling message: {error:#}");
+                            for message in &mut registry.sibling_inbox {
+                                if delivered_ids.contains(&message.id) {
+                                    message.delivered = false;
+                                }
                             }
                         }
-                    }
-                })
-                .ok();
-        })
-        .detach();
+                    })
+                    .ok();
+            })
+            .detach();
+        }
     }
 
     /// Cancels the running turns of every descendant of `thread`, the deepest
@@ -1486,9 +1504,10 @@ impl OrchestrationRegistry {
         if !host.is_thread_idle(orchestrator, cx) {
             return;
         }
-        let (text, delivered_ids) = registry.update(cx, |registry, _| {
-            let mut parts = Vec::new();
-            let mut ids = Vec::new();
+        // One message per child, so each shows as `From <child>` in the
+        // orchestrator's thread.
+        let deliveries = registry.update(cx, |registry, _| {
+            let mut deliveries: Vec<(ThreadId, String, Vec<u64>)> = Vec::new();
             for record in registry
                 .children
                 .get_mut(&orchestrator)
@@ -1496,6 +1515,8 @@ impl OrchestrationRegistry {
                 .flatten()
             {
                 let prefix = urgent_message_prefix(&record.title);
+                let mut parts = Vec::new();
+                let mut ids = Vec::new();
                 for message in record
                     .inbox
                     .iter_mut()
@@ -1505,37 +1526,47 @@ impl OrchestrationRegistry {
                     ids.push(message.id);
                     parts.push(format!("{prefix} {}", message.text));
                 }
+                if !ids.is_empty() {
+                    deliveries.push((record.child_id, parts.join("\n\n"), ids));
+                }
             }
-            (parts.join("\n\n"), ids)
+            deliveries
         });
-        if delivered_ids.is_empty() {
-            return;
-        }
-        let delivery = host.deliver_message(orchestrator, text, cx);
-        let registry = registry.downgrade();
-        cx.spawn(async move |cx| {
-            if let Err(error) = delivery.await {
-                log::error!("failed to deliver an urgent child message: {error:#}");
-                // Back to undelivered, so `pending_messages` still returns it.
-                registry
-                    .update(cx, |registry, _| {
-                        for record in registry
-                            .children
-                            .get_mut(&orchestrator)
-                            .into_iter()
-                            .flatten()
-                        {
-                            for message in &mut record.inbox {
-                                if delivered_ids.contains(&message.id) {
-                                    message.delivered = false;
+        for (child, text, delivered_ids) in deliveries {
+            let delivery = host.deliver_message(
+                orchestrator,
+                MessageSender {
+                    role: SenderRole::Child,
+                    thread: child,
+                },
+                text,
+                cx,
+            );
+            let registry = registry.downgrade();
+            cx.spawn(async move |cx| {
+                if let Err(error) = delivery.await {
+                    log::error!("failed to deliver an urgent child message: {error:#}");
+                    // Back to undelivered, so `pending_messages` still returns it.
+                    registry
+                        .update(cx, |registry, _| {
+                            for record in registry
+                                .children
+                                .get_mut(&orchestrator)
+                                .into_iter()
+                                .flatten()
+                            {
+                                for message in &mut record.inbox {
+                                    if delivered_ids.contains(&message.id) {
+                                        message.delivered = false;
+                                    }
                                 }
                             }
-                        }
-                    })
-                    .ok();
-            }
-        })
-        .detach();
+                        })
+                        .ok();
+                }
+            })
+            .detach();
+        }
     }
 
     /// Writes one summary for each requested child that has human-driven turns
@@ -2268,6 +2299,7 @@ mod tests {
         owned: RefCell<Vec<ThreadId>>,
         idle: Cell<bool>,
         delivered: RefCell<Vec<(ThreadId, String)>>,
+        senders: RefCell<Vec<MessageSender>>,
         summary_requests: RefCell<Vec<HumanSummaryRequest>>,
         summary: RefCell<Option<String>>,
         /// Threads whose running turn this host can cancel.
@@ -2324,7 +2356,14 @@ mod tests {
             self.idle.get()
         }
 
-        fn deliver_message(&self, thread: ThreadId, text: String, _: &mut App) -> Task<Result<()>> {
+        fn deliver_message(
+            &self,
+            thread: ThreadId,
+            from: MessageSender,
+            text: String,
+            _: &mut App,
+        ) -> Task<Result<()>> {
+            self.senders.borrow_mut().push(from);
             self.delivered.borrow_mut().push((thread, text));
             Task::ready(Ok(()))
         }
@@ -2632,6 +2671,13 @@ mod tests {
                 orchestrator,
                 "[from child worker] blocked: need the API key".to_string()
             )]
+        );
+        assert_eq!(
+            *host.senders.borrow(),
+            vec![MessageSender {
+                role: SenderRole::Child,
+                thread: child
+            }]
         );
         cx.update(|cx| OrchestrationRegistry::flush_urgent(&registry, orchestrator, cx));
         assert_eq!(host.delivered.borrow().len(), 1);
@@ -2970,6 +3016,13 @@ mod tests {
         );
         assert!(delivered[0].1.contains(&first.to_key_string()));
         drop(delivered);
+        assert_eq!(
+            *host.senders.borrow(),
+            vec![MessageSender {
+                role: SenderRole::Sibling,
+                thread: first
+            }]
+        );
 
         // Both children's logs hold the exchange, with the other child's id.
         let sent = raw_log(directory.path(), orchestrator, first);
@@ -3839,5 +3892,31 @@ mod tests {
         let header = child_header("Billing", 3);
         assert!(header.contains("granted you 3 subagents"));
         assert!(header.contains("at most 3"));
+    }
+
+    #[test]
+    fn test_split_delivered_text_separates_what_the_model_needs_from_the_message() {
+        let first = format!("{}fix the build", child_header("Refactor billing", 0));
+        let parts = crate::split_delivered_text(&first);
+        assert_eq!(parts.body, "fix the build");
+        assert!(
+            parts
+                .context
+                .unwrap()
+                .starts_with(crate::CHILD_HEADER_MARKER)
+        );
+
+        let sibling = sibling_message_text("api", "abc", "which file?", false);
+        let parts = crate::split_delivered_text(&sibling);
+        assert_eq!(parts.body, "which file?");
+        assert!(parts.context.unwrap().contains("`send_to_sibling`"));
+
+        let parts = crate::split_delivered_text("[from child worker] blocked");
+        assert_eq!(parts.body, "blocked");
+        assert_eq!(parts.context, None);
+
+        let parts = crate::split_delivered_text("plain follow-up");
+        assert_eq!(parts.body, "plain follow-up");
+        assert_eq!(parts.context, None);
     }
 }

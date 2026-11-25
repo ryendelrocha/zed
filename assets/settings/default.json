@@ -1210,6 +1210,8 @@
       "show_as_subthreads": true,
       // How many subagent threads to list under a parent thread before "Load more".
       "subthreads_visible": 5,
+      // Show the model a child thread runs on in its row in the Threads Sidebar.
+      "show_child_model": true,
       // Expose the orchestration tools (start_child, await_children, child_status,
       // send_to_child, cancel_child, send_to_parent, list_siblings, send_to_sibling,
       // whoami) to agents.
@@ -1223,6 +1225,10 @@
       // Maximum number of messages two sibling children may exchange, in both
       // directions.
       "max_sibling_messages": 20,
+      // Turn off Claude Code's own Agent and Task subagent tools in the Claude Code
+      // sessions you open, and tell the session to delegate with start_child, whose
+      // children are full conversations you can open and talk to.
+      "route_agent_subagents": true,
       // Directory for the per-child exchange logs. null uses `zed-orchestration`
       // in the system temporary directory.
       "log_dir": null,

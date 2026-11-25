@@ -5006,6 +5006,11 @@ impl AgentPanel {
         self.selected_agent.is_native()
     }
 
+    /// The id of the agent that new threads use.
+    pub(crate) fn selected_agent_id(&self) -> String {
+        self.selected_agent.id().0.to_string()
+    }
+
     /// The agents (and, for the native agent, models) a new thread can use.
     pub(crate) fn available_agents(&self, cx: &App) -> agent::AvailableAgents {
         let mut agents = vec![agent::available_native_agent(cx)];
@@ -5016,13 +5021,20 @@ impl AgentPanel {
             let display = store
                 .agent_display_name(agent_id)
                 .unwrap_or_else(|| agent_id.0.clone());
+            // External agents offer their models as a session config option:
+            // read it from an open session of the agent, else from the last
+            // list the agent reported.
+            let (models, models_note) = crate::orchestration_models::available_models(
+                agent_id.0.as_ref(),
+                &self.conversation_views(),
+                cx,
+            );
             agents.push(agent::AvailableAgent {
                 id: agent_id.0.to_string(),
                 name: display,
                 is_native: false,
-                // External agents pick their own models dynamically; we don't
-                // try to enumerate them ahead of time.
-                models: Vec::new(),
+                models,
+                models_note: Some(models_note),
             });
         }
 
@@ -5216,6 +5228,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     worktree_name: request.worktree_name,
                     parent_thread_id: None,
                     subagent_quota: None,
+                    defer_prompt: false,
                 },
                 cx,
             )
@@ -5253,6 +5266,10 @@ pub(crate) struct ChildThreadRequest {
     /// The subagent quota the orchestrator grants the new thread (R6). `None`
     /// for threads that are not orchestrated children.
     pub subagent_quota: Option<ChildSubagentQuota>,
+    /// Start the thread without its first prompt: the caller sends `prompt`
+    /// itself, after it has configured the session (the model of an external
+    /// agent). The `model` is then not applied here.
+    pub defer_prompt: bool,
 }
 
 pub(crate) struct ChildSubagentQuota {
@@ -5305,16 +5322,16 @@ pub(crate) async fn create_child_thread(
         }
     };
 
-    let initial_content = AgentInitialContent::ContentBlock {
+    let initial_content = (!request.defer_prompt).then(|| AgentInitialContent::ContentBlock {
         blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
             request.prompt.clone(),
         ))],
         auto_submit: true,
-    };
+    });
 
     let options = CreateThreadOptions {
         title: Some(request.title.clone()),
-        initial_content: Some(initial_content),
+        initial_content,
         agent: agent_choice.clone(),
         model: request.model.clone(),
         profile: request.profile.clone(),
@@ -16508,23 +16525,344 @@ mod tests {
         assert!(task.await.is_err());
     }
 
+    fn external_model_option(current: &str) -> acp_v2::SessionConfigOption {
+        acp_v2::SessionConfigOption::select(
+            "model",
+            "Model",
+            current,
+            vec![
+                acp_v2::SessionConfigSelectOption::new("default", "Default (recommended)"),
+                acp_v2::SessionConfigSelectOption::new("sonnet", "Claude Sonnet 4.5"),
+                acp_v2::SessionConfigSelectOption::new("opus", "Claude Opus 4.5"),
+                acp_v2::SessionConfigSelectOption::new("haiku", "Claude Haiku 4.5"),
+            ],
+        )
+        .category(acp_v2::SessionConfigOptionCategory::Model)
+    }
+
+    async fn setup_external_models(
+        cx: &mut TestAppContext,
+        connection: StubAgentConnection,
+    ) -> OrchestrationFixture {
+        setup_orchestration_with_connection(
+            cx,
+            connection.with_config_options(vec![external_model_option("default")]),
+        )
+        .await
+    }
+
+    fn child_run_config_model(
+        fixture: &mut OrchestrationFixture,
+        child: ThreadId,
+    ) -> Option<(String, String)> {
+        fixture.cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(child)
+                .and_then(|metadata| {
+                    metadata
+                        .run_config
+                        .model()
+                        .map(|(provider, model)| (provider.to_string(), model.to_string()))
+                })
+        })
+    }
+
     #[gpui::test]
-    async fn test_orchestration_model_is_not_supported_for_external_agents(
+    async fn test_orchestration_external_child_gets_its_model_before_the_first_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        let mut input = start_child_input("Haiku worker", "summarize the repo");
+        input.model = Some("haiku".to_string());
+
+        let child = fixture.start_child(input).await;
+
+        assert_eq!(
+            fixture.connection.events(),
+            ["set_config_option:model=haiku", "prompt"],
+            "the model is set, then the first prompt goes"
+        );
+        assert_eq!(
+            child_run_config_model(&mut fixture, child),
+            Some(("stub".to_string(), "haiku".to_string())),
+            "the sidebar can show the model: provider is the agent id"
+        );
+        let model = fixture.cx.update(|_window, cx| {
+            orchestration::OrchestrationRegistry::global(cx)
+                .read(cx)
+                .child(fixture.orchestrator, child)
+                .and_then(|record| record.model.clone())
+        });
+        assert_eq!(model.as_deref(), Some("stub/haiku"));
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_child_accepts_the_agent_prefixed_and_named_model(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        let mut input = start_child_input("Opus worker", "think hard");
+        input.model = Some("stub/Claude Opus".to_string());
+
+        let child = fixture.start_child(input).await;
+
+        assert_eq!(
+            fixture.connection.events(),
+            ["set_config_option:model=opus", "prompt"]
+        );
+        assert_eq!(
+            child_run_config_model(&mut fixture, child),
+            Some(("stub".to_string(), "opus".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_child_keeps_the_model_it_already_has(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        let mut input = start_child_input("Default worker", "go");
+        input.model = Some("default".to_string());
+
+        let child = fixture.start_child(input).await;
+
+        assert_eq!(fixture.connection.events(), ["prompt"]);
+        assert_eq!(
+            child_run_config_model(&mut fixture, child),
+            Some(("stub".to_string(), "default".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_child_without_a_model_sends_the_prompt_at_once(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+
+        let child = fixture
+            .start_child(start_child_input("Plain worker", "go"))
+            .await;
+
+        assert_eq!(fixture.connection.events(), ["prompt"]);
+        assert_eq!(child_run_config_model(&mut fixture, child), None);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_unknown_external_model_fails_the_child_and_lists_the_models(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        let mut input = start_child_input("Bad model", "go");
+        input.model = Some("gpt-5".to_string());
+
+        // No session of the agent had reported its models, so the child
+        // starts and finds out when it connects: it fails before any prompt.
+        let child = fixture.start_child(input).await;
+
+        let (status, message, _turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Failed);
+        let message = message.expect("the failure says why");
+        assert!(message.contains("Unknown model \"gpt-5\""), "{message}");
+        for model in ["default", "sonnet", "opus", "haiku"] {
+            assert!(message.contains(&format!("\"{model}\"")), "{message}");
+        }
+        assert!(
+            fixture.connection.events().is_empty(),
+            "no prompt is sent with a model the agent does not have: {:?}",
+            fixture.connection.events()
+        );
+
+        // Now the models are known: the next unknown model is refused before a
+        // thread is created.
+        let threads_before = fixture
+            .panel
+            .read_with(&fixture.cx, |panel, _| panel.retained_threads.len());
+        let mut input = start_child_input("Bad model again", "go");
+        input.model = Some("gpt-5".to_string());
+        let error = fixture
+            .cx
+            .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx))
+            .await
+            .expect_err("an unknown model is an error");
+        let error = error.to_string();
+        assert!(error.contains("Unknown model \"gpt-5\""), "{error}");
+        assert!(error.contains("\"haiku\""), "{error}");
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            fixture
+                .panel
+                .read_with(&fixture.cx, |panel, _| panel.retained_threads.len()),
+            threads_before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_model_for_an_agent_without_a_model_option_fails_the_child(
         cx: &mut TestAppContext,
     ) {
         let mut fixture = setup_orchestration(cx).await;
         let mut input = start_child_input("External", "hello");
         input.model = Some("anthropic/claude".to_string());
 
-        // `Agent::Stub` is not the native agent, like any external agent.
+        // `Agent::Stub` is not the native agent, like any external agent, and
+        // this stub offers no model option.
+        let child = fixture.start_child(input).await;
+
+        let (status, message, _turns) = fixture.child_record(child);
+        assert_eq!(status, ChildStatus::Failed);
+        let message = message.expect("the failure says why");
+        assert!(
+            message.contains("does not let the client choose a model"),
+            "{message}"
+        );
+        assert!(fixture.connection.events().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_model_timeout_sends_the_prompt_anyway(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(
+            cx,
+            StubAgentConnection::new().with_hanging_set_config_option(),
+        )
+        .await;
+        let mut input = start_child_input("Slow agent", "go");
+        input.model = Some("haiku".to_string());
+
+        let child = fixture.start_child(input).await;
+        assert_eq!(
+            fixture.connection.events(),
+            ["set_config_option:model=haiku"],
+            "the prompt waits while the agent has not answered"
+        );
+
+        fixture
+            .cx
+            .executor()
+            .advance_clock(crate::orchestration_models::MODEL_APPLY_TIMEOUT);
+        fixture.cx.run_until_parked();
+
+        assert_eq!(
+            fixture.connection.events(),
+            ["set_config_option:model=haiku", "prompt"],
+            "after the timeout the prompt is sent anyway"
+        );
+        assert_ne!(fixture.child_record(child).0, ChildStatus::Failed);
+        assert_eq!(
+            child_run_config_model(&mut fixture, child),
+            None,
+            "a model that was never confirmed is not recorded"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_message_to_a_child_waits_behind_its_model(cx: &mut TestAppContext) {
+        let mut fixture = setup_external_models(
+            cx,
+            StubAgentConnection::new().with_hanging_set_config_option(),
+        )
+        .await;
+        let mut input = start_child_input("Slow agent", "first");
+        input.model = Some("sonnet".to_string());
+        let child = fixture.start_child(input).await;
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "second".to_string(),
+                },
+                cx,
+            )
+        });
+        assert!(task.await.unwrap().queued, "parked behind the model");
+        assert_eq!(fixture.connection.events().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_external_child_uses_the_profile_model_of_its_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        fixture.cx.update(|_window, cx| {
+            let settings = serde_json::json!({
+                "agent": {
+                    "orchestration": { "log_dir": fixture.log_dir.path().to_string_lossy() },
+                    "profiles": {
+                        "quick": {
+                            "name": "Quick",
+                            "description": "Fast, cheap work.",
+                            "tools": {},
+                            "default_model": { "provider": "stub", "model": "haiku" }
+                        }
+                    }
+                }
+            });
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(&settings.to_string(), cx)
+                    .result()
+                    .expect("the settings should parse");
+            });
+        });
+        let mut input = start_child_input("Quick worker", "go");
+        input.profile = Some("quick".to_string());
+
         let task = fixture
             .cx
             .update(|_window, cx| fixture.host.start_child(fixture.orchestrator, input, cx));
         let output = task.await.unwrap();
+        fixture.cx.run_until_parked();
 
-        let warning = output.warning.expect("a warning about the model");
-        assert!(warning.contains("not supported yet"), "{warning}");
-        assert!(warning.contains("external agents"), "{warning}");
+        let warning = output.warning.expect("the rest of the profile is ignored");
+        assert!(warning.contains("only its default model"), "{warning}");
+        assert_eq!(
+            fixture.connection.events(),
+            ["set_config_option:model=haiku", "prompt"]
+        );
+        let child = ThreadId::from_key_string(&output.child_id).unwrap();
+        assert_eq!(
+            child_run_config_model(&mut fixture, child),
+            Some(("stub".to_string(), "haiku".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_list_shows_the_models_of_an_open_external_session(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_external_models(cx, StubAgentConnection::new()).await;
+        fixture.cx.run_until_parked();
+
+        let (models, note) = fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            crate::orchestration_models::available_models("stub", &panel.conversation_views(), cx)
+        });
+
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["default", "sonnet", "opus", "haiku"]);
+        assert!(models[0].is_default && !models[3].is_default);
+        assert!(note.contains("open session"), "{note}");
+
+        // With no open session the last list is used, and the note says so.
+        let (cached, cached_note) = fixture
+            .cx
+            .update(|_window, cx| crate::orchestration_models::available_models("stub", &[], cx));
+        assert_eq!(cached.len(), 4);
+        assert!(cached_note.contains("last session"), "{cached_note}");
+        let (none, none_note) = fixture.cx.update(|_window, cx| {
+            crate::orchestration_models::available_models("other-agent", &[], cx)
+        });
+        assert!(none.is_empty());
+        assert!(
+            none_note.contains("reports its models when a session connects"),
+            "{none_note}"
+        );
     }
 
     #[gpui::test]

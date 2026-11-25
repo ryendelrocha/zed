@@ -316,12 +316,16 @@ impl EntryViewState {
                 let can_rewind = thread
                     .read(cx)
                     .can_rewind_to(message.client_id.as_ref(), cx);
-                let source_blocks = message.content.source_blocks();
+                // A message that another thread wrote shows without the part only
+                // the model needs, and cannot be edited.
+                let source_blocks = crate::orchestration_attribution::display_blocks(message);
                 let source_version = message.content.source_version();
                 let source_is_representable = source_blocks
                     .iter()
                     .all(acp_thread::content::can_convert_to_v1);
-                let is_editable = can_rewind && source_is_representable;
+                let is_editable = can_rewind
+                    && source_is_representable
+                    && !crate::orchestration_attribution::is_delivered(message);
                 if let Some(Entry::UserMessage {
                     editor,
                     synced_source_version,

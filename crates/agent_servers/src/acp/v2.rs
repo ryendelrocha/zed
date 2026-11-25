@@ -1395,7 +1395,7 @@ impl AgentConnection for AcpV2Connection {
         let mut request = acp::NewSessionRequest::new(context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
             .mcp_servers(context.mcp_servers.clone());
-        match quota_session_meta(&self.id, cx) {
+        match quota_session_meta(&self.id, orchestration.is_some(), cx) {
             Ok(Some(meta)) => request = request.meta(meta),
             Ok(None) => {}
             Err(error) => return Task::ready(Err(error)),

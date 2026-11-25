@@ -3252,6 +3252,7 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
         name: ZED_AGENT_ID.0.clone(),
         is_native: true,
         models,
+        models_note: None,
     }
 }
 

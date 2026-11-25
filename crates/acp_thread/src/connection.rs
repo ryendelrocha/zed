@@ -1065,6 +1065,9 @@ mod test_support {
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
+        config_options: Arc<Mutex<Vec<acp_v2::SessionConfigOption>>>,
+        events: Arc<Mutex<Vec<String>>>,
+        hang_set_config_option: bool,
     }
 
     enum StubPromptUpdate {
@@ -1115,6 +1118,9 @@ mod test_support {
                 supports_truncate: true,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                config_options: Default::default(),
+                events: Default::default(),
+                hang_set_config_option: false,
                 prompt_capabilities_rx: watch::Receiver::constant(
                     acp_v2::PromptCapabilities::new()
                         .image(acp_v2::PromptImageCapabilities::new())
@@ -1219,6 +1225,25 @@ mod test_support {
                     response_tx: None,
                 },
             );
+        }
+
+        /// Makes every session of this connection expose `options` as its
+        /// session config options.
+        pub fn with_config_options(self, options: Vec<acp_v2::SessionConfigOption>) -> Self {
+            *self.config_options.lock() = options;
+            self
+        }
+
+        /// Makes `set_config_option` never answer, like an agent that hangs.
+        pub fn with_hanging_set_config_option(mut self) -> Self {
+            self.hang_set_config_option = true;
+            self
+        }
+
+        /// The order of the prompts and config option changes this connection
+        /// received, as `prompt` and `set_config_option:<id>=<value>`.
+        pub fn events(&self) -> Vec<String> {
+            self.events.lock().clone()
         }
 
         pub fn take_cancel_calls(&self) -> Vec<acp_v2::SessionId> {
@@ -1396,6 +1421,20 @@ mod test_support {
             Some(self.model_selector_impl())
         }
 
+        fn session_config_options(
+            &self,
+            _session_id: &acp_v2::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionConfigOptions>> {
+            (!self.config_options.lock().is_empty()).then(|| {
+                Rc::new(StubSessionConfigOptions {
+                    options: self.config_options.clone(),
+                    events: self.events.clone(),
+                    hang: self.hang_set_config_option,
+                }) as Rc<dyn AgentSessionConfigOptions>
+            })
+        }
+
         fn new_session(
             self: Rc<Self>,
             project: Entity<Project>,
@@ -1483,6 +1522,7 @@ mod test_support {
             if let Err(error) = crate::content::prompt_to_v1(params) {
                 return Task::ready(Err(error));
             }
+            self.events.lock().push("prompt".to_string());
             let mut sessions = self.sessions.lock();
             let Session {
                 thread,
@@ -1701,6 +1741,47 @@ mod test_support {
             } else {
                 Task::ready(Ok(()))
             }
+        }
+    }
+
+    struct StubSessionConfigOptions {
+        options: Arc<Mutex<Vec<acp_v2::SessionConfigOption>>>,
+        events: Arc<Mutex<Vec<String>>>,
+        hang: bool,
+    }
+
+    impl AgentSessionConfigOptions for StubSessionConfigOptions {
+        fn config_options(&self) -> Vec<acp_v2::SessionConfigOption> {
+            self.options.lock().clone()
+        }
+
+        fn set_config_option(
+            &self,
+            config_id: acp_v2::SessionConfigId,
+            value: acp_v2::SessionConfigOptionValue,
+            cx: &mut App,
+        ) -> Task<Result<Vec<acp_v2::SessionConfigOption>>> {
+            let acp_v2::SessionConfigOptionValue::Id { value: value_id } = &value else {
+                return Task::ready(Err(anyhow::anyhow!("The stub only sets select options")));
+            };
+            self.events
+                .lock()
+                .push(format!("set_config_option:{config_id}={value_id}"));
+            if self.hang {
+                return cx.spawn(async move |_| {
+                    std::future::pending::<()>().await;
+                    Ok(Vec::new())
+                });
+            }
+            let mut options = self.options.lock();
+            for option in options.iter_mut() {
+                if option.config_id == config_id
+                    && let acp_v2::SessionConfigKind::Select(select) = &mut option.kind
+                {
+                    select.current_value = value_id.clone();
+                }
+            }
+            Task::ready(Ok(options.clone()))
         }
     }
 

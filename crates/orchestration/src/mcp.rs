@@ -62,6 +62,20 @@ pub fn orchestration_enabled(cx: &App) -> bool {
     })
 }
 
+/// Whether `agent.orchestration.route_agent_subagents` is on (default true once
+/// the settings are loaded; false before, like [`orchestration_enabled`]).
+pub fn route_agent_subagents(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>().is_some_and(|store| {
+        store
+            .merged_settings()
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.orchestration.as_ref())
+            .and_then(|orchestration| orchestration.route_agent_subagents)
+            .unwrap_or(true)
+    })
+}
+
 /// The MCP server entry to add to an agent session so the session can use the
 /// orchestration tools.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -574,6 +588,7 @@ mod tests {
                     name: "Zed Agent".into(),
                     is_native: true,
                     models: Vec::new(),
+                    models_note: None,
                 }],
                 profiles: vec![crate::AvailableProfile {
                     id: "write".to_string(),
