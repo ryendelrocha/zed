@@ -1,6 +1,6 @@
 # How an agent opens a child conversation
 
-> Companion to `orchestrated-threads.md` and `orchestrated-threads-r1-plan.md`. It explains the flow in plain terms and answers one question: **does the orchestrating agent ever get access to a key?** It does not. State described: code at `bd64c7b`.
+> Companion to `orchestrated-threads.md` and `orchestrated-threads-r1-plan.md`. It explains the flow in plain terms and answers one question: **does the orchestrating agent ever get access to a key?** It does not. State described: code at `9f557b7`.
 
 ## In one sentence
 
@@ -94,6 +94,25 @@ Zed enforces it in layers:
 - The child's header also states the quota.
 
 `child_status` shows the quota granted and used, and the child's log records the grant, each spawn counted or refused, and each cancellation. Limits of this mechanism are listed in section 12 of the spec.
+
+## Who wrote each message: From and To blocks
+
+Every message that another thread wrote is shown with a header above it, `From <title>` or `To <title>`.
+
+- A child shows `From <orchestrator>` on its prompt and on later messages from the orchestrator, `From <sibling>` on a sibling's message, `To <orchestrator>` on its `send_to_parent` calls and on the final message of a turn that the orchestrator started, and `To <sibling>` on its `send_to_sibling` calls.
+- An orchestrator shows `From <child>` on a child's urgent message.
+- The header already says who wrote the message, so the text prefixes (`[from sibling <title>]`, `[from child <title>]`) are hidden in the view. They stay in the text the model receives, which is how the model knows the sender. The header that says "you are a child" (R14) is shown collapsed as "Instructions for the agent".
+- What you type yourself has no header.
+
+Titles are read each time they are drawn, so a rename shows at once. The sender is remembered in memory only. After a restart, a child's first prompt is still `From <orchestrator>`, and the `To` blocks are rebuilt from the tool calls, but later `From` headers are gone and the text prefixes show again.
+
+## Claude Code and its own subagents
+
+Claude Code has its own `Agent` and `Task` tools that start subagents. Those subagents cannot be opened or talked to from Zed: the Claude adapter (`claude-agent-acp`) refuses client requests that target its own subagent sessions (`restrictedChild`). They only show as cards in the parent's transcript.
+
+`agent.orchestration.route_agent_subagents` (on by default) avoids that for the Claude Code sessions you open. When such a session starts, Zed turns off `Agent` and `Task` (the adapter's `disallowedTools` option) and appends one instruction to the system prompt: delegate with `start_child`, using `agent: "claude-acp"` and a model such as `haiku`, `sonnet` or `opus`. The children that results are ordinary Zed threads, shown in the sidebar, that you can open and talk to, and each one can be given a model of its own.
+
+What it does not change: other agents are not touched, and a child that an orchestrator started keeps its own quota rules (R6). It is applied only when the session is created, so a Claude Code session that Zed loads or resumes keeps its own `Agent` tool. Turn the setting off to give the sessions back their own subagents.
 
 ## Permission requests from children
 

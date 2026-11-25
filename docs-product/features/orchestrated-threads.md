@@ -1,16 +1,16 @@
 # Feature Spec: Orchestrated threads
 
-> Status: Draft v0.2 · Branch `feat/orchestrated-threads` · Base: `zed-industries/zed@0be6d59` · Code state described: `bd64c7b`
+> Status: Draft v0.2 · Branch `feat/orchestrated-threads` · Base: `zed-industries/zed@0be6d59` · Code state described: `9f557b7`
 > Type: experimental fork of Zed. Nothing here is proposed upstream yet.
 
 ## Implementation status
 
-Status of each requirement at `bd64c7b`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`; children of unloaded parents and paging of "Load more" by N are `4fc06ea` (R9 is described at `4fc06ea`, the rest at `bd64c7b`). `93bd256` keeps a child row's persisted model and icon when live data is incomplete (R9, R17).
+Status of each requirement at `9f557b7`. "Done" means the behavior in the requirement text exists in the code. Commits: `36ead50` registry, log, parent link and panel host; `b1c2733` native tools, MCP server, bridge, sidebar children; `d303f89` child awareness, inbox, human summary; `10530cf` task profiles; `cbf577d` sibling messages, cascade, caps, restart, permission cards; `bd64c7b` subagent quota; `9f557b7` uniform child rows, From/To attribution, models of external agent children and Claude Code routing. Sidebar nesting is `b7c55ae`, `5921469`, `0d896ef` and `c449f10`; children of unloaded parents and paging of "Load more" by N are `4fc06ea` (R9 is described at `4fc06ea`, the rest at `bd64c7b`). `93bd256` keeps a child row's persisted model and icon when live data is incomplete (R9, R17).
 
 | ID | Status | Commits |
 | :-- | :-- | :-- |
 | R1 Orchestration tools for every agent | Done | `36ead50`, `b1c2733` (the tools added later are in R3b, R14, R15) |
-| R2 Children on any agent, provider and model | Done | `b1c2733`, `10530cf`; model of an external agent child: not yet committed |
+| R2 Children on any agent, provider and model | Done | `b1c2733`, `10530cf`; model of an external agent child in `9f557b7` |
 | R3 Parent-child link and results back | Done | `36ead50`, `b1c2733`; restart rebuild, opening unloaded children and queueing while connecting in `cbf577d` |
 | R3b Children talk to each other directly | Done | `cbf577d` |
 | R4 Exchange log per child | Done | `36ead50`; new directions in `d303f89`, `cbf577d`, `bd64c7b` |
@@ -18,12 +18,12 @@ Status of each requirement at `bd64c7b`. "Done" means the behavior in the requir
 | R6 Subagent quota | Partial | `bd64c7b` |
 | R7 Shared or separate worktree | Done | `36ead50`, `b1c2733` |
 | R8 Parallel execution | Done | `b1c2733` |
-| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf`, `4fc06ea`, `93bd256` |
-| R10 Settings | Done | `36ead50`, `d303f89`, `cbf577d` |
-| R11 The human can write in a child | Done | `d303f89` (message origins); spec revised in `1fcdad9` |
+| R9 Children nested in the sidebar | Done | `b7c55ae`, `5921469`, `0d896ef`, `c449f10`, `b1c2733`, `10530cf`, `4fc06ea`, `93bd256`; uniform rows (model, lines, time) in `9f557b7` |
+| R10 Settings | Done | `36ead50`, `d303f89`, `cbf577d`; `show_child_model` and `route_agent_subagents` in `9f557b7` |
+| R11 The human can write in a child | Done | `d303f89` (message origins); spec revised in `1fcdad9`; From/To blocks in `9f557b7` |
 | R12 Cancellation cascades | Done | `cbf577d` |
 | R13 Child permission requests in the orchestrator | Done | `cbf577d` |
-| R14 A child knows it is a child | Done | `d303f89`; quota sentence in `bd64c7b`, sibling sentence in `cbf577d` |
+| R14 A child knows it is a child | Done | `d303f89`; quota sentence in `bd64c7b`, sibling sentence in `cbf577d`; the header is shown collapsed in `9f557b7` |
 | R15 Child-to-orchestrator inbox | Done | `d303f89` |
 | R16 Human intervention summary | Done | `d303f89` |
 | R17 Task profiles pick the provider | Done | `10530cf`, `93bd256` |
@@ -93,7 +93,7 @@ Tools added by later requirements: `send_to_parent` (R15), `list_siblings` and `
 
 `start_child` accepts any agent and model that `list_agents_and_models` reports, native or external.
 
-For an external agent child, `model` is one of that agent's own models (for Claude Code `haiku`, `sonnet`, `opus`, optionally as `claude-acp/haiku`). Zed sets it through the agent's model config option (`session/set_config_option`, the path of the model selector) when the child's session connects, and sends the child's first prompt only after that (the prompt is parked, and `send_to_child` messages wait behind it). If the agent does not answer in 15 seconds, the prompt is sent anyway and a warning is logged. A profile whose `default_model` is `<agent-id>/<model>` supplies the model when `model` is not given; the rest of the profile is ignored with a `warning`. A model the agent does not offer is an error that lists the agent's models: `start_child` returns it when the agent's models are already known (from an open session or an earlier child), and otherwise the child starts and fails before any prompt, with the same message in `child_status`. An agent with no model option fails the child the same way. The resolved model is stored in the child's `run_config` (provider is the agent id) and registered as `<agent-id>/<model>`. `list_agents_and_models` lists an external agent's models from an open session of that agent, else from the last list the agent reported in this Zed run, with a `models_note` that says which; an agent that has not connected yet lists none. An unknown agent, or an unknown `profile`, is an error.
+For an external agent child, `model` is one of that agent's own models (for Claude Code `haiku`, `sonnet`, `opus`, optionally as `claude-acp/haiku`). Zed sets it through the agent's model config option (`session/set_config_option`, the path of the model selector) when the child's session connects, and sends the child's first prompt only after that (the prompt is parked, and `send_to_child` messages wait behind it). If the agent does not answer in 15 seconds, the prompt is sent anyway and a warning is logged. A profile whose `default_model` is `<agent-id>/<model>` supplies the model when `model` is not given; the rest of the profile is ignored with a `warning`. A model the agent does not offer is an error that lists the agent's models: `start_child` returns it when the agent's models are already known (from an open session or an earlier child), and otherwise the child starts and fails before any prompt, with the same message in `child_status`. An agent with no model option fails the child the same way. The models of an agent are kept in an in-memory cache for the Zed run, so a later child of the same agent can be checked before it starts. The resolved model is stored in the child's `run_config` (provider is the agent id) and registered as `<agent-id>/<model>`. `list_agents_and_models` lists an external agent's models from an open session of that agent, else from the last list the agent reported in this Zed run, with a `models_note` that says which; an agent that has not connected yet lists none. An unknown agent, or an unknown `profile`, is an error.
 
 **Why:** this is the core goal, multi-model work. Mixing models lets cheap or local models (Ollama) take bulk work, while stronger models take judgment work.
 
@@ -189,6 +189,9 @@ When `agent.orchestration.show_as_subthreads` is on:
 - children are **sorted by the time of their last message, most recent first**;
 - each child row reuses the thread row's status icons (running, waiting for confirmation, error, done).
 - each child row shows its model name and provider icon, and keeps them while its data is incomplete: the live model counts only when it is complete (a non-empty name; a missing live icon falls back to the persisted icon), otherwise the persisted run config is shown. Child rows use stable element ids, so a row is not recreated when a sibling is loaded, selected or evicted.
+- **Uniform rows (`9f557b7`).** Every kind of child (orchestrated child, native Zed subagent, external agent-owned subagent) shows the same three things: the model, the lines edited (`+N -M`, shown only when above zero) and the time. The model name is a friendly one, chosen in this order: the name the provider or the ACP agent reports for the live model (kept as is when it reads like a display name, otherwise prettified); for a persisted row, the name in the language model registry; and, when neither is known, the id prettified (`deepseek-v4.1-flash:cloud` becomes "DeepSeek 4.1 Flash", `claude-haiku-5-5` becomes "Claude Haiku 5.5"; serving tags such as `:cloud` are dropped). `agent.orchestration.show_child_model` (default `true`) turns the model off; the icon, lines and time stay.
+
+Limits of the uniform rows: a persisted native subagent whose parent is not loaded shows its time only (no model and no lines, because its thread is not loaded); an orchestrated child that is not loaded shows its lines only once it is loaded, because the diff comes from the live thread.
 
 When the setting is off, children appear as ordinary top-level threads, which is today's `create_thread` behavior.
 
@@ -201,19 +204,30 @@ When the setting is off, children appear as ordinary top-level threads, which is
 | `agent.orchestration.enabled` | bool | `true` | Expose the orchestration tools (R1) |
 | `agent.orchestration.show_as_subthreads` | bool | `true` | Nest children under the orchestrator in the sidebar (R9) |
 | `agent.orchestration.subthreads_visible` | int | `5` | Children shown before "Load more" (R9) |
+| `agent.orchestration.show_child_model` | bool | `true` | Show the model a child runs on in its sidebar row (R9). The icon, the lines edited and the time stay either way |
 | `agent.orchestration.max_concurrent_children` | int | `6` | Global cap on running children, across every orchestrator in the app. A child counts from its start until its turn finishes, fails or is cancelled. `start_child` beyond it fails with an error that states the count |
 | `agent.orchestration.max_sibling_messages` | int | `20` | Cap on messages per pair of children (R3b) |
 | `agent.orchestration.human_summary_max_chars` | int | `600` | Length cap of the human-intervention summary (R16) |
-| `agent.orchestration.route_agent_subagents` | bool | `true` | In the Claude Code sessions the human opens, turn off Claude Code's own `Agent` and `Task` tools and tell the session to delegate with `start_child`, because the Claude adapter refuses client requests to its own subagent sessions (`restrictedChild` in `claude-agent-acp`, `src/acp-subagents.ts`). Sessions of orchestrated children keep their quota rules. Other agents are not affected |
+| `agent.orchestration.route_agent_subagents` | bool | `true` | In the Claude Code sessions the human opens, turn off Claude Code's own `Agent` and `Task` tools and tell the session to delegate with `start_child`, because the Claude adapter refuses client requests to its own subagent sessions (`restrictedChild` in `claude-agent-acp`, `src/acp-subagents.ts`). The disallowed tools go in `_meta.claudeCode.options.disallowedTools` and the instruction is appended to the system prompt (`_meta.systemPrompt.append`) of `session/new`, so a session that is loaded or resumed does not get them. Sessions of orchestrated children keep their quota rules. Other agents are not affected |
 | `agent.orchestration.log_dir` | path | `null` (uses `zed-orchestration` in the system temporary directory) | Where the R4 logs and the R6 quota tickets go |
 
-All eight keys exist in `assets/settings/default.json` with these defaults, and each has an item in the Settings UI (`crates/settings_ui/src/page_data.rs`).
+All nine keys exist in `assets/settings/default.json` with these defaults, and each has an item in the Settings UI (`crates/settings_ui/src/page_data.rs`).
 
 **Why:** each behavior that someone may reasonably want different is a setting, not hard-coded. `max_concurrent_children` is a safety cap that sits above the per-child quota of R6.
 
 ### R11. The human can write in a child thread (revised)
 
 Orchestrated children are ordinary Zed threads, so they keep their message editor and the human can talk to a child directly. (Agent-owned subagents stay read-only, as upstream.) What the orchestrator learns about that conversation is defined by R16. The code tags each message with its origin (human or orchestration) so R16 can tell them apart; no test asserts the editor itself.
+
+**From/To blocks (`9f557b7`).** Messages that other threads write are shown with a header that names the thread:
+- in a child: `From <orchestrator>` on its first prompt and on later messages from the orchestrator, `From <sibling>` on a sibling's message; `To <orchestrator>` on its `send_to_parent` calls and on the final message of a turn the orchestrator started; `To <sibling>` on its `send_to_sibling` calls;
+- in an orchestrator: `From <child>` on a child's urgent message (R15). A reply of the orchestrator is not addressed to anyone;
+- the R14 header is shown collapsed under the label "Instructions for the agent", and the text prefixes (`[from sibling <title>]`, `[from child <title>]`) stay in the text the model receives but are hidden in the view, because the header already says who wrote the message;
+- a message that another thread delivered is read-only (it cannot be edited and resent);
+- messages typed by the human carry no header, and neither do an orchestrator's own replies;
+- titles are looked up each time they are drawn, so a rename shows at once.
+
+Limit: who wrote a message is kept in memory only (the saved thread has no field for it). After a restart, a child's first prompt is still shown as `From <orchestrator>` (recognized by the R14 header), and the `To` blocks are still derived from the tool calls and the turn, but a later message from the orchestrator, a sibling or a child shows no `From` header and its text prefix is visible again.
 
 **Why (revised after testing):** the original V1 made children read-only to avoid turn-taking problems. In practice, steering a child directly is useful, and R16 gives the orchestrator what it needs to continue without reading the human's messages.
 
@@ -308,7 +322,7 @@ This table is the original plan. The files actually changed are listed one by on
 
 ## 9. Acceptance criteria
 
-Status column: **Met (tests)** means a test in the code asserts the behavior; **Not verified** means no test or manual check covers the full criterion. The status was taken from the tests present at `bd64c7b`, and for AC6 and AC27 to AC31 from the tests added in `4fc06ea`; the doc update did not run them. Real Claude Code, Codex or Ollama sessions were not exercised by any test, so criteria that name them are not verified end to end.
+Status column: **Met (tests)** means a test in the code asserts the behavior; **Not verified** means no test or manual check covers the full criterion. The status was taken from the tests present at `9f557b7` (for AC6 and AC27 to AC31, the tests added in `4fc06ea`); the doc update did not run them. Real Claude Code, Codex or Ollama sessions were not exercised by any test, so criteria that name them are not verified end to end.
 
 | ID | Criterion | Status | Evidence |
 | :-- | :-- | :-- | :-- |
@@ -348,6 +362,12 @@ Status column: **Met (tests)** means a test in the code asserts the behavior; **
 | AC34 | R2: an unknown model lists the agent's models; when the agent never answers, the prompt is sent anyway after the timeout. | Met (tests) | `test_orchestration_unknown_external_model_fails_the_child_and_lists_the_models`, `test_orchestration_external_model_timeout_sends_the_prompt_anyway` |
 | AC35 | R2: `list_agents_and_models` lists an external agent's models from an open session or the last reported list. | Met (test) | `test_orchestration_list_shows_the_models_of_an_open_external_session` |
 | AC36 | R10: with `route_agent_subagents` on, a Claude Code root session starts with `Agent` and `Task` disallowed and the `start_child` instruction; off, other agents and children are unchanged. | Met (tests) | `route_on_gives_a_claude_root_session_the_options_and_the_instruction`, `route_off_or_no_orchestration_tools_leave_the_session_unchanged`, `other_agents_are_never_routed`, `a_child_keeps_its_quota_meta_and_is_not_routed` |
+| AC37 | R9: every kind of child row (orchestrated child, native subagent, external agent subagent) carries the model, the `+N -M` lines and the time; `show_child_model` off leaves the model out and keeps the profile, if any. | Met (tests) | `test_every_child_kind_carries_model_diff_and_time`, `test_child_model_label_omits_the_model_when_the_setting_is_off` |
+| AC38 | R9: a model id is shown as a friendly name (`deepseek-v4.1-flash:cloud` as "DeepSeek 4.1 Flash"); a name that already reads like a display name is kept. | Met (tests) | `test_prettify_model_ids`, `test_friendly_name_keeps_display_names` |
+| AC39 | R11: a child shows `From <orchestrator>` on its prompt and `From`/`To` blocks for sibling messages, `send_to_parent` and the final message of an orchestrator-started turn; human messages carry no header; the text prefix is hidden. | Met (tests) | `test_child_thread_shows_who_wrote_and_who_receives_each_message`, `test_split_delivered_text_separates_what_the_model_needs_from_the_message` |
+| AC40 | R11, R15: an orchestrator shows an urgent child message as `From <child>` and its own reply with no header. | Met (test) | `test_orchestrator_thread_shows_urgent_child_messages_from_the_child` |
+| AC41 | R11, R14: after a restart a child's first prompt is still `From <orchestrator>`; a human message after it has no header. | Met (test) | `test_restored_child_prompt_is_still_from_the_orchestrator` |
+| AC42 | R9, R11: how the uniform rows and the From/To blocks look (layout, collapsed "Instructions for the agent", truncation in a narrow sidebar). | Not verified | Tests assert the data (model, lines, headers), not the rendering. |
 
 ## 10. Risks
 
@@ -393,7 +413,7 @@ Source: `CONTRIBUTING.md` and `docs/src/development/feature-process.md` in the Z
 
 ## 12. Known limitations
 
-Open issues of the implementation at `bd64c7b` (R9 at `4fc06ea`). Each one is stated in the code, in a code comment, in a test or in a commit message, or follows directly from the code path named.
+Open issues of the implementation at `9f557b7` (R9 persisted rows at `4fc06ea`). Each one is stated in the code, in a code comment, in a test or in a commit message, or follows directly from the code path named.
 
 | Limitation | Where it comes from |
 | :-- | :-- |
@@ -404,8 +424,11 @@ Open issues of the implementation at `bd64c7b` (R9 at `4fc06ea`). Each one is st
 | L1 and L4 count only the child's own root session. Subagents of a subagent are not counted by L4, and L1 counts the calls of the child's own root session only. | `enforce_subagent_quota` and `count_toward_subagent_quota` resolve the owning child from the root session id. |
 | The ACP v1 path of L4 has no test, and none of L2 to L4 was run against a real Claude Code session (R6, "Verification status"). | Tests in `crates/agent_servers/src/acp/v2.rs` and `crates/orchestration/src/quota.rs` only. |
 | `profile` is ignored for an external agent child except for its default model (R2, R17), and returns a warning. | `crates/agent_ui/src/orchestration_host.rs` and its tests. |
+| A persisted native subagent row shows its time only (no model, no lines), and an orchestrated child that is not loaded shows its lines only once it is loaded (R9). | `persisted_subthreads_by_parent` in `crates/sidebar/src/subthreads.rs` builds the row with default `diff_stats`; the diff comes from the live thread. |
+| Who wrote a message (the From/To origin) is in memory only. After a restart only a child's first prompt (from the R14 header) and the `To` blocks keep their header. | `MessageOrigin` and `pending_user_attribution` in `crates/agent_ui/src/conversation_view.rs` and `crates/acp_thread/src/acp_thread.rs`; the saved thread has no field for it; `test_restored_child_prompt_is_still_from_the_orchestrator`. |
 | A root Claude Code session that is loaded or resumed does not get the `route_agent_subagents` `_meta` again, because it is sent only in `session/new`. Its own `Agent` tool keeps working. | `quota_session_meta` in `crates/agent_servers/src/acp.rs`. |
-| `route_agent_subagents` and the model option were not run against a real Claude Code session. | Tests use the stub connection and unit tests only. |
+| Claude Code's own `Agent`/`Task` subagents, when `route_agent_subagents` is off or the session was loaded, still cannot be opened or talked to from Zed: the Claude adapter refuses client requests to them (`restrictedChild`). | R10, `claude_code_session_meta` in `crates/orchestration`. |
+| `route_agent_subagents`, the model option, the From/To blocks and the uniform rows were not run against a real Claude Code session. | Tests use the stub connection and unit tests only. |
 | The stdio bridge exists only on Unix (`#[cfg(unix)]` in `crates/orchestration/src/bridge.rs`). | `bridge.rs`. |
 | Claude Code may ask the human for permission on each `mcp__zed-orchestration__*` call. | Plan, "Risks": accepted in V1. |
 | The session token sits in the environment of the bridge process. A model with shell access on the same machine could read it (for example with `ps eww`). It only lets that caller act on its own orchestrator's children. | `orchestrated-threads-how-it-works.md`, and `bridge.rs`. |

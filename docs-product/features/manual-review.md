@@ -2,7 +2,7 @@
 
 This file lists every file changed for orchestrated threads, so a human reviewer can review each one individually before anything is proposed upstream to Zed. A checkmark in the "Manual review" column means a human reviewed that file; an empty cell means it has not been reviewed yet. The fork owner fills this column, nobody else.
 
-Base commit: `0be6d59`. Last commit covered: `93bd256` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
+Base commit: `0be6d59`. Last commit covered: `9f557b7` (inclusive). Requirements are defined in [orchestrated-threads.md](orchestrated-threads.md) (R1 to R17, plus R3b).
 
 ## Files
 
@@ -57,10 +57,10 @@ Base commit: `0be6d59`. Last commit covered: `93bd256` (inclusive). Requirements
 | [crates/agent/src/tools/send_to_parent_tool.rs](../../crates/agent/src/tools/send_to_parent_tool.rs) | New native tool for a child to message its orchestrator, with an `urgent` flag. | R15 | |
 | [crates/agent/src/tools/start_child_tool.rs](../../crates/agent/src/tools/start_child_tool.rs) | New native tool that starts a child, with agent, `profile`, model and worktree options. | R1, R2, R17 | |
 | [crates/agent/src/tools/whoami_tool.rs](../../crates/agent/src/tools/whoami_tool.rs) | New native tool that returns the thread's role, its parent and its children. | R14 | |
-| [crates/agent/src/tools/list_siblings_tool.rs](../../crates/agent/src/tools/list_siblings_tool.rs) | New native tool that lists the other children of the caller's orchestrator, with their status. | R3b |
-| [crates/agent/src/tools/send_to_sibling_tool.rs](../../crates/agent/src/tools/send_to_sibling_tool.rs) | New native tool that messages a sibling child, with optional `await_reply` and a timeout. | R3b |
-| [crates/agent_ui/src/conversation_view/orchestrated_permissions.rs](../../crates/agent_ui/src/conversation_view/orchestrated_permissions.rs) | New cards in the orchestrator thread for its children's permission requests, with Allow, Deny and Open. | R13 |
-| [crates/orchestration/src/quota.rs](../../crates/orchestration/src/quota.rs) | New per-child subagent counter, ticket directory, Claude Code session options and the PreToolUse hook command. | R6 |
+| [crates/agent/src/tools/list_siblings_tool.rs](../../crates/agent/src/tools/list_siblings_tool.rs) | New native tool that lists the other children of the caller's orchestrator, with their status. | R3b | |
+| [crates/agent/src/tools/send_to_sibling_tool.rs](../../crates/agent/src/tools/send_to_sibling_tool.rs) | New native tool that messages a sibling child, with optional `await_reply` and a timeout. | R3b | |
+| [crates/agent_ui/src/conversation_view/orchestrated_permissions.rs](../../crates/agent_ui/src/conversation_view/orchestrated_permissions.rs) | New cards in the orchestrator thread for its children's permission requests, with Allow, Deny and Open. | R13 | |
+| [crates/orchestration/src/quota.rs](../../crates/orchestration/src/quota.rs) | New per-child subagent counter, ticket directory, Claude Code session options and the PreToolUse hook command. | R6 | |
 | [crates/agent_servers/Cargo.toml](../../crates/agent_servers/Cargo.toml) | Adds the `orchestration` workspace dependency. | R1 | |
 | [crates/agent_servers/src/acp/v2.rs](../../crates/agent_servers/src/acp/v2.rs) | Adds the orchestration MCP entry to new and loaded ACP v2 sessions when the agent supports stdio MCP, with a test. | R1 | |
 | [crates/agent_settings/src/agent_profile.rs](../../crates/agent_settings/src/agent_profile.rs) | Adds an optional `description` to agent profiles and to profile creation, with a test. | R17 | |
@@ -75,6 +75,11 @@ Base commit: `0be6d59`. Last commit covered: `93bd256` (inclusive). Requirements
 | [crates/zed/Cargo.toml](../../crates/zed/Cargo.toml) | Adds the `orchestration` workspace dependency. | R1 | |
 | [crates/zed/src/main.rs](../../crates/zed/src/main.rs) | Adds the hidden `--orchestration-bridge <socket>` argument that runs the bridge and exits. | R1 | |
 | [docs-product/features/manual-review.md](manual-review.md) | This file: the review checklist of every changed file, with details by requirement. | R1 to R17 | |
+| [crates/acp_thread/src/connection.rs](../../crates/acp_thread/src/connection.rs) | Test stub connection gains scripted session config options, a hanging `set_config_option` and an event log. | R2 | |
+| [crates/agent_ui/src/entry_view_state.rs](../../crates/agent_ui/src/entry_view_state.rs) | Shows a delivered message without its model-only text and makes it read-only. | R11 | |
+| [crates/agent_ui/src/model_display_name.rs](../../crates/agent_ui/src/model_display_name.rs) | New: `friendly_model_name` and `prettify_model_id` turn a model id into a readable name for sidebar rows. | R9 | |
+| [crates/agent_ui/src/orchestration_attribution.rs](../../crates/agent_ui/src/orchestration_attribution.rs) | New: decides the `From`/`To` header of each entry, hides the text prefixes and keeps the model-only text collapsed. | R11, R14, R15 | |
+| [crates/agent_ui/src/orchestration_models.rs](../../crates/agent_ui/src/orchestration_models.rs) | New: reads an external agent's model option, resolves the requested model, applies it and caches each agent's models. | R2 | |
 
 ## Details by requirement
 
@@ -115,6 +120,10 @@ Changed again in `b1c2733`: the module now also lists children that exist only i
 
 Changed again in `4fc06ea` (R9): `persisted_subthreads_by_parent` builds `SubthreadInfo` rows from `ThreadStore::subagent_entries` (status always `Completed`, time = `updated_at`, no model, no thread id) keyed by the parent's session id; `SubthreadLayout` replaces `fully_loaded` with `persisted` and `shown_counts` (children shown per group, default `visible`); `insert_subthread_entries` adds persisted rows unless the loaded conversation already lists that session live, and no longer returns early when only persisted groups exist; `select_visible_subthreads(subthreads, count)` loses its `show_all` argument. Why: children of a parent that was never opened still show, and each "Load more" reveals the next N (R9).
 
+Changed again in `9f557b7` (R9): `child_info` becomes `pub(crate)` and copies `diff_stats` into the row; a persisted subagent row gets default `diff_stats`, so it shows no lines.
+- Review focus:
+  - A persisted native subagent shows time only.
+
 #### [`crates/sidebar/src/sidebar.rs`](../../crates/sidebar/src/sidebar.rs)
 
 - Scope: the sidebar list itself: new row kinds, state, rendering, input handling.
@@ -142,6 +151,11 @@ Changed again in `93bd256` (R9, R17): `merge_live_thread_model` replaces the pla
   - `merge_live_thread_model` covers all four live/persisted combinations.
   - Top-level rows keep the index-based id; only nested rows changed.
 
+Changed again in `9f557b7` (R9): `child_model_label` takes `show_model` (the `show_child_model` setting) and leaves the model out when it is off; the live and the persisted model names go through `friendly_model_name` and `prettify_model_id` (the registry name is used when found); a subthread row also gets `+N -M` lines from `diff_stats`.
+- Review focus:
+  - With the setting off, the profile still shows when there is one.
+  - Rows with no added or removed lines show no lines.
+
 #### [`crates/sidebar/src/sidebar_tests.rs`](../../crates/sidebar/src/sidebar_tests.rs)
 
 - Scope: test coverage for R9 behavior and the stable-order rule.
@@ -158,6 +172,10 @@ Changed again in `b1c2733` and `10530cf`: new helpers `save_orchestration_thread
 Changed again in `4fc06ea` (R9): `select_visible_subthreads` calls lose `show_all`; the limit test also asserts a second "Load more" click; new helpers `kid_titles`, `kid_names` and `save_native_subagent` (saves a native subagent with a parent session in the threads database); new tests `test_load_more_pages_by_visible_count_newest_first`, `test_loaded_count_survives_collapse_and_expand`, `test_top_level_threads_are_not_limited_by_subthreads_visible`, `test_unloaded_parent_shows_chevron_and_children_without_opening` and `test_persisted_native_subagents_nest_under_unloaded_parent`. Mostly additive.
 
 Changed again in `93bd256` (R9, R17): new helpers `ollama_model`, `child_entry_with_model` and `active_info_with_model`; new tests `test_loading_child_without_a_model_keeps_the_persisted_model_and_icon`, `test_live_model_without_an_icon_keeps_the_persisted_icon`, `test_live_model_with_an_empty_name_does_not_blank_the_persisted_model`, `test_known_live_model_replaces_the_persisted_one` and `test_two_ollama_children_keep_their_rows_when_one_is_loaded_or_evicted`. Additive.
+
+Changed again in `9f557b7` (R9): `test_child_model_label_omits_the_model_when_the_setting_is_off` and `test_every_child_kind_carries_model_diff_and_time` (an orchestrated child, a native subagent and an external agent subagent each carry model, diff stats and time).
+- Review focus:
+  - The tests assert data, not the rendering.
 
 #### [`crates/sidebar/Cargo.toml`](../../crates/sidebar/Cargo.toml)
 
@@ -186,6 +204,10 @@ Changed again in `4fc06ea` (R9): new field `pending_navigation` and `navigate_to
 
 Changed again in `93bd256` (R9, R17): the model of a subagent's own view is filtered, so a model with an empty name is treated as missing. Why: an empty live model must not replace the persisted one.
 
+Changed again in `9f557b7` (R9, R11): `SubthreadInfo` gains `diff_stats`; a subagent's model name goes through `friendly_model_name`; new tests `test_child_thread_shows_who_wrote_and_who_receives_each_message`, `test_orchestrator_thread_shows_urgent_child_messages_from_the_child` and `test_restored_child_prompt_is_still_from_the_orchestrator`, with helpers `save_thread_title`, `attribution_headers` and `deliver`.
+- Review focus:
+  - Who wrote a message is stored in memory only; the restored-prompt test shows what survives a restart.
+
 #### [`crates/agent_ui/src/agent_ui.rs`](../../crates/agent_ui/src/agent_ui.rs)
 
 - Scope: crate wiring.
@@ -197,6 +219,10 @@ Changed again in `93bd256` (R9, R17): the model of a subagent's own view is filt
 Changed again in `b1c2733` and `d303f89`: `model_icon_parts` is re-exported; the test settings literal gains `human_summary_max_chars: 600`.
 
 Changed again in `cbf577d`: the test settings literal gains `max_concurrent_children: 6` and `max_sibling_messages: 20`.
+
+Changed again in `9f557b7` (R2, R9, R11): declares `model_display_name`, `orchestration_attribution` and `orchestration_models`, re-exports `friendly_model_name` and `prettify_model_id` for the sidebar, and the test settings literal sets the two new settings.
+- Review focus:
+  - The two re-exports are the only public surface added.
 
 #### [`crates/agent_settings/src/agent_settings.rs`](../../crates/agent_settings/src/agent_settings.rs)
 
@@ -213,6 +239,10 @@ Changed again in `d303f89` (R16): `OrchestrationSettings.human_summary_max_chars
 
 Changed again in `cbf577d` (R3b, R10): `OrchestrationSettings` gains `max_concurrent_children` and `max_sibling_messages` (both `usize`), read with `unwrap()` like their siblings.
 
+Changed again in `9f557b7` (R9, R10): `OrchestrationSettings` gains `show_child_model` and `route_agent_subagents` (both `bool`), read with `unwrap()` like its siblings.
+- Review focus:
+  - Both keys have a default in `default.json`, or `unwrap()` would panic.
+
 #### [`crates/settings_content/src/agent.rs`](../../crates/settings_content/src/agent.rs)
 
 - Scope: the user-facing settings schema.
@@ -227,6 +257,10 @@ Changed again in `d303f89` (R16): `OrchestrationSettingsContent.human_summary_ma
   - Doc comments match the default (600) and the profile description semantics.
 
 Changed again in `cbf577d`: `OrchestrationSettingsContent` gains `max_concurrent_children` (default 6) and `max_sibling_messages` (default 20); the doc comment of `enabled` lists the nine tools; `list_siblings` and `send_to_sibling` join the profile tools schema list.
+
+Changed again in `9f557b7` (R9, R10): `OrchestrationSettingsContent` gains `show_child_model` and `route_agent_subagents` (`Option<bool>`, default `true`), with doc comments that say what each turns off.
+- Review focus:
+  - The doc comment of `route_agent_subagents` states that sessions started by an orchestrator keep their quota.
 
 #### [`assets/settings/default.json`](../../assets/settings/default.json)
 
@@ -244,6 +278,10 @@ Changed again in `b1c2733`: the five tools of `b1c2733` are enabled in the `writ
 
 Changed again in `cbf577d`: `max_concurrent_children: 6` and `max_sibling_messages: 20` with comments, the `enabled` comment lists `list_siblings` and `send_to_sibling`, and both are enabled in the `write` profile.
 
+Changed again in `9f557b7` (R9, R10): `show_child_model: true` and `route_agent_subagents: true`, each with a comment.
+- Review focus:
+  - Both defaults match the spec's R10 table.
+
 #### [`crates/settings_ui/src/page_data.rs`](../../crates/settings_ui/src/page_data.rs)
 
 - Scope: Settings Editor entries for the new settings.
@@ -259,6 +297,10 @@ Changed again in `d303f89` (R16): a fifth item, "Human Intervention Summary Leng
 
 Changed again in `cbf577d`: two items, "Maximum Concurrent Child Threads" and "Maximum Sibling Messages"; the array in `general_section` goes from 13 to 15 items.
 
+Changed again in `9f557b7` (R9, R10): two items, "Show Child Model In Sidebar" and "Route Claude Code Subagents To Child Threads"; `general_section` grows from 15 to 17 items.
+- Review focus:
+  - The array length and the item order.
+
 #### [`crates/agent/src/tool_permissions.rs`](../../crates/agent/src/tool_permissions.rs)
 
 - Scope: test fixture only.
@@ -270,6 +312,8 @@ Changed again in `cbf577d`: two items, "Maximum Concurrent Child Threads" and "M
 Changed again in `d303f89`: the test literal also sets `human_summary_max_chars: 600`.
 
 Changed again in `cbf577d`: the test literal also sets `max_concurrent_children: 6` and `max_sibling_messages: 20`.
+
+Changed again in `9f557b7`: the test literal also sets `show_child_model: true` and `route_agent_subagents: true`.
 
 #### [`docs/src/reference/all-settings.md`](../../docs/src/reference/all-settings.md)
 
@@ -285,6 +329,10 @@ Changed again in `d303f89` (R16): section "Human Intervention Summary Length" (`
   - The model resolution order text matches `resolve_child_model`.
 
 Changed again in `cbf577d`: sections "Maximum Concurrent Child Threads" and "Maximum Sibling Messages", each with the setting, default, behavior and an example.
+
+Changed again in `9f557b7`: sections "Show Child Model In Sidebar" and "Route Claude Code Subagents To Child Threads", each with the setting, default and options.
+- Review focus:
+  - The text matches the doc comments in `settings_content/src/agent.rs`.
 
 ### R1–R5: orchestration core (groundwork)
 
@@ -339,6 +387,10 @@ Changed again in `b1c2733`: `mod bridge;`, `mod mcp;` and their `pub use`. In `d
 Changed again in `cbf577d` (R3b, R12, R10): `ListSiblingsInput`/`Output`, `SiblingInfo`, `SendToSiblingInput`/`Output` (`await_reply`, `timeout_secs`, `reply`, `timed_out`, `messages_left`); `sibling_message_prefix` and `sibling_message_text`; `sibling_messages` on `ChildStatusInfo`; the default constants for the reply timeout, `max_sibling_messages` and `max_concurrent_children`; and the host methods `cancel_thread_turn`, `load_child`, `list_siblings` and `send_to_sibling`. In `bd64c7b` (R6): `mod quota`, `subagent_quota` on `StartChildInput`, `SubagentQuotaStatus` and `subagent_quota` on `ChildStatusInfo`; `child_header` now takes the quota, states it, and mentions the sibling tools.
 - Review focus:
   - `child_header` is the only place that tells a child about its quota and its siblings.
+
+Changed again in `9f557b7` (R2, R11, R14): `MessageSender` and `SenderRole`; `split_delivered_text` and `DeliveredText` separate what only the model needs from the message body; `CHILD_HEADER_MARKER` and the separator are shared constants; `OrchestrationHost::deliver_message` takes the sender; `models_note` on the agent list; the `model` and `profile` docs no longer say an external agent ignores them.
+- Review focus:
+  - The R14 header text is unchanged; only its constants moved.
 
 #### [`crates/orchestration/src/registry.rs`](../../crates/orchestration/src/registry.rs)
 
@@ -401,6 +453,11 @@ Changed again in `cbf577d`: `watch_saved_children` and `restore_saved_children` 
 - Review focus:
   - A child in another workspace's panel is not reachable (error in `open_child`).
 
+Changed again in `9f557b7` (R2, R11): `deliver_message` takes the `MessageSender`; a `ModelGate` parks the first prompt of an external child (and the `send_to_child` messages behind it) until `hold_prompt_for_model`, `start_model_gate` and `finish_model_gate` have set its model, or 15 seconds passed; `persist_external_run_config` stores the model with the agent id as provider.
+- Review focus:
+  - The prompt is never sent before the model is set, except after the timeout.
+  - A failed model fails the child before any prompt.
+
 #### [`crates/agent_ui/src/agent_panel.rs`](../../crates/agent_ui/src/agent_panel.rs)
 
 - Scope: the panel is the host registered with the registry (R1), starts children (R2) and links them to the parent (R3). Also adds `navigate_to_subthread` for R9 (`b7c55ae`).
@@ -421,6 +478,10 @@ Changed again in `cbf577d`: archiving a thread cancels its running descendants; 
 Changed again in `4fc06ea` (R9): `navigate_to_subthread_when_ready` finds the parent's conversation view and calls `navigate_to_thread_when_ready` on it; `navigate_to_subthread` is unchanged. Why: the sidebar uses it when the parent was not loaded.
 
 Changed again in `93bd256` (R9, R17): `persist_native_run_config` persists a model only when its provider id and model id are non-empty, and the profile id only when non-empty; new test `test_changing_one_child_model_leaves_its_sibling_persisted_config`. Why: a loading thread has no resolved model, and an empty one must never overwrite the stored run config.
+
+Changed again in `9f557b7` (R2): `selected_agent_id`; `defer_prompt` on the child request so the caller sends the prompt after configuring the session; `setup_external_models` and `child_run_config_model`; the test that said a model is not supported for an external agent is replaced by ten tests of the model path (before the first prompt, prefixed and named model, kept model, no model, unknown model, no model option, timeout, message queued behind the model, profile model, list from an open session).
+- Review focus:
+  - The ten tests use the stub connection, not a real agent.
 
 #### [`crates/agent_ui/src/conversation_view/thread_view.rs`](../../crates/agent_ui/src/conversation_view/thread_view.rs)
 
@@ -534,6 +595,8 @@ Changed again in `cbf577d` and `bd64c7b`: the descriptions of `start_child`, `ca
 
 Changed again in `bd64c7b`: `new_session` adds the quota `_meta`; tests with a scripted v2 connection check that over-quota subagents are cancelled and logged, not cancelled without `capabilities.cancel`, and that non-orchestrated threads have no quota.
 
+Changed again in `9f557b7` (R10): `quota_session_meta` is called with `orchestration.is_some()`.
+
 #### [`crates/context_server/src/listener.rs`](../../crates/context_server/src/listener.rs)
 
 - Scope: the existing in-app MCP server that listens on a Unix socket.
@@ -563,6 +626,8 @@ Changed again in `bd64c7b`: `new_session` adds the quota `_meta`; tests with a s
   - The Unix-only code paths are `cfg`-gated.
 
 Changed again in `cbf577d` and `bd64c7b`: the server registers `list_siblings` and `send_to_sibling`; the MCP `start_child` goes through `start_child_within_quota`; a test lists and messages a sibling through the bridge.
+
+Changed again in `9f557b7` (R2, R10): `route_agent_subagents(cx)` reads the setting (default `true`); `models_note: None` in the agent list built here.
 
 #### [`crates/zed/src/main.rs`](../../crates/zed/src/main.rs)
 
@@ -609,6 +674,10 @@ Commit `b1c2733`, with the persisted model from `10530cf`. After a restart, chil
   - An agent-owned subagent has no persistence of its own, so a rename lasts for the session.
   - Existing entries for both files carry the full "Changed again" detail.
 
+Changed again in `9f557b7` (R11, R14): before sending, `message_attribution` marks the next user message with its sender (`attribute_next_user_message`, cleared after the send); `entry_attribution` gives each entry a `From`/`To` header; `render_attributed_user_message` and `render_attribution_block` draw it, with the R14 header collapsed as "Instructions for the agent" (`expanded_delivery_context`).
+- Review focus:
+  - The send path clears the pending attribution, so a message typed later is never marked.
+
 ### R14–R16: child awareness, inbox and human summary
 
 Commit `d303f89` (spec in `1fcdad9`). A child is told it is a child and how to reach its orchestrator; it can write to an inbox that the orchestrator reads on its next `await_children` or `child_status`; and when a human writes in a child, the orchestrator gets one short summary instead of the human's messages. Changes in `orchestration.rs`, `registry.rs`, `child_log.rs`, `orchestration_host.rs`, `thread_view.rs`, `agent_panel.rs` and the settings files are in their "Changed again" paragraphs above.
@@ -637,6 +706,8 @@ Commit `d303f89` (spec in `1fcdad9`). A child is told it is a child and how to r
 - Why: R16 treats a human writing in a child differently from the orchestrator's own messages (`send_to_child`, urgent messages).
 - Review focus:
   - Every queue construction sets an origin; the default is `Human`.
+
+Changed again in `9f557b7` (R11): `MessageOrigin::Orchestration` now carries an optional `MessageSender` (role and thread), so the queue keeps who sent each message.
 
 ### R17: task profiles
 
@@ -679,6 +750,10 @@ Commit `c449f10` ("expand subthreads by default, keep order stable on open"). Re
   - All former `Utc::now()` stamp sites now go through the replay guard.
   - `last_assistant_message` semantics: only text after the latest user message (feeds the final message in R5).
 
+Changed again in `9f557b7` (R11): `UserMessage.attribution`, `MessageAttribution` and `AttributionRole`; `pending_user_attribution` with `attribute_next_user_message` and `clear_pending_user_attribution`, applied when the next user message is pushed. In memory only.
+- Review focus:
+  - The attribution is not saved with the thread.
+
 #### [`crates/agent/src/agent.rs`](../../crates/agent/src/agent.rs)
 
 - Scope: native agent loading a saved thread.
@@ -692,6 +767,8 @@ Changed again in `10530cf` (R17): `selection_to_model_string` (formats a selecti
   - The `provider/model-id` form must match what `start_child`'s `model` accepts.
 
 Changed again in `bd64c7b` (R6 L1): `count_toward_subagent_quota` and `refund_subagent_quota` make `spawn_agent` and `create_thread` count against the caller's quota, refund it when the start fails, and look the child up by the caller's root session; `create_counted_sibling_thread` is split out of `create_sibling_thread`; a test covers the counting.
+
+Changed again in `9f557b7` (R2): the agent list is built with `models_note: None`.
 
 #### [`crates/agent/src/thread.rs`](../../crates/agent/src/thread.rs)
 
@@ -707,6 +784,8 @@ Changed again in `b1c2733`, `d303f89` and `10530cf`: `add_default_tools` registe
   - Subagents (threads with a parent) must not get the tools.
 
 Changed again in `cbf577d`: `add_default_tools` registers `list_siblings` and `send_to_sibling` only for a thread with a parent link; the test expects 9 tools for a child.
+
+Changed again in `9f557b7` (R2): `models_note: Option<String>` on the agent entry of `list_agents_and_models` (where the models of an external agent came from).
 
 #### [`crates/agent_servers/src/acp.rs`](../../crates/agent_servers/src/acp.rs) and [`crates/agent_servers/src/acp/v1.rs`](../../crates/agent_servers/src/acp/v1.rs)
 
@@ -730,6 +809,10 @@ Changed again in `bd64c7b` (R6): `acp.rs` gains `enforce_subagent_quota` (cancel
   - `quota_session_meta` always takes the staged grant, so it cannot reach another session; it returns nothing for any agent other than Claude Code.
   - The v1 path has no test of its own.
 
+Changed again in `9f557b7` (R10): `quota_session_meta` takes `orchestration_available` and returns the route meta for a root `claude-acp` session when the setting is on; the module `route_subagents_tests` has four tests (on, off, other agents, a child). `v1.rs` passes `orchestration.is_some()` the same way.
+- Review focus:
+  - The meta is sent only in `session/new`, so a loaded or resumed session is not routed.
+
 ### R3b, R12, caps and restart
 
 Commit `cbf577d`. Children message each other, the cascade follows the orchestrator thread's life, two caps limit load, and the registry survives a restart. Many files appear in other sections with a "Changed again in `cbf577d`" paragraph; the logic is in these two tools and in the files below.
@@ -751,6 +834,10 @@ Commit `cbf577d`. Children message each other, the cascade follows the orchestra
 - Review focus:
   - `await_reply` returns the sibling's next `send_to_sibling`, not its final message (the reason is in R3b of the spec).
   - A refused message (cap, deadlock) is neither logged nor counted.
+
+Changed again in `9f557b7` (R3b, R11, R15): sibling and urgent deliveries are grouped per sender and each group is sent with its `MessageSender`, so one delivery never mixes two authors; a test covers `split_delivered_text`.
+- Review focus:
+  - A failed delivery still goes back to undelivered.
 
 #### Cascade, caps and restart
 
@@ -799,6 +886,50 @@ Commit `bd64c7b`. Layers L1 to L5 of the spec.
 
 Other files of R6 appear in their own sections with a "Changed again in `bd64c7b`" paragraph: `orchestration.rs` (types and the quota sentence of the child header), `registry.rs` (the per-child quota and its log lines), `child_log.rs` (the `quota` direction), `agent.rs` (L1 for `spawn_agent` and `create_thread`), `acp.rs`, `v1.rs` and `v2.rs` (L2, L3, L4), `conversation_view.rs` (staging), `agent_panel.rs` and `orchestration_host.rs` (the grant reaches the registry before the session starts).
 
+Changed again in `9f557b7` (R10): `ROUTE_SUBAGENTS_INSTRUCTION`, `claude_code_route_meta` (disallows `Agent` and `Task`, appends the instruction) and `claude_code_session_meta(grant, route)`: a grant keeps its quota meta, a root session gets the route meta only when `route` is on; three tests.
+- Review focus:
+  - A child (a grant) is never routed, whatever the setting.
+
+### R2, R9, R11: models, uniform rows and From/To blocks (`9f557b7`)
+
+Commit `9f557b7`. Children of external agents get their model before the first prompt, every child row shows model, lines and time, and messages between threads show who wrote them. Files of this commit that already had a section have a "Changed again in `9f557b7`" paragraph there.
+
+#### [`crates/agent_ui/src/model_display_name.rs`](../../crates/agent_ui/src/model_display_name.rs)
+
+- Scope: the readable name of a model, for sidebar rows.
+- What changed: new module. `friendly_model_name` keeps a name that reads like a display name (it has a space or an uppercase letter) and prettifies an id; `prettify_model_id` drops the provider prefix, serving tags (`:cloud`, `:latest`) and 8-digit snapshot dates, joins split versions (`5-5` as "5.5"), keeps size tags (`:30b` as "30B") and fixes brand casing (DeepSeek, GPT, Qwen). Two tests.
+- Why: a row that shows `claude-haiku-5-5` or `deepseek-v4.1-flash:cloud` is hard to read.
+- Review focus:
+  - The brand list is short; an unknown brand is title-cased.
+  - An id with nothing to prettify comes back as is.
+
+#### [`crates/agent_ui/src/orchestration_attribution.rs`](../../crates/agent_ui/src/orchestration_attribution.rs)
+
+- Scope: who wrote each message of an orchestrated thread, for the `From <title>` and `To <title>` headers.
+- What changed: new module. `message_attribution` chooses the mark of the next user message (a child's first message is the orchestrator's prompt even though it goes through the human path); `user_message_attribution` falls back to the R14 header after a restart; `entry_attribution` gives a header to user messages (`From`), to `send_to_parent` and `send_to_sibling` tool calls (`To`) and to the final assistant message of a turn the orchestrator started (`To`); `display_blocks` and `context_text` hide the text prefixes and the R14 header from the body; `is_delivered` marks a delivered message read-only. Titles are looked up when drawn.
+- Why: the text prefixes are for the model; the person needs a header and a clean body.
+- Review focus:
+  - A message typed by the human has no header, and a failed or waiting tool call stays a tool call.
+  - The prefix and the header only change the view; the text the model receives is unchanged.
+  - The origin is in memory only (see section 12 of the spec).
+
+#### [`crates/agent_ui/src/orchestration_models.rs`](../../crates/agent_ui/src/orchestration_models.rs)
+
+- Scope: the models of external agents for `start_child` (R2).
+- What changed: new module. It reads the agent's model config option, matches the requested model (an id, a family name or `<agent-id>/<model>`; an ambiguous name asks for the exact id), applies it through `set_config_option` within `MODEL_APPLY_TIMEOUT` (15 seconds), builds the unknown-model error that lists the agent's models, and keeps the last list each agent reported in a global cache for `list_agents_and_models` and `start_child`. Five unit tests.
+- Why: a child on an external agent must run on the model the orchestrator asked for, from its first prompt.
+- Review focus:
+  - The error text for an unknown model, an ambiguous one and an agent without a model option.
+  - The cache lives for the Zed run only.
+
+#### [`crates/agent_ui/src/entry_view_state.rs`](../../crates/agent_ui/src/entry_view_state.rs) and [`crates/acp_thread/src/connection.rs`](../../crates/acp_thread/src/connection.rs)
+
+- Scope: the editor of a delivered message, and the test stub of an agent connection.
+- What changed: `entry_view_state.rs` builds a user message from `display_blocks` (without the model-only text) and makes a delivered message not editable. `connection.rs` (test code) lets the stub connection expose session config options, hang on `set_config_option`, and record the order of prompts and option changes.
+- Why: a delivered message is not the person's to edit and resend; the model path needs a stub that can show the order of events.
+- Review focus:
+  - Only delivered messages lose the editor; messages typed by the person are editable as before.
+
 ### Documentation
 
 Commits `82b86e0`, `20cd02f`, `134b4c2`, `20bec29`, `1fcdad9`, `307f727`, and edits in `b7c55ae`, `c449f10`, `b1c2733` and `cbf577d`. The documentation update for `bd64c7b` (a later commit) touches the four files below. These files do not affect the build.
@@ -821,6 +952,10 @@ Changed again in `cbf577d` (R3b, R12, R10 and AC10 edited) and in the documentat
   - Section 12 lists only limitations that the code, a comment, a test or a commit message supports.
 
 Changed again in the documentation update after `4fc06ea`: R9 now states discovery of children without loading the parent (by source), top-level threads not limited, paging by N and the per-group count; the R9 status row adds `4fc06ea`; AC6 evidence and new AC27 to AC31; three new limitations in section 12 (persisted subagent row status and time, grandchildren, external agent subagents).
+
+Changed again in `9f557b7`: status and code state at `9f557b7`; R2 is Done (model of an external agent child, 15 second timeout, unknown-model error, in-memory cache); R9 describes uniform rows and `show_child_model`; R11 describes the From/To blocks and their persistence limit; R10 adds `show_child_model` and `route_agent_subagents` (nine keys); AC33 to AC42; section 12 gains the limits of the rows, of the origin and of the routing.
+- Review focus:
+  - AC33 to AC41 name tests that exist; AC42 (how it looks) is not verified.
 
 #### [`docs-product/features/orchestrated-threads-r1-plan.md`](orchestrated-threads-r1-plan.md)
 
@@ -850,10 +985,14 @@ Changed again in the documentation update after `bd64c7b`: the token is also use
 - Review focus:
   - The key-safety statements are unchanged: no provider key reaches the orchestrator, and the hook command holds only a directory path.
 
+Changed again in `9f557b7`: new sections on the From/To blocks and on Claude Code and its own subagents (why they cannot be talked to, and what `route_agent_subagents` does).
+- Review focus:
+  - The routing section says it applies at session creation only.
+
 #### [`docs-product/features/manual-review.md`](manual-review.md)
 
 - Scope: this checklist.
-- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`, then up to `bd64c7b`, then up to `4fc06ea`, then up to `93bd256`.
+- What changed: added in `20bec29` with the table and the details up to `36ead50`; extended up to `10530cf`, then up to `bd64c7b`, then up to `4fc06ea`, then up to `93bd256`, then up to `9f557b7`.
 - Why: lets the fork owner review every file individually before anything goes upstream.
 - Review focus:
   - Only the "Manual review" column is edited by the fork owner; a "🔁" marks a file reviewed before and changed since.
@@ -863,3 +1002,5 @@ Changed again in the update that extends the list from `10530cf` to `bd64c7b`: f
 Changed again in the update that extends the list from `bd64c7b` to `4fc06ea`: one new row (`thread_store.rs`), "Changed again in `4fc06ea`" paragraphs for `subthreads.rs`, `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`, and the section "R9: children of unloaded parents (`4fc06ea`)". No row was marked reviewed by this update.
 
 Changed again in the update that extends the list from `4fc06ea` to `93bd256`: no new row, "Changed again in `93bd256`" paragraphs for `sidebar.rs`, `sidebar_tests.rs`, `conversation_view.rs` and `agent_panel.rs`, and the "Last commit covered" line.
+
+Changed again in the update that extends the list from `93bd256` to `9f557b7`: five new rows (`connection.rs`, `entry_view_state.rs`, `model_display_name.rs`, `orchestration_attribution.rs`, `orchestration_models.rs`), "Changed again in `9f557b7`" paragraphs for the other files of the commit, the section "R2, R9, R11: models, uniform rows and From/To blocks (`9f557b7`)" and the "Last commit covered" line. No row was marked reviewed by this update.
