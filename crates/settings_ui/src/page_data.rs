@@ -9102,7 +9102,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 12] {
+    fn general_section() -> [SettingsPageItem; 13] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9270,6 +9270,33 @@ fn ai_page(cx: &App) -> SettingsPage {
                             .orchestration
                             .get_or_insert_default()
                             .enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Human Intervention Summary Length",
+                description: "Maximum length, in characters, of the summary that tells an orchestrator a human intervened in one of its child threads.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.orchestration.human_summary_max_chars"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .orchestration
+                            .as_ref()?
+                            .human_summary_max_chars
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .orchestration
+                            .get_or_insert_default()
+                            .human_summary_max_chars = value;
                     },
                 }),
                 metadata: None,

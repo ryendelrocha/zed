@@ -4,9 +4,10 @@ use crate::{
     DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
     FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
     ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SendToChildTool, SpawnAgentTool, StartChildTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    RenameTool, SandboxedTerminalTool, SendToChildTool, SendToParentTool, SpawnAgentTool,
+    StartChildTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, WebSearchTool, WhoAmITool, WriteFileTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
@@ -2418,7 +2419,9 @@ impl Thread {
             self.add_tool(AwaitChildrenTool::new(session_id.clone()));
             self.add_tool(ChildStatusTool::new(session_id.clone()));
             self.add_tool(SendToChildTool::new(session_id.clone()));
-            self.add_tool(CancelChildTool::new(session_id));
+            self.add_tool(CancelChildTool::new(session_id.clone()));
+            self.add_tool(SendToParentTool::new(session_id.clone()));
+            self.add_tool(WhoAmITool::new(session_id));
         }
     }
 
@@ -4630,7 +4633,7 @@ impl Thread {
             .filter(|(tool_name, _)| crate::tools::tool_feature_flag_enabled(tool_name, cx))
             .filter(|(tool_name, _)| {
                 !crate::tools::is_orchestration_tool(tool_name)
-                    || crate::tools::orchestration_available(&self.id.0, cx)
+                    || crate::tools::orchestration_tool_available(tool_name, &self.id.0, cx)
             })
             .collect::<BTreeMap<_, _>>();
 
@@ -7718,7 +7721,7 @@ mod tests {
         assert_eq!(orchestration_tools(cx), 0);
 
         // Setting on and a host owns the session.
-        struct SessionHost(String);
+        struct SessionHost(String, orchestration::ThreadId);
         impl orchestration::OrchestrationHost for SessionHost {
             fn start_child(
                 &self,
@@ -7752,18 +7755,53 @@ mod tests {
                 session_id: &str,
                 _: &App,
             ) -> Option<orchestration::ThreadId> {
-                (session_id == self.0).then(orchestration::ThreadId::new)
+                (session_id == self.0).then_some(self.1)
             }
             fn owns_thread(&self, _: orchestration::ThreadId, _: &App) -> bool {
                 false
             }
         }
+        let thread_id = orchestration::ThreadId::new();
         cx.update(|cx| {
             orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, _| {
-                registry.register_host(Rc::new(SessionHost(session_id)));
+                registry.register_host(Rc::new(SessionHost(session_id, thread_id)));
             });
         });
-        assert_eq!(orchestration_tools(cx), 5);
+        // Every orchestration tool except `send_to_parent`: nobody started
+        // this thread, so it has no orchestrator to write to.
+        assert_eq!(orchestration_tools(cx), 6);
+        let tool_names = cx.update(|cx| {
+            thread
+                .read(cx)
+                .enabled_tools(cx)
+                .keys()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert!(tool_names.contains(&"whoami".to_string()));
+        assert!(!tool_names.contains(&"send_to_parent".to_string()));
+
+        // Once an orchestrator has started the thread, `send_to_parent` appears.
+        let log_dir = std::env::temp_dir().join("zed-orchestration-tool-gating-test");
+        cx.update(|cx| {
+            orchestration::OrchestrationRegistry::global_or_init(cx).update(cx, |registry, cx| {
+                registry.register_child(
+                    orchestration::ThreadId::new(),
+                    orchestration::NewChild {
+                        child_id: thread_id,
+                        title: "child".into(),
+                        agent_id: "zed-agent".into(),
+                        model: None,
+                        log_dir: log_dir.clone(),
+                        prompt: "prompt".into(),
+                        orchestrator_title: "orchestrator".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        assert_eq!(orchestration_tools(cx), 7);
+        std::fs::remove_dir_all(&log_dir).ok();
 
         // Setting off again hides them even with a host.
         set_enabled(false, cx);

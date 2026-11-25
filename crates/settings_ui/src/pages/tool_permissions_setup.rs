@@ -1433,6 +1433,8 @@ mod tests {
             "child_status",
             "send_to_child",
             "cancel_child",
+            "send_to_parent",
+            "whoami",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

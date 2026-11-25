@@ -11,10 +11,16 @@ use gpui::{
 use settings::SettingsStore;
 
 use crate::{
-    AwaitChildrenInput, AwaitChildrenOutput, ChildLog, ChildResult, ChildStatus, ChildStatusInfo,
-    ChildStatusInput, ChildStatusOutput, DEFAULT_AWAIT_TIMEOUT_SECS, LogDirection,
-    MAX_AWAIT_TIMEOUT_SECS, OrchestrationHost, ThreadId, log_dir_from_setting,
+    AwaitChildrenInput, AwaitChildrenOutput, ChildLog, ChildReference, ChildResult, ChildStatus,
+    ChildStatusInfo, ChildStatusInput, ChildStatusOutput, DEFAULT_AWAIT_TIMEOUT_SECS,
+    HumanIntervention, HumanSummaryRequest, LogDirection, MAX_AWAIT_TIMEOUT_SECS,
+    OrchestrationHost, PendingMessage, SendToParentInput, SendToParentOutput, ThreadId,
+    ThreadReference, ThreadRole, WhoAmIOutput, human_summary_fallback, log_dir_from_setting,
+    truncate_summary, urgent_message_prefix,
 };
+
+/// Default of `agent.orchestration.human_summary_max_chars`.
+pub const DEFAULT_HUMAN_SUMMARY_MAX_CHARS: usize = 600;
 
 /// What the registry needs to start tracking a child.
 pub struct NewChild {
@@ -28,6 +34,9 @@ pub struct NewChild {
     /// The child's first message, written to its log as the first `to_child`
     /// line.
     pub prompt: String,
+    /// Title of the orchestrator thread when the child started, for the child's
+    /// `whoami` when the live title is not available.
+    pub orchestrator_title: String,
 }
 
 /// The orchestrator's view of one child. It never holds the child's
@@ -44,11 +53,59 @@ pub struct ChildRecord {
     pub turns: u32,
     pub last_activity: DateTime<Utc>,
     pub log_path: PathBuf,
+    pub orchestrator_title: String,
     log: ChildLog,
     status_sender: watch::Sender<ChildStatus>,
+    /// What the child sent with `send_to_parent`.
+    inbox: Vec<InboxMessage>,
+    /// Counts the urgent messages, so `await_children` can wake on a new one.
+    urgent_count: u32,
+    urgent_sender: watch::Sender<u32>,
+    /// Human-driven turns since the last summary. The human's messages
+    /// themselves are never stored.
+    human_turns: u32,
+    /// Index of the first thread entry the next summary covers.
+    human_cursor: Option<usize>,
+    /// User messages the orchestrator sent after `human_cursor`, so the
+    /// summary does not credit them to the human.
+    orchestrator_entries: Vec<usize>,
+    /// Summaries the orchestrator has not read yet.
+    interventions: Vec<HumanIntervention>,
+}
+
+struct InboxMessage {
+    id: u64,
+    sent_at: DateTime<Utc>,
+    text: String,
+    urgent: bool,
+    /// Seen by the orchestrator, through `pending_messages` or as a message
+    /// in its thread.
+    delivered: bool,
 }
 
 impl ChildRecord {
+    fn has_undelivered_urgent(&self) -> bool {
+        self.inbox
+            .iter()
+            .any(|message| message.urgent && !message.delivered)
+    }
+
+    /// The messages the orchestrator has not seen. Each is returned once.
+    fn take_pending_messages(&mut self) -> Vec<PendingMessage> {
+        self.inbox
+            .iter_mut()
+            .filter(|message| !message.delivered)
+            .map(|message| {
+                message.delivered = true;
+                PendingMessage {
+                    message: message.text.clone(),
+                    sent_at: message.sent_at.to_rfc3339(),
+                    urgent: message.urgent,
+                }
+            })
+            .collect()
+    }
+
     /// A receiver that observes every status change of this child.
     pub fn subscribe_status(&self) -> watch::Receiver<ChildStatus> {
         self.status_sender.receiver()
@@ -81,6 +138,21 @@ pub fn orchestration_log_dir(cx: &App) -> PathBuf {
     log_dir_from_setting(log_dir)
 }
 
+/// The cap on the length of human-intervention summaries, from
+/// `agent.orchestration.human_summary_max_chars`.
+pub fn human_summary_max_chars(cx: &App) -> usize {
+    cx.try_global::<SettingsStore>()
+        .and_then(|store| {
+            store
+                .merged_settings()
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.orchestration.as_ref())
+                .and_then(|orchestration| orchestration.human_summary_max_chars)
+        })
+        .unwrap_or(DEFAULT_HUMAN_SUMMARY_MAX_CHARS)
+}
+
 /// Tracks every child of every orchestrator in the app.
 ///
 /// It is also where callers learn who they are acting for: a token minted
@@ -96,6 +168,7 @@ pub struct OrchestrationRegistry {
     /// knows only the session id. See [`Self::resolve_caller`].
     session_tokens: HashMap<String, Option<String>>,
     hosts: Vec<Rc<dyn OrchestrationHost>>,
+    next_message_id: u64,
 }
 
 impl EventEmitter<OrchestrationRegistryEvent> for OrchestrationRegistry {}
@@ -251,6 +324,7 @@ impl OrchestrationRegistry {
             ChildStatus::Starting,
         );
         let (status_sender, _) = watch::channel(ChildStatus::Starting);
+        let (urgent_sender, _) = watch::channel(0);
         let child_id = child.child_id;
         self.children
             .entry(orchestrator)
@@ -265,8 +339,16 @@ impl OrchestrationRegistry {
                 turns: 0,
                 last_activity: Utc::now(),
                 log_path: log_path.clone(),
+                orchestrator_title: child.orchestrator_title,
                 log,
                 status_sender,
+                inbox: Vec::new(),
+                urgent_count: 0,
+                urgent_sender,
+                human_turns: 0,
+                human_cursor: None,
+                orchestrator_entries: Vec::new(),
+                interventions: Vec::new(),
             });
         cx.emit(OrchestrationRegistryEvent::ChildChanged {
             orchestrator,
@@ -418,17 +500,347 @@ impl OrchestrationRegistry {
             .find(|record| record.child_id == child)
     }
 
-    /// Metadata only: status, counters and times, never content.
-    pub fn child_status(
-        &self,
+    /// Records a message from `child` to its orchestrator: it goes to the
+    /// child's log and the orchestrator's inbox. Returns the orchestrator.
+    pub fn record_message_from_child(
+        &mut self,
+        child: ThreadId,
+        text: &str,
+        urgent: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<ThreadId> {
+        let orchestrator = self.orchestrator_of(child).ok_or_else(|| {
+            anyhow!(
+                "This thread has no orchestrator, so there is nobody to send a message to. \
+                 Reply in your own chat instead."
+            )
+        })?;
+        let id = self.next_message_id;
+        self.next_message_id += 1;
+        let record = self
+            .child_mut(orchestrator, child)
+            .ok_or_else(|| anyhow!("This thread is no longer tracked by its orchestrator."))?;
+        log_exchange(&record.log, LogDirection::ToParent, text, record.status);
+        record.inbox.push(InboxMessage {
+            id,
+            sent_at: Utc::now(),
+            text: text.to_string(),
+            urgent,
+            delivered: false,
+        });
+        if urgent {
+            record.urgent_count += 1;
+            let count = record.urgent_count;
+            record.urgent_sender.send(count).ok();
+        }
+        record.last_activity = Utc::now();
+        cx.emit(OrchestrationRegistryEvent::ChildChanged {
+            orchestrator,
+            child,
+        });
+        cx.notify();
+        Ok(orchestrator)
+    }
+
+    /// Notes that the human wrote in `child` directly. Only a counter and the
+    /// position of the first affected thread entry are kept: the human's
+    /// message is neither logged nor forwarded. A thread that is not a child
+    /// is ignored.
+    pub fn note_human_turn(&mut self, child: ThreadId, first_entry: usize) {
+        let Some(orchestrator) = self.orchestrator_of(child) else {
+            return;
+        };
+        if let Some(record) = self.child_mut(orchestrator, child) {
+            record.human_turns += 1;
+            record.human_cursor.get_or_insert(first_entry);
+        }
+    }
+
+    /// Notes that the orchestrator sent `child` a message while a human
+    /// intervention is waiting for its summary.
+    pub fn note_orchestrator_turn(&mut self, child: ThreadId, entry: usize) {
+        let Some(orchestrator) = self.orchestrator_of(child) else {
+            return;
+        };
+        if let Some(record) = self.child_mut(orchestrator, child)
+            && record.human_cursor.is_some()
+        {
+            record.orchestrator_entries.push(entry);
+        }
+    }
+
+    /// Human-driven turns of `child` that no summary covers yet.
+    pub fn pending_human_turns(&self, child: ThreadId) -> u32 {
+        self.orchestrator_of(child)
+            .and_then(|orchestrator| self.child(orchestrator, child))
+            .map_or(0, |record| record.human_turns)
+    }
+
+    fn record_human_intervention(
+        &mut self,
         orchestrator: ThreadId,
-        input: &ChildStatusInput,
-    ) -> Result<ChildStatusOutput> {
+        child: ThreadId,
+        turns: u32,
+        summary: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.child_mut(orchestrator, child) else {
+            return;
+        };
+        log_exchange(
+            &record.log,
+            LogDirection::HumanIntervention,
+            &summary,
+            record.status,
+        );
+        record.interventions.push(HumanIntervention {
+            summary,
+            turns,
+            summarized_at: Utc::now().to_rfc3339(),
+        });
+        cx.emit(OrchestrationRegistryEvent::ChildChanged {
+            orchestrator,
+            child,
+        });
+        cx.notify();
+    }
+
+    /// The role of `thread`, its orchestrator and its children.
+    pub fn whoami(&self, thread: ThreadId, cx: &App) -> WhoAmIOutput {
         let children = self
-            .resolve_child_ids(orchestrator, &input.child_ids)?
+            .children(thread)
+            .iter()
+            .map(|record| ChildReference {
+                id: record.child_id.to_key_string(),
+                title: record.title.to_string(),
+                status: record.status,
+            })
+            .collect::<Vec<_>>();
+        let parent = self.orchestrator_of(thread).map(|parent| {
+            let live_title = self
+                .host_for_thread(parent, cx)
+                .and_then(|host| host.thread_title(parent, cx));
+            let title = live_title
+                .or_else(|| {
+                    self.child(parent, thread)
+                        .map(|record| record.orchestrator_title.clone())
+                })
+                .unwrap_or_default();
+            ThreadReference {
+                id: parent.to_key_string(),
+                title,
+            }
+        });
+        let role = match (parent.is_some(), !children.is_empty()) {
+            (true, true) => ThreadRole::Both,
+            (true, false) => ThreadRole::Child,
+            (false, true) => ThreadRole::Orchestrator,
+            (false, false) => ThreadRole::None,
+        };
+        WhoAmIOutput {
+            role,
+            parent,
+            children,
+        }
+    }
+
+    /// `send_to_parent`: records the message and, when it is urgent, tries to
+    /// put it in the orchestrator's thread right away.
+    pub fn send_to_parent(
+        registry: &Entity<Self>,
+        caller: ThreadId,
+        input: SendToParentInput,
+        cx: &mut App,
+    ) -> Result<SendToParentOutput> {
+        let message = input.message.trim();
+        if message.is_empty() {
+            return Err(anyhow!("`message` is empty."));
+        }
+        let orchestrator = registry.update(cx, |registry, cx| {
+            registry.record_message_from_child(caller, message, input.urgent, cx)
+        })?;
+        if input.urgent {
+            Self::flush_urgent(registry, orchestrator, cx);
+        }
+        let parent_title = registry
+            .read(cx)
+            .whoami(caller, cx)
+            .parent
+            .map(|parent| parent.title)
+            .unwrap_or_default();
+        Ok(SendToParentOutput {
+            parent_id: orchestrator.to_key_string(),
+            parent_title,
+            urgent: input.urgent,
+        })
+    }
+
+    /// Delivers the urgent messages that wait for `orchestrator` as one new
+    /// message in its thread, but only when the thread is idle. A running turn
+    /// is never interrupted: callers retry when the orchestrator stops.
+    pub fn flush_urgent(registry: &Entity<Self>, orchestrator: ThreadId, cx: &mut App) {
+        let Some(host) = registry.read(cx).host_for_thread(orchestrator, cx) else {
+            return;
+        };
+        if !host.is_thread_idle(orchestrator, cx) {
+            return;
+        }
+        let (text, delivered_ids) = registry.update(cx, |registry, _| {
+            let mut parts = Vec::new();
+            let mut ids = Vec::new();
+            for record in registry
+                .children
+                .get_mut(&orchestrator)
+                .into_iter()
+                .flatten()
+            {
+                let prefix = urgent_message_prefix(&record.title);
+                for message in record
+                    .inbox
+                    .iter_mut()
+                    .filter(|message| message.urgent && !message.delivered)
+                {
+                    message.delivered = true;
+                    ids.push(message.id);
+                    parts.push(format!("{prefix} {}", message.text));
+                }
+            }
+            (parts.join("\n\n"), ids)
+        });
+        if delivered_ids.is_empty() {
+            return;
+        }
+        let delivery = host.deliver_message(orchestrator, text, cx);
+        let registry = registry.downgrade();
+        cx.spawn(async move |cx| {
+            if let Err(error) = delivery.await {
+                log::error!("failed to deliver an urgent child message: {error:#}");
+                // Back to undelivered, so `pending_messages` still returns it.
+                registry
+                    .update(cx, |registry, _| {
+                        for record in registry
+                            .children
+                            .get_mut(&orchestrator)
+                            .into_iter()
+                            .flatten()
+                        {
+                            for message in &mut record.inbox {
+                                if delivered_ids.contains(&message.id) {
+                                    message.delivered = false;
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Writes one summary for each requested child that has human-driven turns
+    /// no summary covers yet. This is the only place a summary is generated,
+    /// so a model is never called when the orchestrator does not ask.
+    fn collect_human_interventions(
+        registry: &Entity<Self>,
+        orchestrator: ThreadId,
+        children: &[ThreadId],
+        cx: &mut App,
+    ) -> Task<()> {
+        let pending = registry.update(cx, |registry, _| {
+            children
+                .iter()
+                .filter_map(|child| {
+                    let record = registry.child_mut(orchestrator, *child)?;
+                    if record.human_turns == 0 {
+                        return None;
+                    }
+                    let request = (
+                        *child,
+                        record.human_turns,
+                        record.human_cursor.unwrap_or_default(),
+                        std::mem::take(&mut record.orchestrator_entries),
+                    );
+                    // Turns that happen while the summary is written count
+                    // toward the next one.
+                    record.human_turns = 0;
+                    record.human_cursor = None;
+                    Some(request)
+                })
+                .collect::<Vec<_>>()
+        });
+        if pending.is_empty() {
+            return Task::ready(());
+        }
+        let max_chars = human_summary_max_chars(cx);
+        let jobs = pending
             .into_iter()
-            .filter_map(|child| self.child(orchestrator, child))
-            .map(|record| ChildStatusInfo {
+            .map(|(child, turns, from_entry, orchestrator_entries)| {
+                let host = registry.read(cx).host_for_thread(child, cx);
+                let summary = host.map(|host| {
+                    host.summarize_human_interventions(
+                        HumanSummaryRequest {
+                            child,
+                            turns,
+                            from_entry,
+                            orchestrator_entries,
+                            max_chars,
+                        },
+                        cx,
+                    )
+                });
+                (child, turns, summary)
+            })
+            .collect::<Vec<_>>();
+        let registry = registry.downgrade();
+        cx.spawn(async move |cx| {
+            let summaries =
+                future::join_all(jobs.into_iter().map(|(child, turns, summary)| async move {
+                    let text = match summary {
+                        None => format!(
+                            "A human intervened in {turns} turn(s); the child thread is closed, \
+                             so no summary could be written."
+                        ),
+                        Some(task) => match task.await {
+                            Ok(Some(text)) if !text.trim().is_empty() => {
+                                truncate_summary(&text, max_chars)
+                            }
+                            Ok(_) => human_summary_fallback(turns),
+                            Err(error) => {
+                                log::error!("failed to summarize a human intervention: {error:#}");
+                                format!(
+                                    "A human intervened in {turns} turn(s); the summary could \
+                                     not be written."
+                                )
+                            }
+                        },
+                    };
+                    (child, turns, text)
+                }))
+                .await;
+            registry
+                .update(cx, |registry, cx| {
+                    for (child, turns, text) in summaries {
+                        registry.record_human_intervention(orchestrator, child, turns, text, cx);
+                    }
+                })
+                .ok();
+        })
+    }
+
+    /// Status, counters and times, never the child's content. It also hands
+    /// over the messages and human-intervention summaries the orchestrator has
+    /// not seen yet.
+    fn take_child_status(
+        &mut self,
+        orchestrator: ThreadId,
+        children: &[ThreadId],
+    ) -> Vec<ChildStatusInfo> {
+        let mut infos = Vec::new();
+        for child in children {
+            let Some(record) = self.child_mut(orchestrator, *child) else {
+                continue;
+            };
+            infos.push(ChildStatusInfo {
                 child_id: record.child_id.to_key_string(),
                 title: record.title.to_string(),
                 agent: record.agent_id.clone(),
@@ -436,9 +848,35 @@ impl OrchestrationRegistry {
                 status: record.status,
                 turns: record.turns,
                 last_activity: record.last_activity.to_rfc3339(),
-            })
-            .collect();
-        Ok(ChildStatusOutput { children })
+                pending_messages: record.take_pending_messages(),
+                human_interventions: std::mem::take(&mut record.interventions),
+            });
+        }
+        infos
+    }
+
+    pub fn child_status_with_summaries(
+        registry: &Entity<Self>,
+        orchestrator: ThreadId,
+        input: ChildStatusInput,
+        cx: &mut App,
+    ) -> Task<Result<ChildStatusOutput>> {
+        let child_ids = match registry
+            .read(cx)
+            .resolve_child_ids(orchestrator, &input.child_ids)
+        {
+            Ok(child_ids) => child_ids,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let summaries = Self::collect_human_interventions(registry, orchestrator, &child_ids, cx);
+        let registry = registry.downgrade();
+        cx.spawn(async move |cx| {
+            summaries.await;
+            let children = registry.update(cx, |registry, _| {
+                registry.take_child_status(orchestrator, &child_ids)
+            })?;
+            Ok(ChildStatusOutput { children })
+        })
     }
 
     /// Waits until each requested child is in a terminal state, or until the
@@ -446,25 +884,35 @@ impl OrchestrationRegistry {
     ///
     /// Children that already finished return at once. Children that are
     /// still running when the timeout expires come back with their current
-    /// status and no message, and `timed_out` set.
+    /// status and no message, and `timed_out` set. A child that sends an urgent
+    /// message wakes the wait early: the orchestrator is blocked in this call,
+    /// so it could not see the message any other way.
     pub fn await_children(
         registry: &Entity<Self>,
         orchestrator: ThreadId,
         input: AwaitChildrenInput,
         cx: &mut App,
     ) -> Task<Result<AwaitChildrenOutput>> {
-        let (child_ids, receivers) = {
+        let (child_ids, receivers, urgent_receivers, urgent_waiting) = {
             let this = registry.read(cx);
             let child_ids = match this.resolve_child_ids(orchestrator, &input.child_ids) {
                 Ok(child_ids) => child_ids,
                 Err(error) => return Task::ready(Err(error)),
             };
-            let receivers = child_ids
+            let records = child_ids
                 .iter()
                 .filter_map(|child| this.child(orchestrator, *child))
-                .map(ChildRecord::subscribe_status)
                 .collect::<Vec<_>>();
-            (child_ids, receivers)
+            let receivers = records
+                .iter()
+                .map(|record| record.subscribe_status())
+                .collect::<Vec<_>>();
+            let urgent_receivers = records
+                .iter()
+                .map(|record| record.urgent_sender.receiver())
+                .collect::<Vec<_>>();
+            let urgent_waiting = records.iter().any(|record| record.has_undelivered_urgent());
+            (child_ids, receivers, urgent_receivers, urgent_waiting)
         };
         let timeout = Duration::from_secs(
             input
@@ -473,20 +921,43 @@ impl OrchestrationRegistry {
                 .min(MAX_AWAIT_TIMEOUT_SECS),
         );
         let timer = cx.background_executor().timer(timeout);
+        let registry_handle = registry.clone();
         let registry = registry.downgrade();
 
         cx.spawn(async move |cx| {
-            let all_finished =
-                future::join_all(receivers.into_iter().map(wait_until_terminal)).map(|_| ());
-            let timed_out = match future::select(Box::pin(all_finished), Box::pin(timer)).await {
-                future::Either::Left(_) => false,
-                future::Either::Right(_) => true,
-            };
-            registry.read_with(cx, |registry, _| {
-                let children = child_ids
-                    .iter()
-                    .filter_map(|child| registry.child(orchestrator, *child))
-                    .map(|record| ChildResult {
+            let mut timed_out = false;
+            if !urgent_waiting {
+                let all_finished =
+                    future::join_all(receivers.into_iter().map(wait_until_terminal)).map(|_| ());
+                let urgent_or_timeout = async {
+                    match future::select(
+                        Box::pin(wait_for_urgent(urgent_receivers)),
+                        Box::pin(timer),
+                    )
+                    .await
+                    {
+                        future::Either::Left(_) => false,
+                        future::Either::Right(_) => true,
+                    }
+                };
+                timed_out =
+                    match future::select(Box::pin(all_finished), Box::pin(urgent_or_timeout)).await
+                    {
+                        future::Either::Left(_) => false,
+                        future::Either::Right((timed_out, _)) => timed_out,
+                    };
+            }
+            let summaries = cx.update(|cx| {
+                Self::collect_human_interventions(&registry_handle, orchestrator, &child_ids, cx)
+            });
+            summaries.await;
+            registry.update(cx, |registry, _| {
+                let mut children = Vec::new();
+                for child in &child_ids {
+                    let Some(record) = registry.child_mut(orchestrator, *child) else {
+                        continue;
+                    };
+                    children.push(ChildResult {
                         child_id: record.child_id.to_key_string(),
                         title: record.title.to_string(),
                         status: record.status,
@@ -495,8 +966,10 @@ impl OrchestrationRegistry {
                             .is_terminal()
                             .then(|| record.final_message.clone())
                             .flatten(),
-                    })
-                    .collect::<Vec<_>>();
+                        pending_messages: record.take_pending_messages(),
+                        human_interventions: std::mem::take(&mut record.interventions),
+                    });
+                }
                 let timed_out =
                     timed_out && children.iter().any(|child| !child.status.is_terminal());
                 AwaitChildrenOutput {
@@ -516,6 +989,23 @@ impl ChildRecord {
         // value is stored either way, so later subscribers still see it.
         self.status_sender.send(status).ok();
     }
+}
+
+/// Completes when any of the children sends an urgent message. Never
+/// completes when there is nobody to wait on.
+async fn wait_for_urgent(receivers: Vec<watch::Receiver<u32>>) {
+    let waits = receivers.into_iter().map(|mut receiver| {
+        Box::pin(async move {
+            // A dropped sender means the child was forgotten, not a message.
+            if receiver.changed().await.is_err() {
+                future::pending::<()>().await;
+            }
+        })
+    });
+    if waits.len() == 0 {
+        return future::pending().await;
+    }
+    future::select_all(waits).await;
 }
 
 async fn wait_until_terminal(mut receiver: watch::Receiver<ChildStatus>) {
@@ -548,6 +1038,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use gpui::BorrowAppContext as _;
     use gpui::TestAppContext;
 
     fn new_child(log_dir: &Path, title: &str) -> NewChild {
@@ -558,6 +1049,7 @@ mod tests {
             model: None,
             log_dir: log_dir.to_path_buf(),
             prompt: format!("prompt for {title}"),
+            orchestrator_title: "orchestrator".to_string(),
         }
     }
 
@@ -815,7 +1307,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_child_status_returns_metadata_only(cx: &mut TestAppContext) {
+    async fn test_child_status_returns_metadata_only(cx: &mut TestAppContext) {
         let registry = init_registry(cx);
         let directory = tempfile::tempdir().unwrap();
         let orchestrator = ThreadId::new();
@@ -830,11 +1322,17 @@ mod tests {
             );
         });
 
-        let output = registry.read_with(cx, |registry, _| {
-            registry
-                .child_status(orchestrator, &ChildStatusInput::default())
-                .unwrap()
-        });
+        let output = cx
+            .update(|cx| {
+                OrchestrationRegistry::child_status_with_summaries(
+                    &registry,
+                    orchestrator,
+                    ChildStatusInput::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
         assert_eq!(output.children.len(), 1);
         assert_eq!(output.children[0].status, ChildStatus::Completed);
         assert_eq!(output.children[0].turns, 1);
@@ -920,5 +1418,635 @@ mod tests {
             assert!(registry.children(orchestrator).is_empty());
             assert_eq!(registry.resolve_token(&token), None);
         });
+    }
+
+    use crate::{
+        AvailableAgents, CancelChildInput, CancelChildOutput, SendToChildInput, SendToChildOutput,
+        StartChildOutput, child_header, human_summary_prompt,
+    };
+    use std::cell::{Cell, RefCell};
+
+    /// A host that owns some threads, reports whether they are idle, and
+    /// records what it is asked to deliver and to summarize.
+    #[derive(Default)]
+    struct TestHost {
+        owned: RefCell<Vec<ThreadId>>,
+        idle: Cell<bool>,
+        delivered: RefCell<Vec<(ThreadId, String)>>,
+        summary_requests: RefCell<Vec<HumanSummaryRequest>>,
+        summary: RefCell<Option<String>>,
+    }
+
+    impl OrchestrationHost for TestHost {
+        fn start_child(
+            &self,
+            _: ThreadId,
+            _: crate::StartChildInput,
+            _: &mut App,
+        ) -> Task<Result<StartChildOutput>> {
+            Task::ready(Err(anyhow!("unused")))
+        }
+
+        fn send_to_child(
+            &self,
+            _: ThreadId,
+            _: SendToChildInput,
+            _: &mut App,
+        ) -> Task<Result<SendToChildOutput>> {
+            Task::ready(Err(anyhow!("unused")))
+        }
+
+        fn cancel_child(
+            &self,
+            _: ThreadId,
+            _: CancelChildInput,
+            _: &mut App,
+        ) -> Task<Result<CancelChildOutput>> {
+            Task::ready(Err(anyhow!("unused")))
+        }
+
+        fn list_available_agents(&self, _: &mut App) -> Result<AvailableAgents> {
+            Ok(AvailableAgents::default())
+        }
+
+        fn resolve_orchestrator(&self, _: &str, _: &App) -> Option<ThreadId> {
+            None
+        }
+
+        fn owns_thread(&self, thread_id: ThreadId, _: &App) -> bool {
+            self.owned.borrow().contains(&thread_id)
+        }
+
+        fn thread_title(&self, _: ThreadId, _: &App) -> Option<String> {
+            Some("Live orchestrator title".to_string())
+        }
+
+        fn is_thread_idle(&self, _: ThreadId, _: &App) -> bool {
+            self.idle.get()
+        }
+
+        fn deliver_message(&self, thread: ThreadId, text: String, _: &mut App) -> Task<Result<()>> {
+            self.delivered.borrow_mut().push((thread, text));
+            Task::ready(Ok(()))
+        }
+
+        fn summarize_human_interventions(
+            &self,
+            request: HumanSummaryRequest,
+            _: &mut App,
+        ) -> Task<Result<Option<String>>> {
+            self.summary_requests.borrow_mut().push(request);
+            Task::ready(Ok(self.summary.borrow().clone()))
+        }
+    }
+
+    fn setup_host(
+        registry: &Entity<OrchestrationRegistry>,
+        threads: &[ThreadId],
+        cx: &mut TestAppContext,
+    ) -> Rc<TestHost> {
+        let host = Rc::new(TestHost::default());
+        host.owned.borrow_mut().extend_from_slice(threads);
+        registry.update(cx, |registry, _| registry.register_host(host.clone()));
+        host
+    }
+
+    async fn status_of(
+        registry: &Entity<OrchestrationRegistry>,
+        orchestrator: ThreadId,
+        cx: &mut TestAppContext,
+    ) -> Vec<ChildStatusInfo> {
+        let task = cx.update(|cx| {
+            OrchestrationRegistry::child_status_with_summaries(
+                registry,
+                orchestrator,
+                ChildStatusInput::default(),
+                cx,
+            )
+        });
+        task.await.unwrap().children
+    }
+
+    fn log_entries(
+        directory: &Path,
+        orchestrator: ThreadId,
+        child: ThreadId,
+    ) -> Vec<(LogDirection, String)> {
+        ChildLog::new(directory, orchestrator, child)
+            .read()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.direction, entry.text))
+            .collect()
+    }
+
+    #[test]
+    fn test_child_header_names_the_orchestrator_and_the_tools() {
+        let header = child_header("Refactor billing");
+        assert!(header.contains("\"Refactor billing\""));
+        assert!(header.contains("final message goes back to the orchestrator automatically"));
+        assert!(header.contains("`send_to_parent`"));
+        assert!(header.contains("`whoami`"));
+    }
+
+    #[test]
+    fn test_truncate_summary_respects_the_cap() {
+        assert_eq!(truncate_summary("  short  ", 600), "short");
+        let long = "word ".repeat(400);
+        let cut = truncate_summary(&long, 600);
+        assert!(cut.chars().count() <= 600, "{}", cut.chars().count());
+        assert!(cut.ends_with('\u{2026}'));
+        // Multi-byte characters are counted as characters, not bytes.
+        let accents = "\u{e9}".repeat(50);
+        assert_eq!(truncate_summary(&accents, 10).chars().count(), 10);
+        assert_eq!(truncate_summary("anything", 0), "");
+        assert!(human_summary_prompt("t", 123).contains("123"));
+    }
+
+    #[gpui::test]
+    fn test_whoami_roles(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let root = ThreadId::new();
+        let middle = register(&registry, root, directory.path(), "middle", cx);
+        let leaf = register(&registry, middle, directory.path(), "leaf", cx);
+        let loner = ThreadId::new();
+        setup_host(&registry, &[root, middle, leaf], cx);
+
+        cx.update(|cx| {
+            let registry = registry.read(cx);
+            let whoami = registry.whoami(loner, cx);
+            assert_eq!(whoami.role, ThreadRole::None);
+            assert!(whoami.parent.is_none() && whoami.children.is_empty());
+
+            let whoami = registry.whoami(root, cx);
+            assert_eq!(whoami.role, ThreadRole::Orchestrator);
+            assert_eq!(whoami.children.len(), 1);
+            assert_eq!(whoami.children[0].id, middle.to_key_string());
+            assert_eq!(whoami.children[0].title, "middle");
+            assert_eq!(whoami.children[0].status, ChildStatus::Starting);
+
+            // A thread that started children and was started itself is both.
+            let whoami = registry.whoami(middle, cx);
+            assert_eq!(whoami.role, ThreadRole::Both);
+            let parent = whoami.parent.unwrap();
+            assert_eq!(parent.id, root.to_key_string());
+            assert_eq!(parent.title, "Live orchestrator title");
+            assert_eq!(whoami.children[0].id, leaf.to_key_string());
+
+            let whoami = registry.whoami(leaf, cx);
+            assert_eq!(whoami.role, ThreadRole::Child);
+            assert!(whoami.children.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn test_whoami_falls_back_to_the_title_stored_when_the_child_started(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        // No host owns the orchestrator.
+        cx.update(|cx| {
+            let whoami = registry.read(cx).whoami(child, cx);
+            assert_eq!(whoami.parent.unwrap().title, "orchestrator");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_send_to_parent_logs_fills_the_inbox_and_is_delivered_once(
+        cx: &mut TestAppContext,
+    ) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+
+        let output = cx
+            .update(|cx| {
+                OrchestrationRegistry::send_to_parent(
+                    &registry,
+                    child,
+                    SendToParentInput {
+                        message: "which schema do I use?".into(),
+                        urgent: false,
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(output.parent_id, orchestrator.to_key_string());
+        assert_eq!(output.parent_title, "Live orchestrator title");
+        assert!(!output.urgent);
+
+        let entries = log_entries(directory.path(), orchestrator, child);
+        assert_eq!(
+            entries.last(),
+            Some(&(LogDirection::ToParent, "which schema do I use?".to_string()))
+        );
+        // A message that is not urgent never reaches the orchestrator's thread.
+        assert!(host.delivered.borrow().is_empty());
+
+        let first = status_of(&registry, orchestrator, cx).await;
+        assert_eq!(first[0].pending_messages.len(), 1);
+        assert_eq!(
+            first[0].pending_messages[0].message,
+            "which schema do I use?"
+        );
+        assert!(!first[0].pending_messages[0].urgent);
+        // Returned once, then marked delivered.
+        let second = status_of(&registry, orchestrator, cx).await;
+        assert!(second[0].pending_messages.is_empty());
+
+        let task = cx.update(|cx| {
+            OrchestrationRegistry::send_to_parent(
+                &registry,
+                child,
+                SendToParentInput {
+                    message: "  ".into(),
+                    urgent: false,
+                },
+                cx,
+            )
+        });
+        assert!(task.is_err());
+    }
+
+    #[gpui::test]
+    fn test_send_to_parent_requires_an_orchestrator(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let error = cx
+            .update(|cx| {
+                OrchestrationRegistry::send_to_parent(
+                    &registry,
+                    ThreadId::new(),
+                    SendToParentInput {
+                        message: "hello".into(),
+                        urgent: true,
+                    },
+                    cx,
+                )
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("no orchestrator"), "{error}");
+    }
+
+    #[gpui::test]
+    async fn test_pending_messages_reach_await_children_once(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        setup_host(&registry, &[orchestrator, child], cx);
+        registry.update(cx, |registry, cx| {
+            registry.record_turn_finished(
+                orchestrator,
+                child,
+                ChildStatus::Completed,
+                Some("done".into()),
+                cx,
+            );
+        });
+        cx.update(|cx| {
+            OrchestrationRegistry::send_to_parent(
+                &registry,
+                child,
+                SendToParentInput {
+                    message: "note".into(),
+                    urgent: false,
+                },
+                cx,
+            )
+        })
+        .unwrap();
+
+        let await_once = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                OrchestrationRegistry::await_children(
+                    &registry,
+                    orchestrator,
+                    AwaitChildrenInput::default(),
+                    cx,
+                )
+            })
+        };
+        let first = await_once(cx).await.unwrap();
+        assert_eq!(first.children[0].final_message.as_deref(), Some("done"));
+        assert_eq!(first.children[0].pending_messages.len(), 1);
+        let second = await_once(cx).await.unwrap();
+        assert!(second.children[0].pending_messages.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_urgent_message_waits_for_an_idle_orchestrator(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        let send = |text: &str, urgent: bool, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                OrchestrationRegistry::send_to_parent(
+                    &registry,
+                    child,
+                    SendToParentInput {
+                        message: text.into(),
+                        urgent,
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        };
+
+        // The orchestrator is in the middle of a turn.
+        host.idle.set(false);
+        send("blocked: need the API key", true, cx);
+        cx.run_until_parked();
+        assert!(
+            host.delivered.borrow().is_empty(),
+            "a running turn must not receive anything"
+        );
+
+        // It stops: whoever watches it flushes, and the message arrives once.
+        host.idle.set(true);
+        cx.update(|cx| OrchestrationRegistry::flush_urgent(&registry, orchestrator, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *host.delivered.borrow(),
+            vec![(
+                orchestrator,
+                "[from child worker] blocked: need the API key".to_string()
+            )]
+        );
+        cx.update(|cx| OrchestrationRegistry::flush_urgent(&registry, orchestrator, cx));
+        assert_eq!(host.delivered.borrow().len(), 1);
+
+        // What was delivered as a message is not returned a second time.
+        assert!(
+            status_of(&registry, orchestrator, cx).await[0]
+                .pending_messages
+                .is_empty()
+        );
+
+        // Idle orchestrator: an urgent message goes straight in.
+        send("second blocker", true, cx);
+        cx.run_until_parked();
+        assert_eq!(host.delivered.borrow().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_urgent_message_read_through_a_tool_is_not_delivered_again(
+        cx: &mut TestAppContext,
+    ) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        host.idle.set(false);
+        cx.update(|cx| {
+            OrchestrationRegistry::send_to_parent(
+                &registry,
+                child,
+                SendToParentInput {
+                    message: "need a decision".into(),
+                    urgent: true,
+                },
+                cx,
+            )
+        })
+        .unwrap();
+
+        let statuses = status_of(&registry, orchestrator, cx).await;
+        assert_eq!(statuses[0].pending_messages.len(), 1);
+        assert!(statuses[0].pending_messages[0].urgent);
+
+        host.idle.set(true);
+        cx.update(|cx| OrchestrationRegistry::flush_urgent(&registry, orchestrator, cx));
+        cx.run_until_parked();
+        assert!(host.delivered.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_urgent_message_wakes_await_children(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        host.idle.set(false);
+        registry.update(cx, |registry, cx| {
+            registry.set_status(orchestrator, child, ChildStatus::Running, cx);
+        });
+
+        let task = cx.update(|cx| {
+            OrchestrationRegistry::await_children(
+                &registry,
+                orchestrator,
+                AwaitChildrenInput::default(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            OrchestrationRegistry::send_to_parent(
+                &registry,
+                child,
+                SendToParentInput {
+                    message: "blocked".into(),
+                    urgent: true,
+                },
+                cx,
+            )
+        })
+        .unwrap();
+
+        let output = task.await.unwrap();
+        assert!(!output.timed_out);
+        assert_eq!(output.children[0].status, ChildStatus::Running);
+        assert_eq!(output.children[0].pending_messages[0].message, "blocked");
+        assert!(host.delivered.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn test_human_turns_are_neither_logged_nor_forwarded(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        host.idle.set(true);
+        let before = log_entries(directory.path(), orchestrator, child);
+
+        registry.update(cx, |registry, _| {
+            registry.note_human_turn(child, 4);
+            registry.note_human_turn(child, 9);
+            // A thread that is not a child is ignored.
+            registry.note_human_turn(orchestrator, 0);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(log_entries(directory.path(), orchestrator, child), before);
+        assert!(host.delivered.borrow().is_empty());
+        assert!(host.summary_requests.borrow().is_empty());
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(registry.pending_human_turns(child), 2);
+            assert_eq!(registry.pending_human_turns(orchestrator), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_summary_is_generated_on_demand_and_covers_all_human_turns(
+        cx: &mut TestAppContext,
+    ) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        *host.summary.borrow_mut() =
+            Some("A human intervened and switched the child to tabs, to match the repo.".into());
+
+        registry.update(cx, |registry, _| {
+            // An orchestrator message before the first human turn is outside
+            // the summary's range and is not tracked.
+            registry.note_orchestrator_turn(child, 1);
+            registry.note_human_turn(child, 3);
+            registry.note_orchestrator_turn(child, 5);
+            registry.note_human_turn(child, 6);
+            registry.note_human_turn(child, 9);
+        });
+        // Nothing asked yet: no model call.
+        cx.run_until_parked();
+        assert!(host.summary_requests.borrow().is_empty());
+
+        let statuses = status_of(&registry, orchestrator, cx).await;
+        let requests = host.summary_requests.borrow();
+        assert_eq!(requests.len(), 1, "three human turns make one summary");
+        assert_eq!(requests[0].child, child);
+        assert_eq!(requests[0].turns, 3);
+        assert_eq!(requests[0].from_entry, 3);
+        assert_eq!(requests[0].orchestrator_entries, vec![5]);
+        assert_eq!(requests[0].max_chars, DEFAULT_HUMAN_SUMMARY_MAX_CHARS);
+
+        let interventions = &statuses[0].human_interventions;
+        assert_eq!(interventions.len(), 1);
+        assert_eq!(interventions[0].turns, 3);
+        assert!(
+            interventions[0]
+                .summary
+                .contains("switched the child to tabs")
+        );
+        assert_eq!(
+            log_entries(directory.path(), orchestrator, child).last(),
+            Some(&(
+                LogDirection::HumanIntervention,
+                interventions[0].summary.clone()
+            ))
+        );
+        drop(requests);
+
+        // Returned once, and a later call does not summarize again.
+        let again = status_of(&registry, orchestrator, cx).await;
+        assert!(again[0].human_interventions.is_empty());
+        assert_eq!(host.summary_requests.borrow().len(), 1);
+
+        // The next summary starts after the previous one.
+        registry.update(cx, |registry, _| registry.note_human_turn(child, 12));
+        let next = status_of(&registry, orchestrator, cx).await;
+        assert_eq!(next[0].human_interventions[0].turns, 1);
+        assert_eq!(host.summary_requests.borrow()[1].from_entry, 12);
+    }
+
+    #[gpui::test]
+    async fn test_summary_reaches_await_children(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        *host.summary.borrow_mut() = Some("A human adjusted the plan.".into());
+        registry.update(cx, |registry, cx| {
+            registry.note_human_turn(child, 1);
+            registry.record_turn_finished(
+                orchestrator,
+                child,
+                ChildStatus::Completed,
+                Some("done".into()),
+                cx,
+            );
+        });
+        let output = cx
+            .update(|cx| {
+                OrchestrationRegistry::await_children(
+                    &registry,
+                    orchestrator,
+                    AwaitChildrenInput::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            output.children[0].human_interventions[0].summary,
+            "A human adjusted the plan."
+        );
+    }
+
+    #[gpui::test]
+    async fn test_summary_is_capped_by_the_setting(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .orchestration
+                        .get_or_insert_default()
+                        .human_summary_max_chars = Some(80);
+                });
+            });
+            assert_eq!(human_summary_max_chars(cx), 80);
+        });
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        let host = setup_host(&registry, &[orchestrator, child], cx);
+        *host.summary.borrow_mut() = Some("The human changed the approach. ".repeat(40));
+        registry.update(cx, |registry, _| registry.note_human_turn(child, 0));
+
+        let statuses = status_of(&registry, orchestrator, cx).await;
+        assert_eq!(host.summary_requests.borrow()[0].max_chars, 80);
+        let summary = &statuses[0].human_interventions[0].summary;
+        assert!(summary.chars().count() <= 80, "{}", summary.chars().count());
+    }
+
+    #[gpui::test]
+    async fn test_summary_without_a_model_is_a_minimal_note(cx: &mut TestAppContext) {
+        let registry = init_registry(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let orchestrator = ThreadId::new();
+        let child = register(&registry, orchestrator, directory.path(), "worker", cx);
+        // The host has no summary model: it answers `None`.
+        setup_host(&registry, &[orchestrator, child], cx);
+        registry.update(cx, |registry, _| {
+            registry.note_human_turn(child, 0);
+            registry.note_human_turn(child, 2);
+        });
+
+        let statuses = status_of(&registry, orchestrator, cx).await;
+        assert_eq!(
+            statuses[0].human_interventions[0].summary,
+            "A human intervened in 2 turns; no summary model configured."
+        );
+        assert_eq!(
+            human_summary_fallback(1),
+            "A human intervened in 1 turn; no summary model configured."
+        );
     }
 }

@@ -285,6 +285,30 @@ Open the Settings Editor and search for “Orchestration Tools”. Or add this t
 }
 ```
 
+### Human Intervention Summary Length {#agent-orchestration-human-summary-max-chars}
+
+- Description: Maximum length, in characters, of the summary that tells an orchestrator that a human intervened in one of its child threads.
+- Setting: `agent.orchestration.human_summary_max_chars`
+- Default: `600`
+
+**Options**
+
+A positive integer.
+
+When you write directly in a child thread, Zed does not log or forward your messages. When the orchestrator next calls `await_children` or `child_status`, Zed writes one summary of everything you did in that child since the previous summary: that you intervened, what you adjusted and why. The summary is written with the model from `agent.thread_summary_model` and cut to this length. If no summary model is available, the orchestrator only learns how many turns you took.
+
+Open the Settings Editor and search for “Human Intervention Summary Length”. Or add this to your `settings.json`:
+
+```json [settings]
+{
+  "agent": {
+    "orchestration": {
+      "human_summary_max_chars": 400
+    }
+  }
+}
+```
+
 ### Orchestration Log Directory {#agent-orchestration-log-dir}
 
 - Description: Directory where Zed writes one JSONL log per child thread, with only the exchanges between the orchestrator and the child.

@@ -209,6 +209,12 @@ pub struct OrchestrationSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Maximum length, in characters, of the summary that tells an
+    /// orchestrator a human intervened in one of its children. The summary is
+    /// written with `thread_summary_model`.
+    ///
+    /// Default: 600
+    pub human_summary_max_chars: Option<usize>,
     /// Directory where the per-child exchange logs (JSONL) are written, as
     /// `<log_dir>/<orchestrator-id>/<child-id>.jsonl`. When unset, a
     /// `zed-orchestration` folder in the system temporary directory is used.
@@ -670,6 +676,9 @@ fn agent_profile_tools_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sc
     let tool_names = [
         "apply_code_action",
         "ask_user",
+        "await_children",
+        "cancel_child",
+        "child_status",
         "copy_path",
         "create_directory",
         "create_thread",
@@ -688,9 +697,13 @@ fn agent_profile_tools_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sc
         "read_file",
         "rename_symbol",
         "search_web",
+        "send_to_child",
+        "send_to_parent",
         "skill",
         "spawn_agent",
+        "start_child",
         "terminal",
+        "whoami",
         "write_file",
     ];
     let properties = tool_names

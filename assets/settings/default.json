@@ -1211,8 +1211,11 @@
       // How many subagent threads to list under a parent thread before "Load more".
       "subthreads_visible": 5,
       // Expose the orchestration tools (start_child, await_children, child_status,
-      // send_to_child, cancel_child) to agents.
+      // send_to_child, cancel_child, send_to_parent, whoami) to agents.
       "enabled": true,
+      // Maximum length, in characters, of the summary that tells an orchestrator a
+      // human intervened in one of its children.
+      "human_summary_max_chars": 600,
       // Directory for the per-child exchange logs. null uses `zed-orchestration`
       // in the system temporary directory.
       "log_dir": null,
@@ -1353,10 +1356,12 @@
           "rename_symbol": true,
           "search_web": true,
           "send_to_child": true,
+          "send_to_parent": true,
           "skill": true,
           "spawn_agent": true,
           "start_child": true,
           "terminal": true,
+          "whoami": true,
           "write_file": true,
         },
       },

@@ -12,7 +12,11 @@ Report where child threads are, without any of their content.
 
 Returns, for each child, its title, agent, model, status (`starting`, `running`, `waiting_for_confirmation`, `completed`, `failed` or `cancelled`), the number of completed turns and the time of the last activity. It never returns the child's messages.
 
-Use it for a quick look, for example to see whether a child is waiting for the user's permission. To get results, use `await_children`, not repeated calls to this tool.
+Also check these two fields, each returned once:
+- `pending_messages`: what the child told you with `send_to_parent` (a blocker, a question). Answer with `send_to_child`.
+- `human_interventions`: a human wrote directly in the child. Each entry is a short summary of what they changed and why, so you continue coherently. The human's own messages are never shown.
+
+Use it for a quick look, for example to see whether a child is waiting for the user's permission or for your answer. To get results, use `await_children`, not repeated calls to this tool.
 
 `child_ids` empty reports every child of this thread.";
 
@@ -61,7 +65,7 @@ impl AgentTool for ChildStatusTool {
             self.session_id.clone(),
             input,
             cx,
-            |host, orchestrator, input, cx| Task::ready(host.child_status(orchestrator, input, cx)),
+            |host, orchestrator, input, cx| host.child_status(orchestrator, input, cx),
         )
     }
 }

@@ -10,7 +10,7 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 const DESCRIPTION: &str = "\
 Send a follow-up message to a child thread you started.
 
-Use it to correct a child, answer a question it asked in its final message, or hand it the next step. The child keeps the context of its earlier turns, so send a short, direct message and do not repeat the original task.
+Use it to correct a child, answer a question it asked in its final message or with `send_to_parent`, or hand it the next step. The child keeps the context of its earlier turns, so send a short, direct message and do not repeat the original task.
 
 If the child is in the middle of a turn, the message is queued and delivered when the turn ends (`queued` is true). If the child already finished, the message starts a new turn and its status goes back to `running`.
 

@@ -259,6 +259,7 @@ pub struct OrchestrationSettings {
     pub show_as_subthreads: bool,
     pub subthreads_visible: usize,
     pub enabled: bool,
+    pub human_summary_max_chars: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -793,6 +794,7 @@ impl Settings for AgentSettings {
                 show_as_subthreads: orchestration.show_as_subthreads.unwrap(),
                 subthreads_visible: orchestration.subthreads_visible.unwrap(),
                 enabled: orchestration.enabled.unwrap(),
+                human_summary_max_chars: orchestration.human_summary_max_chars.unwrap(),
             },
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),

@@ -5,8 +5,21 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueueEntryId(usize);
 
+/// Who wrote a message sent to a thread. The orchestration feature needs it: a
+/// human writing in a child thread is reported to the orchestrator as a
+/// summary, while the orchestrator's own messages are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageOrigin {
+    #[default]
+    Human,
+    /// Sent by the orchestration tools: `send_to_child`, or an urgent message
+    /// from a child.
+    Orchestration,
+}
+
 pub struct QueueEntry {
     pub id: QueueEntryId,
+    pub origin: MessageOrigin,
     pub content: Vec<acp_v2::ContentBlock>,
     pub tracked_buffers: Vec<Entity<Buffer>>,
     /// When true, this message interrupts the agent at the next turn boundary

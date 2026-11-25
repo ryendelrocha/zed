@@ -1,24 +1,44 @@
 use std::{cell::RefCell, rc::Rc};
 
-use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
+use acp_thread::{
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ThreadStatus,
+};
 use agent_client_protocol::v2::schema as acp_v2;
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow, ensure};
 use collections::HashMap;
+use futures::StreamExt as _;
 use gpui::{App, Entity, Subscription, Task, WeakEntity};
+use language_model::{
+    CompletionIntent, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, Role,
+};
 use orchestration::{
     AvailableAgent, AvailableAgents, AvailableModel, CancelChildInput, CancelChildOutput,
-    ChildStatus, NewChild, OrchestrationHost, OrchestrationRegistry, SendToChildInput,
-    SendToChildOutput, StartChildInput, StartChildOutput, ThreadId, WorktreeMode,
-    orchestration_log_dir,
+    ChildStatus, HumanSummaryRequest, NewChild, OrchestrationHost, OrchestrationRegistry,
+    SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput, ThreadId, WorktreeMode,
+    child_header, human_summary_prompt, orchestration_log_dir,
 };
 use settings::Settings as _;
 
 use crate::{
     AgentPanel,
     agent_panel::{ChildThreadRequest, create_child_thread},
-    conversation_view::{ConversationView, RootThreadUpdated},
+    conversation_view::{ConversationView, MessageOrigin, RootThreadUpdated},
 };
+
+/// Reports to the orchestration registry that a message was sent in `thread`.
+/// A human message in a child counts toward its next summary. The message
+/// itself is not stored anywhere.
+pub(crate) fn note_turn(thread: ThreadId, origin: MessageOrigin, first_entry: usize, cx: &mut App) {
+    let Some(registry) = OrchestrationRegistry::try_global(cx) else {
+        return;
+    };
+    registry.update(cx, |registry, _| match origin {
+        MessageOrigin::Human => registry.note_human_turn(thread, first_entry),
+        MessageOrigin::Orchestration => registry.note_orchestrator_turn(thread, first_entry),
+    });
+}
 
 /// Serves the orchestration tools from an agent panel: it creates child
 /// threads, delivers messages to them, and watches each child's `AcpThread`
@@ -30,6 +50,9 @@ pub(crate) struct AgentPanelOrchestrationHost {
     panel: WeakEntity<AgentPanel>,
     window: gpui::AnyWindowHandle,
     children: Rc<RefCell<HashMap<ThreadId, ChildHandle>>>,
+    /// Watches each orchestrator thread, to deliver urgent child messages
+    /// when it stops.
+    orchestrator_watches: Rc<RefCell<HashMap<ThreadId, Subscription>>>,
 }
 
 struct ChildHandle {
@@ -44,6 +67,7 @@ impl AgentPanelOrchestrationHost {
             panel,
             window,
             children: Rc::default(),
+            orchestrator_watches: Rc::default(),
         }
     }
 
@@ -77,19 +101,22 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
         let panel = self.panel.clone();
         let window = self.window;
         let children = self.children.clone();
+        let orchestrator_watches = self.orchestrator_watches.clone();
         cx.spawn(async move |cx| {
-            let (owns_orchestrator, selected_agent_is_native) = panel
+            let (orchestrator_view, selected_agent_is_native, orchestrator_title) = panel
                 .read_with(cx, |panel, cx| {
-                    (
-                        panel.conversation_view_for_id(&orchestrator, cx).is_some(),
-                        panel.selected_agent_is_native(),
-                    )
+                    let view = panel.conversation_view_for_id(&orchestrator, cx).cloned();
+                    let title = view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).root_thread(cx))
+                        .and_then(|thread| thread.read(cx).title())
+                        .map(|title| title.to_string())
+                        .unwrap_or_else(|| "Untitled thread".to_string());
+                    (view, panel.selected_agent_is_native(), title)
                 })
                 .context("The agent panel is no longer available.")?;
-            ensure!(
-                owns_orchestrator,
-                "This thread is not an orchestrator that this agent panel owns."
-            );
+            let orchestrator_view = orchestrator_view
+                .context("This thread is not an orchestrator that this agent panel owns.")?;
 
             let is_native = match input.agent.as_deref() {
                 Some(agent_id) => agent_id == agent::ZED_AGENT_ID.as_ref(),
@@ -123,7 +150,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                 window,
                 ChildThreadRequest {
                     title: input.title.clone().into(),
-                    prompt: input.prompt.clone(),
+                    prompt: format!("{}{}", child_header(&orchestrator_title), input.prompt),
                     agent_id: input.agent,
                     model: model.clone(),
                     use_new_worktree: input.worktree == WorktreeMode::New,
@@ -149,6 +176,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                         model,
                         log_dir,
                         prompt: input.prompt,
+                        orchestrator_title,
                     },
                     cx,
                 )
@@ -161,6 +189,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                     &child.conversation_view,
                     cx,
                 );
+                watch_orchestrator(&orchestrator_watches, orchestrator, &orchestrator_view, cx);
             });
 
             Ok(StartChildOutput {
@@ -193,12 +222,7 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
         // Deferred, because sending needs the window and the caller may be
         // running inside an update of it.
         cx.spawn(async move |cx| {
-            let content = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                input.message.clone(),
-            ))];
-            let queued = window.update(cx, |_root, window, cx| {
-                conversation_view.update(cx, |view, cx| view.send_follow_up(content, window, cx))
-            })??;
+            let queued = send_text(window, &conversation_view, input.message.clone(), cx)?;
             let registry = cx.update(OrchestrationRegistry::global_or_init);
             registry.update(cx, |registry, cx| {
                 registry.record_message_to_child(orchestrator, child, &input.message, cx);
@@ -298,6 +322,179 @@ impl OrchestrationHost for AgentPanelOrchestrationHost {
                 .is_some()
         })
     }
+
+    fn thread_title(&self, thread_id: ThreadId, cx: &App) -> Option<String> {
+        self.owned_thread(thread_id, cx)?
+            .read(cx)
+            .title()
+            .map(|title| title.to_string())
+    }
+
+    fn is_thread_idle(&self, thread_id: ThreadId, cx: &App) -> bool {
+        self.owned_thread(thread_id, cx)
+            .is_some_and(|thread| thread.read(cx).status() == ThreadStatus::Idle)
+    }
+
+    fn deliver_message(&self, thread_id: ThreadId, text: String, cx: &mut App) -> Task<Result<()>> {
+        let Some(conversation_view) = self.panel.upgrade().and_then(|panel| {
+            panel
+                .read(cx)
+                .conversation_view_for_id(&thread_id, cx)
+                .cloned()
+        }) else {
+            return Task::ready(Err(anyhow!("The thread is no longer open.")));
+        };
+        let window = self.window;
+        // Deferred, because sending needs the window and the caller may be
+        // running inside an update of it.
+        cx.spawn(async move |cx| {
+            send_text(window, &conversation_view, text, cx)?;
+            Ok(())
+        })
+    }
+
+    fn summarize_human_interventions(
+        &self,
+        request: HumanSummaryRequest,
+        cx: &mut App,
+    ) -> Task<Result<Option<String>>> {
+        let Some(model) = LanguageModelRegistry::read_global(cx).thread_summary_model(cx) else {
+            return Task::ready(Ok(None));
+        };
+        let Some(thread) = self.owned_thread(request.child, cx) else {
+            return Task::ready(Err(anyhow!("The child thread is no longer open.")));
+        };
+        let transcript = human_turn_transcript(thread.read(cx), &request, cx);
+        let language_request = LanguageModelRequest {
+            intent: Some(CompletionIntent::ThreadSummarization),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![human_summary_prompt(&transcript, request.max_chars).into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+        cx.spawn(async move |cx| {
+            let provider =
+                cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+            let mut events = provider
+                .stream_completion(&model, language_request, cx)
+                .await?;
+            let mut summary = String::new();
+            while let Some(event) = events.next().await {
+                if let LanguageModelCompletionEvent::Text(text) = event? {
+                    summary.push_str(&text);
+                }
+            }
+            Ok(Some(summary))
+        })
+    }
+}
+
+impl AgentPanelOrchestrationHost {
+    /// The root ACP thread of a thread that this host's panel owns.
+    fn owned_thread(&self, thread_id: ThreadId, cx: &App) -> Option<Entity<AcpThread>> {
+        self.panel
+            .upgrade()?
+            .read(cx)
+            .conversation_view_for_id(&thread_id, cx)?
+            .read(cx)
+            .root_thread(cx)
+    }
+}
+
+/// Sends `text` to a thread as a user message that the orchestration tools
+/// wrote. A thread that is generating queues it. Returns whether it was queued.
+fn send_text(
+    window: gpui::AnyWindowHandle,
+    conversation_view: &Entity<ConversationView>,
+    text: String,
+    cx: &mut gpui::AsyncApp,
+) -> Result<bool> {
+    let content = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text))];
+    window.update(cx, |_root, window, cx| {
+        conversation_view.update(cx, |view, cx| view.send_follow_up(content, window, cx))
+    })?
+}
+
+/// The turns a summary covers, as text for the summary model. Messages are cut
+/// and the whole is capped, because a human may steer a child through hundreds
+/// of turns. Tool calls and thoughts are left out.
+fn human_turn_transcript(thread: &AcpThread, request: &HumanSummaryRequest, cx: &App) -> String {
+    const MAX_MESSAGE_CHARS: usize = 1_500;
+    const MAX_TRANSCRIPT_CHARS: usize = 12_000;
+
+    let mut transcript = String::new();
+    for (index, entry) in thread.entries().iter().enumerate().skip(request.from_entry) {
+        let (speaker, text) = match entry {
+            AgentThreadEntry::UserMessage(message) => {
+                let speaker = if request.orchestrator_entries.contains(&index) {
+                    "Orchestrator"
+                } else {
+                    "Human"
+                };
+                (speaker, message.content.to_markdown(cx).to_string())
+            }
+            AgentThreadEntry::AssistantMessage(message) if !message.is_subagent_output => {
+                let text = message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            Some(block.to_markdown(cx).to_string())
+                        }
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                ("Agent", text)
+            }
+            _ => continue,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let text = util::truncate_and_trailoff(text, MAX_MESSAGE_CHARS);
+        transcript.push_str(&format!("{speaker}: {text}\n\n"));
+        if transcript.chars().count() >= MAX_TRANSCRIPT_CHARS {
+            transcript.push_str("[the rest is left out]\n");
+            break;
+        }
+    }
+    transcript
+}
+
+/// Delivers urgent child messages when the orchestrator thread stops. The
+/// thread is watched once, however many children it starts.
+fn watch_orchestrator(
+    watches: &Rc<RefCell<HashMap<ThreadId, Subscription>>>,
+    orchestrator: ThreadId,
+    conversation_view: &Entity<ConversationView>,
+    cx: &mut App,
+) {
+    if watches.borrow().contains_key(&orchestrator) {
+        return;
+    }
+    let Some(thread) = conversation_view.read(cx).root_thread(cx) else {
+        return;
+    };
+    let subscription = cx.subscribe(&thread, move |_thread, event, cx| {
+        if matches!(
+            event,
+            AcpThreadEvent::Stopped { .. }
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::ConnectionLost
+                | AcpThreadEvent::StatusChanged
+                | AcpThreadEvent::ActivityConfirmedIdle
+        ) {
+            let registry = OrchestrationRegistry::global_or_init(cx);
+            OrchestrationRegistry::flush_urgent(&registry, orchestrator, cx);
+        }
+    });
+    watches.borrow_mut().insert(orchestrator, subscription);
 }
 
 /// Starts watching a child: its `ConversationView` for the moment its root

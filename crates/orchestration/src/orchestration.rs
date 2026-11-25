@@ -177,7 +177,14 @@ pub struct StartChildOutput {
     pub warning: Option<String>,
 }
 
-/// Waits until children finish their turn, or until the timeout.
+/// Waits until children finish their turn, or until the timeout, and returns
+/// each child's final message only.
+///
+/// Read the whole result, not only `final_message`: `pending_messages` holds
+/// what a child told you with `send_to_parent` (a blocker, a question), and
+/// `human_interventions` says that a human stepped in on a child, what they
+/// changed and why. Both are returned once. A child that sends an urgent
+/// message ends the wait early, with the other children still running.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AwaitChildrenInput {
     /// Children to wait for. An empty list waits for every child of this
@@ -201,6 +208,36 @@ pub struct ChildResult {
     /// and it is never the child's transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
+    /// Messages the child sent with `send_to_parent` that you have not seen
+    /// yet. Each is returned once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_messages: Vec<PendingMessage>,
+    /// Summaries of what a human changed by writing directly in the child
+    /// since the last summary. Each is returned once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_interventions: Vec<HumanIntervention>,
+}
+
+/// A message a child sent to its orchestrator with `send_to_parent`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PendingMessage {
+    pub message: String,
+    /// RFC 3339 time the child sent it.
+    pub sent_at: String,
+    /// Whether the child marked it urgent.
+    pub urgent: bool,
+}
+
+/// What a human did in a child thread, summarized once for the orchestrator.
+/// The human's own messages are never part of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HumanIntervention {
+    /// That a human intervened, what they adjusted and why.
+    pub summary: String,
+    /// How many human-driven turns the summary covers.
+    pub turns: u32,
+    /// RFC 3339 time the summary was written.
+    pub summarized_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -210,7 +247,10 @@ pub struct AwaitChildrenOutput {
     pub timed_out: bool,
 }
 
-/// Reports where children are, without any of their content.
+/// Reports where children are, without any of their content. Like
+/// `await_children`, it also returns each child's `pending_messages` and
+/// `human_interventions`, once. Check them: a child may be waiting on an answer
+/// from you, or a human may have changed its course.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ChildStatusInput {
     /// Children to report. An empty list reports every child of this
@@ -231,6 +271,14 @@ pub struct ChildStatusInfo {
     pub turns: u32,
     /// RFC 3339 time of the last exchange or status change.
     pub last_activity: String,
+    /// Messages the child sent with `send_to_parent` that you have not seen
+    /// yet. Each is returned once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_messages: Vec<PendingMessage>,
+    /// Summaries of what a human changed by writing directly in the child
+    /// since the last summary. Each is returned once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_interventions: Vec<HumanIntervention>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -250,6 +298,136 @@ pub struct SendToChildInput {
 pub struct SendToChildOutput {
     /// True when the child was busy and the message was queued.
     pub queued: bool,
+}
+
+/// Sends a message to the orchestrator that started this thread.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendToParentInput {
+    /// What the orchestrator needs to know: a blocker, a question, a decision
+    /// you need. Be specific and self-contained.
+    pub message: String,
+    /// Set it only when you are blocked and cannot continue without an
+    /// answer. The message is then also added to the orchestrator's thread as
+    /// a new message, but only when the orchestrator is idle: it never
+    /// interrupts a running turn. Defaults to false.
+    #[serde(default)]
+    pub urgent: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendToParentOutput {
+    pub parent_id: String,
+    pub parent_title: String,
+    pub urgent: bool,
+}
+
+/// Reports this thread's place in an orchestration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct WhoAmIInput {}
+
+/// How a thread takes part in an orchestration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadRole {
+    /// The thread started children.
+    Orchestrator,
+    /// An orchestrator started the thread.
+    Child,
+    /// The thread started children and was started by an orchestrator.
+    Both,
+    /// The thread is not part of an orchestration.
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadReference {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChildReference {
+    pub id: String,
+    pub title: String,
+    pub status: ChildStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WhoAmIOutput {
+    pub role: ThreadRole,
+    /// The orchestrator that started this thread, if any. Reach it with
+    /// `send_to_parent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ThreadReference>,
+    /// The children this thread started.
+    pub children: Vec<ChildReference>,
+}
+
+/// What the host needs to summarize the human turns in a child.
+#[derive(Clone, Debug)]
+pub struct HumanSummaryRequest {
+    pub child: ThreadId,
+    /// How many human-driven turns happened since the previous summary.
+    pub turns: u32,
+    /// Index of the child's first thread entry the summary covers.
+    pub from_entry: usize,
+    /// Indexes of the user messages in that range that the orchestrator sent,
+    /// not the human.
+    pub orchestrator_entries: Vec<usize>,
+    /// Cap on the length of the summary, in characters.
+    pub max_chars: usize,
+}
+
+/// Prefix of a child's first prompt: it tells the child that it is a child,
+/// who its orchestrator is and how to reach it.
+pub fn child_header(orchestrator_title: &str) -> String {
+    format!(
+        "You are a child conversation started by the orchestrator thread \"{orchestrator_title}\". \
+         When you finish, your final message goes back to the orchestrator automatically, so you do \
+         not need to send it. If you need to reach the orchestrator during the task (a blocker, a \
+         question, a decision), use the `send_to_parent` tool. Do not write it in your own chat: the \
+         orchestrator cannot read your chat. Use `whoami` to see your role, your orchestrator and \
+         your own children.\n\n---\n\n"
+    )
+}
+
+/// Prefix of a message that `send_to_parent` adds to the orchestrator's thread.
+pub fn urgent_message_prefix(child_title: &str) -> String {
+    format!("[from child {child_title}]")
+}
+
+/// Prompt that asks a model for the summary of a human's turns in a child.
+/// `transcript` holds only the turns the summary covers.
+pub fn human_summary_prompt(transcript: &str, max_chars: usize) -> String {
+    format!(
+        "A human wrote directly in a child conversation that an orchestrator started. Their turns \
+         are below, with the agent's replies. Write one short summary for the orchestrator that \
+         says: that a human intervened, what they adjusted, and why. Describe the change, not the \
+         process, and do not quote the human. Plain text, no preamble, at most {max_chars} \
+         characters.\n\n<conversation>\n{transcript}\n</conversation>"
+    )
+}
+
+/// Cuts `text` to at most `max_chars` characters, ending with an ellipsis when
+/// it had to cut.
+pub fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut cut: String = text.chars().take(keep).collect();
+    cut.truncate(cut.trim_end().len());
+    if max_chars > 0 {
+        cut.push('\u{2026}');
+    }
+    cut
+}
+
+/// What the orchestrator gets when no summary model is available.
+pub fn human_summary_fallback(turns: u32) -> String {
+    let noun = if turns == 1 { "turn" } else { "turns" };
+    format!("A human intervened in {turns} {noun}; no summary model configured.")
 }
 
 /// Cancels the current turn of a child.
@@ -338,15 +516,60 @@ pub trait OrchestrationHost {
     /// Whether this host owns the thread `thread_id`.
     fn owns_thread(&self, thread_id: ThreadId, cx: &App) -> bool;
 
+    /// The current title of a thread this host owns.
+    fn thread_title(&self, _thread: ThreadId, _cx: &App) -> Option<String> {
+        None
+    }
+
+    /// Whether the thread is between turns. A message may be added to it
+    /// without interrupting anything only while this is true.
+    fn is_thread_idle(&self, _thread: ThreadId, _cx: &App) -> bool {
+        false
+    }
+
+    /// Adds `text` to the thread as a new user message that starts a turn. It
+    /// must never cancel a running turn.
+    fn deliver_message(&self, _thread: ThreadId, _text: String, _cx: &mut App) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "This host cannot deliver messages to threads."
+        )))
+    }
+
+    /// Summarizes the human-driven turns of a child with the thread summary
+    /// model. `Ok(None)` means no model is available.
+    fn summarize_human_interventions(
+        &self,
+        _request: HumanSummaryRequest,
+        _cx: &mut App,
+    ) -> Task<Result<Option<String>>> {
+        Task::ready(Ok(None))
+    }
+
     fn child_status(
         &self,
         orchestrator: ThreadId,
         input: ChildStatusInput,
         cx: &mut App,
-    ) -> Result<ChildStatusOutput> {
-        OrchestrationRegistry::global_or_init(cx)
-            .read(cx)
-            .child_status(orchestrator, &input)
+    ) -> Task<Result<ChildStatusOutput>> {
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        OrchestrationRegistry::child_status_with_summaries(&registry, orchestrator, input, cx)
+    }
+
+    fn send_to_parent(
+        &self,
+        caller: ThreadId,
+        input: SendToParentInput,
+        cx: &mut App,
+    ) -> Task<Result<SendToParentOutput>> {
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        Task::ready(OrchestrationRegistry::send_to_parent(
+            &registry, caller, input, cx,
+        ))
+    }
+
+    fn whoami(&self, caller: ThreadId, cx: &mut App) -> WhoAmIOutput {
+        let registry = OrchestrationRegistry::global_or_init(cx);
+        registry.read(cx).whoami(caller, cx)
     }
 
     fn await_children(

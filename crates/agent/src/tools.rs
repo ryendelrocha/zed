@@ -26,6 +26,7 @@ mod orchestration_common;
 mod read_file_tool;
 mod rename_tool;
 mod send_to_child_tool;
+mod send_to_parent_tool;
 mod skill_tool;
 mod spawn_agent_tool;
 mod start_child_tool;
@@ -33,6 +34,7 @@ mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
 mod web_search_tool;
+mod whoami_tool;
 mod write_file_tool;
 
 use crate::AgentTool;
@@ -101,6 +103,7 @@ pub use orchestration_common::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use send_to_child_tool::*;
+pub use send_to_parent_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use start_child_tool::*;
@@ -109,6 +112,7 @@ pub use symbol_locator::*;
 pub use terminal_tool::*;
 pub use tool_permissions::*;
 pub use web_search_tool::*;
+pub use whoami_tool::*;
 pub use write_file_tool::*;
 
 macro_rules! tools {
@@ -232,11 +236,13 @@ tools! {
     ReadFileTool,
     RenameTool,
     SendToChildTool,
+    SendToParentTool,
     SkillTool,
     SpawnAgentTool,
     StartChildTool,
     TerminalTool,
     WebSearchTool,
+    WhoAmITool,
     WriteFileTool,
 }
 

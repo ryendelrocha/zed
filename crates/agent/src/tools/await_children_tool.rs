@@ -15,6 +15,7 @@ This is the way to collect results from children started with `start_child`. Pre
 - `child_ids`: the children to wait for. Leave it empty to wait for every child of this thread.
 - Children run in parallel, so waiting on several costs about as much as waiting on the slowest one.
 - Each result has the child's status and, once it finished, its final message: the last message it wrote in its latest turn. You never get its transcript or its tool calls.
+- Also read `pending_messages` and `human_interventions` on every child, each returned once. `pending_messages` is what the child told you with `send_to_parent` (a blocker, a question): answer it with `send_to_child`. `human_interventions` says that a human wrote directly in the child, what they adjusted and why: take it into account before you continue. A child that sends an urgent message ends the wait early, with the other children still running.
 - If the timeout expires first, `timed_out` is true and the unfinished children come back with their current status and no message. Call `await_children` again to keep waiting; do other useful work in between if you have any.
 - A `failed` child stopped with an error or a refusal; a `cancelled` child was cancelled. The final message, when present, says what happened.
 - To ask a finished child for more, use `send_to_child`, then `await_children` again.";

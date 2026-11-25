@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use crate::ToolInput;
 
 /// Names of the tools that exist only while orchestration is available.
-pub const ORCHESTRATION_TOOL_NAMES: [&str; 5] = [
+pub const ORCHESTRATION_TOOL_NAMES: [&str; 7] = [
     "start_child",
     "await_children",
     "child_status",
     "send_to_child",
     "cancel_child",
+    "send_to_parent",
+    "whoami",
 ];
 
 /// Whether `tool_name` is one of the orchestration tools.
@@ -74,6 +76,20 @@ pub fn orchestration_available(session_id: &str, cx: &App) -> bool {
     resolve_orchestrator(session_id, cx).is_ok()
 }
 
+/// Whether the calling session can use `tool_name`, one of
+/// [`ORCHESTRATION_TOOL_NAMES`], right now. `send_to_parent` also needs the
+/// thread to have been started by an orchestrator.
+pub fn orchestration_tool_available(tool_name: &str, session_id: &str, cx: &App) -> bool {
+    let Ok((thread, _)) = resolve_orchestrator(session_id, cx) else {
+        return false;
+    };
+    if tool_name != "send_to_parent" {
+        return true;
+    }
+    OrchestrationRegistry::try_global(cx)
+        .is_some_and(|registry| registry.read(cx).orchestrator_of(thread).is_some())
+}
+
 /// Receives the tool input, resolves the orchestrator and calls the host.
 pub(crate) fn run_orchestration_tool<I, O>(
     session_id: String,
@@ -105,13 +121,14 @@ mod tests {
     use super::*;
     use crate::{
         AgentTool, AwaitChildrenTool, CancelChildTool, ChildStatusTool, SendToChildTool,
-        StartChildTool, ToolCallEventStream,
+        SendToParentTool, StartChildTool, ToolCallEventStream, WhoAmITool,
     };
     use gpui::TestAppContext;
     use orchestration::{
         AvailableAgents, AwaitChildrenInput, AwaitChildrenOutput, CancelChildInput,
         CancelChildOutput, ChildResult, ChildStatus, ChildStatusInput, ChildStatusOutput,
-        SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput, WorktreeMode,
+        SendToChildInput, SendToChildOutput, SendToParentInput, SendToParentOutput,
+        StartChildInput, StartChildOutput, ThreadReference, ThreadRole, WhoAmIOutput, WorktreeMode,
     };
     use std::{cell::RefCell, sync::Arc};
 
@@ -190,9 +207,35 @@ mod tests {
             orchestrator: ThreadId,
             _input: ChildStatusInput,
             _cx: &mut App,
-        ) -> Result<ChildStatusOutput> {
+        ) -> Task<Result<ChildStatusOutput>> {
             self.record("child_status", orchestrator);
-            Ok(ChildStatusOutput { children: vec![] })
+            Task::ready(Ok(ChildStatusOutput { children: vec![] }))
+        }
+
+        fn send_to_parent(
+            &self,
+            caller: ThreadId,
+            input: SendToParentInput,
+            _cx: &mut App,
+        ) -> Task<Result<SendToParentOutput>> {
+            self.record("send_to_parent", caller);
+            Task::ready(Ok(SendToParentOutput {
+                parent_id: "parent-1".into(),
+                parent_title: "Parent".into(),
+                urgent: input.urgent,
+            }))
+        }
+
+        fn whoami(&self, caller: ThreadId, _cx: &mut App) -> WhoAmIOutput {
+            self.record("whoami", caller);
+            WhoAmIOutput {
+                role: ThreadRole::Child,
+                parent: Some(ThreadReference {
+                    id: "parent-1".into(),
+                    title: "Parent".into(),
+                }),
+                children: Vec::new(),
+            }
         }
 
         fn await_children(
@@ -208,6 +251,8 @@ mod tests {
                     title: "Child".into(),
                     status: ChildStatus::Completed,
                     final_message: Some("done".into()),
+                    pending_messages: Vec::new(),
+                    human_interventions: Vec::new(),
                 }],
                 timed_out: false,
             }))
@@ -332,6 +377,46 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_child_tools_call_the_host_for_the_calling_thread(cx: &mut TestAppContext) {
+        let host = register_host(cx);
+
+        let sent = run_tool(
+            SendToParentTool::new(SESSION.into()),
+            SendToParentInput {
+                message: "I am blocked".into(),
+                urgent: true,
+            },
+            cx,
+        )
+        .await
+        .ok()
+        .unwrap();
+        let OrchestrationToolOutput::Success(sent) = sent else {
+            panic!("expected success");
+        };
+        assert!(sent.urgent);
+        assert_eq!(sent.parent_title, "Parent");
+
+        let who = run_tool(
+            WhoAmITool::new(SESSION.into()),
+            orchestration::WhoAmIInput {},
+            cx,
+        )
+        .await
+        .ok()
+        .unwrap();
+        let OrchestrationToolOutput::Success(who) = who else {
+            panic!("expected success");
+        };
+        assert_eq!(who.role, ThreadRole::Child);
+
+        let calls = host.calls.borrow();
+        let names: Vec<_> = calls.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["send_to_parent", "whoami"]);
+        assert!(calls.iter().all(|(_, thread)| *thread == host.orchestrator));
+    }
+
+    #[gpui::test]
     async fn test_host_errors_reach_the_model(cx: &mut TestAppContext) {
         register_host(cx);
         let result = run_tool(
@@ -385,6 +470,8 @@ mod tests {
             ChildStatusTool::NAME,
             SendToChildTool::NAME,
             CancelChildTool::NAME,
+            SendToParentTool::NAME,
+            WhoAmITool::NAME,
         ];
         assert_eq!(names, ORCHESTRATION_TOOL_NAMES);
         for name in names {

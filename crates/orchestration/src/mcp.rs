@@ -41,8 +41,8 @@ use util::ResultExt as _;
 use crate::{
     AvailableAgents, AwaitChildrenInput, AwaitChildrenOutput, BRIDGE_TOKEN_ENV, CancelChildInput,
     CancelChildOutput, ChildStatusInput, ChildStatusOutput, OrchestrationHost,
-    OrchestrationRegistry, SendToChildInput, SendToChildOutput, StartChildInput, StartChildOutput,
-    ThreadId,
+    OrchestrationRegistry, SendToChildInput, SendToChildOutput, SendToParentInput,
+    SendToParentOutput, StartChildInput, StartChildOutput, ThreadId, WhoAmIInput, WhoAmIOutput,
 };
 
 /// Name of the MCP server in the agent's session.
@@ -164,7 +164,7 @@ pub fn ensure_mcp_server(cx: &mut App) -> Option<PathBuf> {
     Some(socket_path)
 }
 
-/// Adds the `initialize` handler and the six tools to `server`.
+/// Adds the `initialize` handler and the orchestration tools to `server`.
 pub fn register_orchestration_tools(server: &mut McpServer) {
     server.handle_request::<Initialize>(|params: InitializeParams, _cx| {
         // Answer with the client's version when we know it, otherwise with
@@ -198,6 +198,8 @@ pub fn register_orchestration_tools(server: &mut McpServer) {
     server.add_tool(SendToChildTool);
     server.add_tool(CancelChildTool);
     server.add_tool(ListAgentsAndModelsTool);
+    server.add_tool(SendToParentTool);
+    server.add_tool(WhoAmITool);
 }
 
 /// Resolves the caller and runs `f` against its host.
@@ -213,10 +215,9 @@ async fn with_host<T: 'static>(
     let task = cx.update(|cx| {
         let registry =
             OrchestrationRegistry::try_global(cx).context("Orchestration is not available.")?;
-        let (orchestrator, host) = registry
-            .read(cx)
-            .resolve_caller(token, cx)
-            .context("Unknown orchestration token: this session is not an orchestrator.")?;
+        let (orchestrator, host) = registry.read(cx).resolve_caller(token, cx).context(
+            "Unknown orchestration token: this session is not a thread of the agent panel.",
+        )?;
         anyhow::Ok(f(orchestrator, host, cx))
     })?;
     task.await
@@ -311,7 +312,7 @@ impl McpServerTool for ChildStatusTool {
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
         let output = with_host(caller, cx, |orchestrator, host, cx| {
-            Task::ready(host.child_status(orchestrator, input, cx))
+            host.child_status(orchestrator, input, cx)
         })
         .await?;
         text_response(output)
@@ -364,6 +365,58 @@ impl McpServerTool for CancelChildTool {
     ) -> Result<ToolResponse<Self::Output>> {
         let output = with_host(caller, cx, |orchestrator, host, cx| {
             host.cancel_child(orchestrator, input, cx)
+        })
+        .await?;
+        text_response(output)
+    }
+}
+
+#[derive(Clone)]
+pub struct SendToParentTool;
+
+impl McpServerTool for SendToParentTool {
+    type Input = SendToParentInput;
+    type Output = SendToParentOutput;
+    const NAME: &'static str = "send_to_parent";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations(false, false)
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        caller: &McpCaller,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let output = with_host(caller, cx, |thread, host, cx| {
+            host.send_to_parent(thread, input, cx)
+        })
+        .await?;
+        text_response(output)
+    }
+}
+
+#[derive(Clone)]
+pub struct WhoAmITool;
+
+impl McpServerTool for WhoAmITool {
+    type Input = WhoAmIInput;
+    type Output = WhoAmIOutput;
+    const NAME: &'static str = "whoami";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations(true, false)
+    }
+
+    async fn run(
+        &self,
+        _input: Self::Input,
+        caller: &McpCaller,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let output = with_host(caller, cx, |thread, host, cx| {
+            Task::ready(Ok(host.whoami(thread, cx)))
         })
         .await?;
         text_response(output)
@@ -592,7 +645,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_bridge_lists_the_six_tools_with_schemas(cx: &mut TestAppContext) {
+    async fn test_bridge_lists_the_orchestration_tools_with_schemas(cx: &mut TestAppContext) {
         let (setup, tokens) = setup(cx);
         let mut client = BridgeClient::connect(&setup.socket, &tokens[0]);
 
@@ -616,7 +669,9 @@ mod tests {
                 "child_status",
                 "list_agents_and_models",
                 "send_to_child",
+                "send_to_parent",
                 "start_child",
+                "whoami",
             ]
         );
         for tool in tools {
@@ -686,6 +741,65 @@ mod tests {
             )
             .await;
         assert_eq!(response["result"]["isError"], false, "{response}");
+    }
+
+    #[gpui::test]
+    async fn test_whoami_and_send_to_parent_over_the_bridge(cx: &mut TestAppContext) {
+        let (setup, tokens) = setup(cx);
+        let mut client = BridgeClient::connect(&setup.socket, &tokens[0]);
+        client.initialize().await;
+
+        let response = client
+            .request("tools/call", json!({"name": "whoami", "arguments": {}}))
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["role"], "none");
+
+        // Nobody started this thread, so there is no orchestrator to write to.
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "send_to_parent", "arguments": {"message": "hello"}}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no orchestrator")
+        );
+
+        // Once it has an orchestrator, the message goes through and is logged.
+        let directory = tempfile::tempdir().unwrap();
+        let child = setup.orchestrators[0].1;
+        setup.registry.update(cx, |registry, cx| {
+            registry.register_child(
+                ThreadId::new(),
+                crate::NewChild {
+                    child_id: child,
+                    title: "child".into(),
+                    agent_id: "zed-agent".to_string(),
+                    model: None,
+                    log_dir: directory.path().to_path_buf(),
+                    prompt: "prompt".to_string(),
+                    orchestrator_title: "parent".to_string(),
+                },
+                cx,
+            );
+        });
+        let response = client
+            .request(
+                "tools/call",
+                json!({"name": "send_to_parent", "arguments": {"message": "hello"}}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["urgent"], false);
+        let response = client
+            .request("tools/call", json!({"name": "whoami", "arguments": {}}))
+            .await;
+        assert_eq!(response["result"]["structuredContent"]["role"], "child");
     }
 
     #[gpui::test]

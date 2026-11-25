@@ -639,6 +639,7 @@ mod tests {
                 show_as_subthreads: true,
                 subthreads_visible: 5,
                 enabled: true,
+                human_summary_max_chars: 600,
             },
             thinking_display: Default::default(),
         }

@@ -2435,6 +2435,26 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.send_content_with_origin(
+            contents_task,
+            is_native_command,
+            MessageOrigin::Human,
+            window,
+            cx,
+        );
+    }
+
+    fn send_content_with_origin(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        origin: MessageOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root_thread_id = self.root_thread_id;
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2522,6 +2542,7 @@ impl ThreadView {
             }
 
             let turn_start_time = Instant::now();
+            let first_entry = thread.read_with(cx, |thread, _cx| thread.entries().len())?;
             let send = thread.update(cx, |thread, cx| {
                 thread.action_log().update(cx, |action_log, cx| {
                     for buffer in tracked_buffers {
@@ -2547,6 +2568,15 @@ impl ThreadView {
                 }
             })?;
             let submission_id = send.id;
+
+            // A thread's first message is never a human intervention: for a
+            // child thread it is the prompt its orchestrator started it with.
+            if !is_first_message {
+                cx.update(|_window, cx| {
+                    crate::orchestration_host::note_turn(root_thread_id, origin, first_entry, cx);
+                })
+                .log_err();
+            }
 
             let _ = this.update(cx, |this, cx| {
                 this.current_submission = Some(submission_id);
@@ -2615,13 +2645,20 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.thread.read(cx).status() == ThreadStatus::Generating {
-            self.add_to_queue(content, Vec::new(), window, cx);
+            self.add_to_queue_with_origin(
+                content,
+                Vec::new(),
+                MessageOrigin::Orchestration,
+                window,
+                cx,
+            );
             return true;
         }
         self.message_queue.resume();
-        self.send_content(
+        self.send_content_with_origin(
             Task::ready(Ok(Some((content, Vec::new())))),
             false,
+            MessageOrigin::Orchestration,
             window,
             cx,
         );
@@ -2996,6 +3033,17 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.add_to_queue_with_origin(content, tracked_buffers, MessageOrigin::Human, window, cx);
+    }
+
+    fn add_to_queue_with_origin(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        origin: MessageOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The ID must be allocated up front so the editor event subscription
         // can capture it before the entry (which owns the subscription) exists.
         let id = self.message_queue.next_id();
@@ -3027,6 +3075,7 @@ impl ThreadView {
 
         self.message_queue.enqueue(QueueEntry {
             id,
+            origin,
             content,
             tracked_buffers,
             steer: false,
@@ -3236,6 +3285,7 @@ impl ThreadView {
             })
             .is_some();
 
+        let origin = entry.origin;
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
         let workspace = self.workspace.clone();
@@ -3262,7 +3312,7 @@ impl ThreadView {
             Ok(Some((entry.content, entry.tracked_buffers)))
         });
 
-        self.send_content(contents_task, is_native_command, window, cx);
+        self.send_content_with_origin(contents_task, is_native_command, origin, window, cx);
     }
 
     pub fn move_queued_message_to_main_editor(

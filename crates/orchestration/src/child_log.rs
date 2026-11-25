@@ -19,6 +19,11 @@ pub enum LogDirection {
     /// From the child to the orchestrator: the final message of a turn, or
     /// the reason the child failed.
     FromChild,
+    /// From the child to the orchestrator, through `send_to_parent`.
+    ToParent,
+    /// The summary of what a human did in the child. The human's own
+    /// messages are never logged.
+    HumanIntervention,
 }
 
 /// One line of a child's log file.

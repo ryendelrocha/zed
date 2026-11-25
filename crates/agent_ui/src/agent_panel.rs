@@ -15881,4 +15881,431 @@ mod tests {
         let error = task.await.expect_err("orchestration is disabled");
         assert!(error.to_string().contains("agent.orchestration.enabled"));
     }
+
+    impl OrchestrationFixture {
+        fn user_messages(&mut self, thread_id: ThreadId) -> Vec<String> {
+            self.panel.read_with(&self.cx, |panel, cx| {
+                panel
+                    .conversation_view_for_id(&thread_id, cx)
+                    .expect("the thread should be open")
+                    .read(cx)
+                    .root_thread(cx)
+                    .expect("the thread should have a root thread")
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        acp_thread::AgentThreadEntry::UserMessage(message) => {
+                            Some(message.content.to_markdown(cx).to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+        }
+
+        /// The human typing in a thread, as opposed to the orchestration tools.
+        fn human_sends(&mut self, thread_id: ThreadId, text: &str) {
+            let view = self.panel.read_with(&self.cx, |panel, cx| {
+                panel
+                    .conversation_view_for_id(&thread_id, cx)
+                    .and_then(|view| view.read(cx).root_thread_view())
+                    .expect("the thread should have a view")
+            });
+            let content = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                text.to_string(),
+            ))];
+            view.update_in(&mut self.cx, |view, window, cx| {
+                view.send_content(
+                    Task::ready(Ok(Some((content, Vec::new())))),
+                    false,
+                    window,
+                    cx,
+                );
+            });
+            self.cx.run_until_parked();
+        }
+
+        fn pending_human_turns(&mut self, child: ThreadId) -> u32 {
+            self.cx.update(|_window, cx| {
+                orchestration::OrchestrationRegistry::global(cx)
+                    .read(cx)
+                    .pending_human_turns(child)
+            })
+        }
+
+        fn log_lines(&self, child: ThreadId) -> Vec<(LogDirection, String)> {
+            orchestration::ChildLog::new(self.log_dir.path(), self.orchestrator, child)
+                .read()
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.direction, entry.text))
+                .collect()
+        }
+
+        /// Starts a child that finishes its first turn with "child result".
+        async fn start_finished_child(&mut self) -> ThreadId {
+            self.connection
+                .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new("child result".into()),
+                )]);
+            let child = self
+                .start_child(start_child_input("Worker", "first task"))
+                .await;
+            assert_eq!(self.child_record(child).0, ChildStatus::Completed);
+            child
+        }
+
+        fn child_status(&mut self) -> Task<Result<orchestration::ChildStatusOutput>> {
+            self.cx.update(|_window, cx| {
+                self.host.child_status(
+                    self.orchestrator,
+                    orchestration::ChildStatusInput::default(),
+                    cx,
+                )
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_child_gets_a_header_before_its_first_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "do the thing"))
+            .await;
+
+        let first = fixture.user_messages(child).remove(0);
+        assert!(first.contains("You are a child conversation started by the orchestrator"));
+        assert!(first.contains("`send_to_parent`"));
+        assert!(first.contains("final message goes back to the orchestrator automatically"));
+        assert!(first.trim_end().ends_with("do the thing"), "{first}");
+
+        // The log keeps the prompt the orchestrator wrote, not the header.
+        assert_eq!(
+            fixture.log_lines(child)[0],
+            (LogDirection::ToChild, "do the thing".to_string())
+        );
+        // The first message is the orchestrator's, never a human turn.
+        assert_eq!(fixture.pending_human_turns(child), 0);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_whoami_and_send_to_parent_through_the_host(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "task"))
+            .await;
+
+        let (child_view, orchestrator_view) = fixture.cx.update(|_window, cx| {
+            (
+                fixture.host.whoami(child, cx),
+                fixture.host.whoami(fixture.orchestrator, cx),
+            )
+        });
+        assert_eq!(child_view.role, orchestration::ThreadRole::Child);
+        assert_eq!(
+            child_view.parent.map(|parent| parent.id),
+            Some(fixture.orchestrator.to_key_string())
+        );
+        assert_eq!(
+            orchestrator_view.role,
+            orchestration::ThreadRole::Orchestrator
+        );
+        assert_eq!(orchestrator_view.children[0].id, child.to_key_string());
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_parent(
+                child,
+                orchestration::SendToParentInput {
+                    message: "which schema?".to_string(),
+                    urgent: false,
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        assert_eq!(
+            fixture.log_lines(child).last(),
+            Some(&(LogDirection::ToParent, "which schema?".to_string()))
+        );
+        let statuses = fixture.child_status().await.unwrap();
+        assert_eq!(
+            statuses.children[0].pending_messages[0].message,
+            "which schema?"
+        );
+        let statuses = fixture.child_status().await.unwrap();
+        assert!(statuses.children[0].pending_messages.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_urgent_message_waits_for_an_idle_orchestrator(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture
+            .start_child(start_child_input("Worker", "task"))
+            .await;
+
+        // The orchestrator is in the middle of a turn: the stub keeps it open.
+        fixture.human_sends(fixture.orchestrator, "orchestrator is busy");
+        let orchestrator = fixture.orchestrator;
+        let orchestrator_session = fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            panel
+                .conversation_view_for_id(&orchestrator, cx)
+                .unwrap()
+                .read(cx)
+                .root_thread(cx)
+                .unwrap()
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+        let before = fixture.user_messages(orchestrator);
+        assert_eq!(before.len(), 1);
+
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_parent(
+                child,
+                orchestration::SendToParentInput {
+                    message: "blocked: need a decision".to_string(),
+                    urgent: true,
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            fixture.user_messages(orchestrator),
+            before,
+            "a running turn must not receive the message, queued or not"
+        );
+        fixture.panel.read_with(&fixture.cx, |panel, cx| {
+            let view = panel
+                .conversation_view_for_id(&orchestrator, cx)
+                .unwrap()
+                .read(cx)
+                .root_thread_view()
+                .unwrap();
+            assert_eq!(view.read(cx).message_queue.len(), 0);
+        });
+
+        // The turn ends: the message arrives as a new user message, once.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("noted".into()),
+            )]);
+        fixture
+            .connection
+            .end_turn(orchestrator_session, acp::StopReason::EndTurn);
+        fixture.cx.run_until_parked();
+        let after = fixture.user_messages(orchestrator);
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(
+            after[1].contains("[from child Worker] blocked: need a decision"),
+            "{}",
+            after[1]
+        );
+        // It was delivered as a message, so the tools do not return it again.
+        let statuses = fixture.child_status().await.unwrap();
+        assert!(statuses.children[0].pending_messages.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_human_message_is_neither_logged_nor_forwarded(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = setup_orchestration(cx).await;
+        let child = fixture.start_finished_child().await;
+        let orchestrator_messages = fixture.user_messages(fixture.orchestrator);
+        let log_before = fixture.log_lines(child);
+
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("adjusted".into()),
+            )]);
+        fixture.human_sends(child, "SECRET human words: use tabs");
+
+        assert_eq!(fixture.pending_human_turns(child), 1);
+        assert_eq!(
+            fixture.user_messages(fixture.orchestrator),
+            orchestrator_messages
+        );
+        // The only new log line is the child's own reply to that turn.
+        let log_after = fixture.log_lines(child);
+        assert!(
+            log_after
+                .iter()
+                .all(|(_, text)| !text.contains("SECRET human words")),
+            "{log_after:?}"
+        );
+        assert!(
+            log_after
+                .iter()
+                .all(|(direction, _)| *direction != LogDirection::HumanIntervention),
+            "no summary is written before the orchestrator asks"
+        );
+        assert_eq!(log_after.len(), log_before.len() + 1);
+
+        // A message from the orchestrator tools is not a human turn.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("ok".into()),
+            )]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "orchestrator follow-up".to_string(),
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        fixture.cx.run_until_parked();
+        assert_eq!(fixture.pending_human_turns(child), 1);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_human_turns_become_one_summary_on_demand(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        let fake_provider = fixture
+            .cx
+            .update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+        let child = fixture.start_finished_child().await;
+
+        for text in ["first human nudge", "second human nudge"] {
+            fixture.connection.set_next_prompt_updates(vec![
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("done".into())),
+            ]);
+            fixture.human_sends(child, text);
+        }
+        // The orchestrator's own follow-up lands between human turns.
+        fixture
+            .connection
+            .set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("ok".into()),
+            )]);
+        let task = fixture.cx.update(|_window, cx| {
+            fixture.host.send_to_child(
+                fixture.orchestrator,
+                orchestration::SendToChildInput {
+                    child_id: child.to_key_string(),
+                    message: "orchestrator follow-up".to_string(),
+                },
+                cx,
+            )
+        });
+        task.await.unwrap();
+        fixture.cx.run_until_parked();
+        assert_eq!(fixture.pending_human_turns(child), 2);
+        // No model call until the orchestrator asks.
+        assert_eq!(fake_provider.completion_count(), 0);
+
+        let status = fixture.child_status();
+        fixture.cx.run_until_parked();
+        let requests = fake_provider.pending_completions();
+        assert_eq!(requests.len(), 1, "two human turns make one summary");
+        let prompt = format!("{:?}", requests[0].messages);
+        assert!(prompt.contains("Human: first human nudge"), "{prompt}");
+        assert!(prompt.contains("Human: second human nudge"), "{prompt}");
+        assert!(
+            prompt.contains("Orchestrator: orchestrator follow-up"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("at most 600"), "{prompt}");
+        // What the child did before the human spoke is outside the summary.
+        assert!(!prompt.contains("first task"), "{prompt}");
+
+        let model = fake_provider.model("fake");
+        fake_provider.send_last_text(&model, "A human intervened and ");
+        fake_provider.send_last_text(&model, "asked for tabs, to match the repo.");
+        fake_provider.end_last(&model);
+        let statuses = status.await.unwrap();
+        let interventions = &statuses.children[0].human_interventions;
+        assert_eq!(interventions.len(), 1);
+        assert_eq!(interventions[0].turns, 2);
+        assert_eq!(
+            interventions[0].summary,
+            "A human intervened and asked for tabs, to match the repo."
+        );
+        assert_eq!(
+            fixture.log_lines(child).last(),
+            Some(&(
+                LogDirection::HumanIntervention,
+                interventions[0].summary.clone()
+            ))
+        );
+        assert_eq!(fixture.pending_human_turns(child), 0);
+
+        // Nothing new happened, so asking again does not call the model.
+        let again = fixture.child_status().await.unwrap();
+        assert!(again.children[0].human_interventions.is_empty());
+        assert_eq!(fake_provider.completion_count(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_summary_respects_the_char_cap(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        let fake_provider = fixture
+            .cx
+            .update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+        fixture.cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .orchestration
+                        .get_or_insert_default()
+                        .human_summary_max_chars = Some(100);
+                });
+            });
+        });
+        let child = fixture.start_finished_child().await;
+        fixture.human_sends(child, "change course");
+
+        let status = fixture.child_status();
+        fixture.cx.run_until_parked();
+        let prompt = format!("{:?}", fake_provider.pending_completions()[0].messages);
+        assert!(prompt.contains("at most 100"), "{prompt}");
+        let model = fake_provider.model("fake");
+        fake_provider.send_last_text(&model, "The human changed the plan. ".repeat(30));
+        fake_provider.end_last(&model);
+        let statuses = status.await.unwrap();
+        let summary = &statuses.children[0].human_interventions[0].summary;
+        assert!(
+            summary.chars().count() <= 100,
+            "{}",
+            summary.chars().count()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_summary_without_a_model_is_a_minimal_note(cx: &mut TestAppContext) {
+        let mut fixture = setup_orchestration(cx).await;
+        // A registry with no model at all.
+        fixture.cx.update(|_window, cx| language_model::init(cx));
+        let child = fixture.start_finished_child().await;
+        for text in ["one", "two", "three"] {
+            fixture.connection.set_next_prompt_updates(vec![
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("done".into())),
+            ]);
+            fixture.human_sends(child, text);
+        }
+
+        let statuses = fixture.child_status().await.unwrap();
+        assert_eq!(
+            statuses.children[0].human_interventions[0].summary,
+            "A human intervened in 3 turns; no summary model configured."
+        );
+    }
 }
